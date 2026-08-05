@@ -9,6 +9,8 @@ const GameAudioManager = preload("res://scripts/audio_manager.gd")
 const GameSaveManager = preload("res://scripts/save_manager.gd")
 const GameLocalization = preload("res://scripts/game_localization.gd")
 const EnemyEnhancementCatalog = preload("res://scripts/enemy_enhancement_catalog.gd")
+const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
+const NationCatalog = preload("res://scripts/nation_catalog.gd")
 const PythonBossControllerScript = preload("res://scripts/python_boss.gd")
 const ChaosBossControllerScript = preload("res://scripts/chaos_boss.gd")
 const AionisBossControllerScript = preload("res://scripts/aionis_boss.gd")
@@ -33,7 +35,10 @@ const PLAYER_RADIUS := 17.0
 const PLAYER_HIT_GRACE_SECONDS := 0.14
 const CASTLE_CORE_COLLISION_RADIUS := 121.0
 const CASTLE_OUTER_COLLISION_RADIUS := 205.0
-const SAVE_SCHEMA := 6 # Raised to 7 atomically when troop research migration lands.
+const SAVE_SCHEMA := 7
+const NATION_TICK_INTERVAL := 2.0
+const NATION_SUPPORT_RADIUS := 1750.0
+const NATION_WAR_RADIUS := 1250.0
 const FIXED_STEP := 1.0 / 60.0
 const BOSS_ENTITY_ID := -9001
 const MAIN_PYTHON_BOSS_LAIR_ID := "python_boss_main_lair"
@@ -127,6 +132,8 @@ var command_castle_id := ""
 var recruit_anchor := HOUSE_POS
 var tutorial_visible := true
 var notifications_hidden := false
+var soldier_research: Dictionary = {}
+var nation_tick_timer := 0.0
 var tutorial_step := 0
 var master_volume := 0.75
 var sound_muted := false
@@ -188,6 +195,7 @@ func _ready() -> void:
 	audio.set_volume(master_volume)
 	world_generator = WorldGenerator.new(world_seed)
 	_initialize_empty_player()
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
 	_load_profile_progression()
 	_initialize_python_boss()
 	_initialize_chaos_boss()
@@ -1604,6 +1612,8 @@ func _input(event: InputEvent) -> void:
 					active_panel = "" if active_panel == "recruit" else "recruit"
 				else:
 					_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
+			KEY_K:
+				active_panel = "" if active_panel == "soldier_upgrades" else "soldier_upgrades"
 			KEY_M:
 				active_panel = "" if active_panel == "map" else "map"
 			KEY_H:
@@ -3022,6 +3032,7 @@ func _register_castle(descriptor: Dictionary) -> void:
 	var tier := GameConfig.castle_tier_for_level(level)
 	var tier_cfg: Dictionary = GameConfig.castle_tier(level)
 	var wall_max_hp := max_hp * float(tier_cfg.get("wall_ratio", 0.0))
+	var nation := NationCatalog.metadata_for_castle(world_seed, id, castle_position)
 	castles[id] = {
 		"id": id,
 		"pos": castle_position,
@@ -3040,6 +3051,8 @@ func _register_castle(descriptor: Dictionary) -> void:
 		"spawn_timer": 3.0,
 		"tower_cd": 1.5,
 		"under_attack": 0.0,
+		"nation": nation,
+		"original_nation": nation.duplicate(true),
 	}
 	_spawn_castle_guard_wave(castles[id], true)
 
@@ -3910,6 +3923,13 @@ func _execute_enemy_attack(enemy: Dictionary) -> void:
 	var direction := (target_pos - origin).normalized()
 	if direction == Vector2.ZERO: direction = Vector2.RIGHT
 	enemy["aim_dir"] = direction
+	enemy["enhancement_attack_sequence"] = int(enemy.get("enhancement_attack_sequence", 0)) + 1
+	var base_attack := float(enemy["attack"])
+	var crit_chance := float(enemy.get("enhancement_crit_chance", 0.0))
+	var crit_roll := float((int(enemy["id"]) * 37 + int(enemy["enhancement_attack_sequence"]) * 101) % 1000) / 1000.0
+	if crit_chance > 0.0 and crit_roll < crit_chance:
+		enemy["attack"] = base_attack * float(enemy.get("enhancement_crit_multiplier", 1.5))
+		_spawn_effect("warning", target_pos, Color("FF8E8E"), 0.8)
 	match str(enemy["type"]):
 		"archer":
 			_spawn_projectile({"team": "enemy", "kind": "enemy_arrow", "pos": origin + direction * 16.0, "vel": direction * 610.0, "damage": enemy["attack"], "range": 520.0, "radius": 5.0, "pierce": 1, "aoe": 0.0, "color": Color("FF9B79")})
@@ -3975,6 +3995,62 @@ func _execute_enemy_attack(enemy: Dictionary) -> void:
 			camera_shake = max(camera_shake, 0.55)
 		_:
 			_enemy_melee_attack(enemy, direction)
+	_apply_enemy_special_enhancements(enemy, target_pos, float(enemy["attack"]))
+	var lifesteal := float(enemy.get("enhancement_lifesteal", 0.0))
+	if lifesteal > 0.0:
+		enemy["hp"] = minf(float(enemy["max_hp"]), float(enemy["hp"]) + float(enemy["attack"]) * lifesteal)
+	enemy["attack"] = base_attack
+
+
+func _apply_enemy_special_enhancements(enemy: Dictionary, target_pos: Vector2, attack_damage: float) -> void:
+	var enhancement: Dictionary = Dictionary(enemy.get("enhancement", {}))
+	var tracks: Dictionary = Dictionary(enhancement.get("tracks", {}))
+	if tracks.is_empty():
+		return
+	var sequence := int(enemy.get("enhancement_attack_sequence", 0))
+	var origin := Vector2(enemy["pos"])
+	var direction := (target_pos - origin).normalized()
+	if direction == Vector2.ZERO:
+		direction = Vector2.RIGHT
+	var flame_rank := EnemyEnhancementCatalog.rank_for(enhancement, "flame")
+	if flame_rank > 0:
+		var flame := EnemyEnhancementCatalog.definition("flame")
+		var ratio := float(flame["burn_ratio"][flame_rank - 1])
+		_enemy_area_attack(target_pos, 42.0, attack_damage * ratio)
+		_spawn_effect("burn", target_pos, FIRE_ORANGE, 0.8)
+	var paralysis_rank := EnemyEnhancementCatalog.rank_for(enhancement, "paralysis")
+	if paralysis_rank > 0:
+		var paralysis := EnemyEnhancementCatalog.definition("paralysis")
+		if sequence % int(paralysis["every"][paralysis_rank - 1]) == 0:
+			var stun := float(paralysis["stun"][paralysis_rank - 1])
+			for soldier in soldiers:
+				if Vector2(soldier["pos"]).distance_to(target_pos) <= 54.0:
+					soldier["invuln"] = minf(float(soldier.get("invuln", 0.0)), -stun)
+			_spawn_effect("warning", target_pos, Color("E9DD68"), 0.9)
+	var split_rank := EnemyEnhancementCatalog.rank_for(enhancement, "split_shot")
+	if split_rank > 0:
+		var split := EnemyEnhancementCatalog.definition("split_shot")
+		var extra := int(split["extra"][split_rank - 1])
+		var angle := deg_to_rad(float(split["angle"][split_rank - 1]))
+		for shot_index in extra:
+			var side := -1.0 if shot_index % 2 == 0 else 1.0
+			var shot_dir := direction.rotated(angle * side * float(1 + shot_index / 2))
+			_spawn_projectile({"team": "enemy", "kind": "enhanced_split", "pos": origin + shot_dir * 18.0, "vel": shot_dir * 680.0, "damage": attack_damage * float(split["damage_ratio"][split_rank - 1]), "range": 520.0, "radius": 4.0, "pierce": 1, "aoe": 0.0, "color": Color("F8B4FF")})
+	var stomp_rank := EnemyEnhancementCatalog.rank_for(enhancement, "stomp")
+	if stomp_rank > 0 and sequence % 4 == 0:
+		var stomp := EnemyEnhancementCatalog.definition("stomp")
+		_enemy_area_attack(origin, float(stomp["radius"][stomp_rank - 1]), attack_damage * float(stomp["damage_ratio"][stomp_rank - 1]))
+		_spawn_effect("explosion", origin, Color("D99B68"), 1.0)
+	var meteor_rank := EnemyEnhancementCatalog.rank_for(enhancement, "meteor")
+	if meteor_rank > 0:
+		var cooldowns: Dictionary = Dictionary(enemy.get("enhancement_cooldowns", {}))
+		if float(cooldowns.get("meteor", 0.0)) <= 0.0:
+			var meteor := EnemyEnhancementCatalog.definition("meteor")
+			var warning := float(meteor["warning"][meteor_rank - 1])
+			_spawn_projectile({"team": "enemy", "kind": "bomb", "pos": target_pos, "vel": Vector2.ZERO, "damage": attack_damage * float(meteor["damage_ratio"][meteor_rank - 1]), "range": 1.0, "radius": 14.0, "pierce": 1, "aoe": float(meteor["radius"][meteor_rank - 1]), "color": Color("FF4E62"), "ttl": warning, "delayed_impact": true, "drop_height": 150.0})
+			cooldowns["meteor"] = float(meteor["cooldown"][meteor_rank - 1])
+			enemy["enhancement_cooldowns"] = cooldowns
+			_spawn_effect("warning", target_pos, Color("FF4E62"), 1.5)
 
 
 func _enemy_melee_attack(enemy: Dictionary, direction: Vector2) -> void:
@@ -4038,6 +4114,18 @@ func _army_limit() -> int:
 	return GameConfig.army_limit(_owned_castle_level_total())
 
 
+func _purchase_soldier_upgrade(type_id: String, upgrade_id: String) -> bool:
+	var preview := SoldierUpgradeCatalog.purchase_preview(type_id, upgrade_id, soldier_research, int(player.get("money", 0)), GameConfig.SOLDIERS.has(type_id))
+	if not bool(preview.get("allowed", false)):
+		_add_notification("士兵強化尚未符合條件或金錢不足。", Color("F6C177"), 2.0)
+		return false
+	soldier_research = Dictionary(preview["research_after"]).duplicate(true)
+	player["money"] = int(preview["gold_after"])
+	_add_notification("士兵永久強化：%s Rank %d" % [SoldierUpgradeCatalog.localized_name(upgrade_id, language), int(preview["next_rank"])], HEAL_GREEN, 2.4)
+	audio.play("purchase", 0.8)
+	return true
+
+
 func _recruit_soldier(type_id: String, requested_count: int = 1) -> int:
 	if not GameConfig.SOLDIERS.has(type_id):
 		return 0
@@ -4049,7 +4137,8 @@ func _recruit_soldier(type_id: String, requested_count: int = 1) -> int:
 		_add_notification("請靠近出生房屋或友方城堡招募。", Color("F6C177"), 2.0)
 		return 0
 	var cfg: Dictionary = GameConfig.SOLDIERS[type_id]
-	var cost := int(cfg["recruit_cost"]["gold"])
+	var discount := SoldierUpgradeCatalog.recruit_discount_for_type(type_id, soldier_research)
+	var cost := maxi(1, int(ceil(float(cfg["recruit_cost"]["gold"]) * (1.0 - discount))))
 	var bought := 0
 	for _n in requested_count:
 		if soldiers.size() >= _army_limit():
@@ -4118,22 +4207,25 @@ func _spawn_soldier(type_id: String, position: Vector2, hp_ratio: float = 1.0) -
 	var cfg: Dictionary = GameConfig.SOLDIERS[type_id]
 	var combat: Dictionary = cfg["combat"]
 	var level_growth := 1.0 + 0.012 * float(int(player["level"]) - 1)
-	var max_hp := float(combat["hp"]) * level_growth
+	var research_snapshot := SoldierUpgradeCatalog.snapshot_for_type(type_id, soldier_research)
+	var base_effects: Dictionary = Dictionary(research_snapshot.get("base_effects", {}))
+	var max_hp := float(combat["hp"]) * level_growth * (1.0 + float(base_effects.get("max_hp_bonus", 0.0)))
 	var id := next_entity_id
 	next_entity_id += 1
 	var radius := _soldier_radius(type_id)
 	var soldier := {
 		"id": id, "type": type_id, "pos": position, "vel": Vector2.ZERO, "hp": max_hp * hp_ratio, "max_hp": max_hp,
-		"attack": float(combat["attack"]) * (1.0 + 0.015 * float(int(player["level"]) - 1)),
-		"defense": float(combat["armor"]) + floor(float(int(player["level"]) - 1) / 8.0),
-		"speed": float(combat["movement_speed"]) * 1.35, "range": float(combat["range"]),
-		"attack_rate": float(combat["attack_speed"]), "radius": radius,
+		"attack": float(combat["attack"]) * (1.0 + 0.015 * float(int(player["level"]) - 1)) * (1.0 + float(base_effects.get("attack_or_healing_bonus", 0.0))),
+		"defense": float(combat["armor"]) + floor(float(int(player["level"]) - 1) / 8.0) + float(base_effects.get("armor_bonus", 0.0)),
+		"speed": float(combat["movement_speed"]) * 1.35 * (1.0 + float(base_effects.get("move_speed_bonus", 0.0))), "range": float(combat["range"]) * (1.0 + float(base_effects.get("range_bonus_ratio", 0.0))) + float(base_effects.get("range_bonus_px", 0.0)),
+		"attack_rate": float(combat["attack_speed"]) * (1.0 + float(base_effects.get("attack_or_support_speed_bonus", 0.0))), "radius": radius,
 		"cooldown": randf_range(0.0, 0.5), "support_cd": 0.0, "revive_cd": 0.0,
 		"state": "follow", "target_id": -1, "ai_accum": randf_range(0.0, 0.12),
 		"flash": 0.0, "invuln": 0.0, "charge": 0.0, "cast_timer": 0.0, "cast_target": -1,
 		"last_hit": -99.0, "soul_fatigue": 0.0, "aim_dir": Vector2.RIGHT, "structure_target": "",
 		"avoid_dir": Vector2.ZERO, "avoid_timer": 0.0,
 		"domain": str(combat.get("domain", "ground")), "altitude": 38.0 if str(combat.get("domain", "ground")) == "air" else 0.0,
+		"upgrade_snapshot": research_snapshot,
 	}
 	soldiers.append(soldier)
 	_spawn_effect("spawn", position, FRIEND_BLUE, 0.65)
@@ -5242,6 +5334,10 @@ func _update_drops(delta: float) -> void:
 # -----------------------------------------------------------------------------
 
 func _update_castles_and_camps(delta: float) -> void:
+	nation_tick_timer -= delta
+	if nation_tick_timer <= 0.0:
+		nation_tick_timer = NATION_TICK_INTERVAL
+		_update_nation_wars(NATION_TICK_INTERVAL)
 	for castle in castles.values():
 		var castle_is_active := _is_position_active(castle["pos"])
 		castle["under_attack"] = max(0.0, float(castle["under_attack"]) - delta)
@@ -5299,6 +5395,62 @@ func _update_castles_and_camps(delta: float) -> void:
 			camp["crate_hp"] = float(GameConfig.CAMP_SETTINGS["crate_hp"])
 			camp["respawn_at"] = 0.0
 			_spawn_camp_guards(camp)
+
+
+func _update_nation_wars(delta: float) -> void:
+	var active_castles: Array[Dictionary] = []
+	for castle_value in castles.values():
+		var castle: Dictionary = castle_value
+		if _is_position_active(Vector2(castle.get("pos", Vector2.ZERO))):
+			active_castles.append(castle)
+	for index in active_castles.size():
+		var source := active_castles[index]
+		var source_nation: Dictionary = Dictionary(source.get("nation", {}))
+		if not NationCatalog.is_valid_metadata(source_nation):
+			continue
+		for other_index in range(index + 1, active_castles.size()):
+			var target := active_castles[other_index]
+			var target_nation: Dictionary = Dictionary(target.get("nation", {}))
+			if not NationCatalog.is_valid_metadata(target_nation):
+				continue
+			var distance := Vector2(source["pos"]).distance_to(target["pos"])
+			if not NationCatalog.are_hostile(source_nation, target_nation):
+				if distance <= NATION_SUPPORT_RADIUS:
+					_reinforce_nation_castle(source, target, delta)
+					_reinforce_nation_castle(target, source, delta)
+				continue
+			if distance <= NATION_WAR_RADIUS and not bool(source.get("owned", false)) and not bool(target.get("owned", false)):
+				var source_power := float(source.get("level", 1)) * (0.8 + float(source.get("hp", 0.0)) / maxf(1.0, float(source.get("max_hp", 1.0))))
+				var target_power := float(target.get("level", 1)) * (0.8 + float(target.get("hp", 0.0)) / maxf(1.0, float(target.get("max_hp", 1.0))))
+				if source_power >= target_power:
+					_apply_nation_siege(source, target, delta)
+				else:
+					_apply_nation_siege(target, source, delta)
+
+
+func _reinforce_nation_castle(source: Dictionary, target: Dictionary, delta: float) -> void:
+	if bool(source.get("destroyed", false)) or bool(target.get("destroyed", false)):
+		return
+	var support := maxf(1.0, float(source.get("level", 1)) * 0.45) * delta
+	target["hp"] = minf(float(target.get("max_hp", 1.0)), float(target.get("hp", 0.0)) + support)
+
+
+func _apply_nation_siege(attacker: Dictionary, defender: Dictionary, delta: float) -> void:
+	if bool(defender.get("destroyed", false)):
+		defender["nation"] = NationCatalog.conquest_metadata(attacker.get("nation", {}))
+		defender["destroyed"] = false
+		defender["hp"] = float(defender.get("max_hp", 1.0)) * 0.30
+		defender["wall_hp"] = float(defender.get("wall_max_hp", 0.0)) * 0.20
+		defender["wall_breached"] = float(defender.get("wall_hp", 0.0)) <= 0.0
+		return
+	var pressure := maxf(1.0, float(attacker.get("level", 1)) * 0.34) * delta
+	if float(defender.get("wall_hp", 0.0)) > 0.0:
+		defender["wall_hp"] = maxf(0.0, float(defender["wall_hp"]) - pressure)
+		defender["wall_breached"] = float(defender["wall_hp"]) <= 0.0
+	else:
+		defender["hp"] = maxf(0.0, float(defender.get("hp", 0.0)) - pressure)
+		if float(defender["hp"]) <= 0.0:
+			defender["destroyed"] = true
 
 
 func _spawn_castle_guard_wave(castle: Dictionary, initial: bool) -> void:
@@ -5393,6 +5545,7 @@ func _update_castle_capture(castle: Dictionary, delta: float) -> void:
 		castle["capture"] = max(0.0, float(castle["capture"]) - delta * 0.45)
 	if float(castle["capture"]) >= float(GameConfig.CASTLE_SETTINGS["capture_seconds"]):
 		castle["owned"] = true
+		castle["nation"] = NationCatalog.conquest_metadata(NationCatalog.player_metadata())
 		castle["destroyed"] = false
 		castle["hp"] = float(castle["max_hp"]) * 0.45
 		castle["income_timer"] = float(GameConfig.CASTLE_SETTINGS["income_interval"])
@@ -5416,6 +5569,7 @@ func _update_castle_capture(castle: Dictionary, delta: float) -> void:
 func _lose_castle(castle: Dictionary) -> void:
 	_evacuate_friendly_units_from_falling_castle(castle)
 	castle["owned"] = false
+	castle["nation"] = NationCatalog.normalized_or_generated(castle.get("original_nation", {}), world_seed, str(castle["id"]), castle["pos"])
 	castle["destroyed"] = false
 	castle["hp"] = float(castle["max_hp"]) * 0.38
 	castle["capture"] = 0.0
@@ -5899,6 +6053,7 @@ func _save_game(show_notice: bool = true, path: String = GameSaveManager.SAVE_PA
 		"chunk_states": chunk_states.duplicate(true),
 		"pending_chunk_spawns": pending_chunk_spawns.duplicate(true),
 		"settings": {"master_volume": master_volume, "muted": sound_muted, "tutorial": tutorial_visible, "notifications_hidden": notifications_hidden},
+		"soldier_research": soldier_research.duplicate(true),
 		"boss": {} if python_boss == null else python_boss.serialize(),
 		"chaos_boss": {} if chaos_boss == null else chaos_boss.serialize(),
 		"aionis_boss": {} if not timeless_gate_unlocked or aionis_boss == null else aionis_boss.serialize(),
@@ -5930,6 +6085,7 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 	var loaded_lair_binding := _resolve_saved_python_boss_lair_binding(data)
 	var loaded_progression: Dictionary = Dictionary(data.get("progression", {}))
 	var loaded_schema := int(data.get("schema", 1))
+	soldier_research = SoldierUpgradeCatalog.sanitize_research(data.get("soldier_research", {}))
 	final_boss_defeated = bool(loaded_progression.get("final_boss_defeated", false))
 	ending_seen = bool(loaded_progression.get("ending_seen", false))
 	all_soldiers_unlocked = all_soldiers_unlocked or bool(loaded_progression.get("all_soldiers_unlocked", false)) or final_boss_defeated
@@ -5978,6 +6134,10 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 		loaded_castle["wall_max_hp"] = loaded_wall_max
 		loaded_castle["wall_hp"] = clampf(float(loaded_castle.get("wall_hp", loaded_wall_max)), 0.0, loaded_wall_max)
 		loaded_castle["wall_breached"] = bool(loaded_castle.get("wall_breached", loaded_wall_max <= 0.0 or float(loaded_castle["wall_hp"]) <= 0.0))
+		var loaded_id := str(loaded_castle.get("id", ""))
+		var generated_nation := NationCatalog.normalized_or_generated(loaded_castle.get("original_nation", loaded_castle.get("nation", {})), world_seed, loaded_id, loaded_castle.get("pos", Vector2.ZERO))
+		loaded_castle["original_nation"] = generated_nation
+		loaded_castle["nation"] = NationCatalog.conquest_metadata(NationCatalog.player_metadata()) if bool(loaded_castle.get("owned", false)) else NationCatalog.normalized_or_generated(loaded_castle.get("nation", generated_nation), world_seed, loaded_id, loaded_castle.get("pos", Vector2.ZERO))
 	camps = Dictionary(data.get("camps", {})).duplicate(true)
 	snake_nests = _migrate_loaded_python_boss_lairs(data.get("snake_nests", {}))
 	var loaded_lair_state: Dictionary = Dictionary(data.get("boss_lair_state", {}))
@@ -6093,6 +6253,8 @@ func _normalize_loaded_soldier(loaded_soldier: Dictionary) -> void:
 	var loaded_combat: Dictionary = Dictionary(GameConfig.SOLDIERS.get(loaded_type, {})).get("combat", {})
 	loaded_soldier["domain"] = str(loaded_combat.get("domain", loaded_soldier.get("domain", "ground")))
 	loaded_soldier["altitude"] = 38.0 if str(loaded_soldier["domain"]) == "air" else 0.0
+	if not loaded_soldier.has("upgrade_snapshot"):
+		loaded_soldier["upgrade_snapshot"] = SoldierUpgradeCatalog.snapshot_for_type(loaded_type, soldier_research)
 	# Older releases also used the `cannon` id. Keep those saves compatible while
 	# guaranteeing that a unit now sold as the Heavy Cannon receives its current
 	# player-only damage floor instead of retaining the former ordinary-cannon stat.
@@ -6116,6 +6278,8 @@ func _is_valid_save_data(data: Dictionary) -> bool:
 	if schema >= 5 and (not data.has("chaos_boss") or not data.has("progression")):
 		return false
 	if schema >= 6 and not data.has("aionis_boss"):
+		return false
+	if schema >= 7 and (not data.has("soldier_research") or typeof(data["soldier_research"]) != TYPE_DICTIONARY):
 		return false
 	if schema >= 5:
 		if typeof(data["progression"]) != TYPE_DICTIONARY or typeof(data["chaos_boss"]) != TYPE_DICTIONARY:
@@ -6518,6 +6682,16 @@ func _handle_ui_click(position: Vector2) -> bool:
 				_recruit_soldier(recruit_type, 5 if Input.is_key_pressed(KEY_SHIFT) else 1)
 				return true
 		return true
+	if active_panel == "soldier_upgrades":
+		var upgrade_panel := _soldier_upgrade_panel_rect()
+		if not upgrade_panel.has_point(position):
+			return false
+		for upgrade_index in SoldierUpgradeCatalog.BASE_UPGRADE_ORDER.size():
+			var upgrade_rect := Rect2(upgrade_panel.position.x + 28.0, upgrade_panel.position.y + 76.0 + float(upgrade_index) * 45.0, upgrade_panel.size.x - 56.0, 36.0)
+			if upgrade_rect.has_point(position):
+				_purchase_soldier_upgrade("archer", str(SoldierUpgradeCatalog.BASE_UPGRADE_ORDER[upgrade_index]))
+				return true
+		return true
 	if active_panel == "map":
 		return _map_panel_rect().has_point(position)
 	return false
@@ -6525,6 +6699,10 @@ func _handle_ui_click(position: Vector2) -> bool:
 
 func _skills_panel_rect() -> Rect2:
 	return Rect2(max(24.0, screen_size.x * 0.5 - 320.0), max(34.0, screen_size.y * 0.5 - 240.0), min(640.0, screen_size.x - 48.0), min(480.0, screen_size.y - 68.0))
+
+
+func _soldier_upgrade_panel_rect() -> Rect2:
+	return Rect2(maxf(20.0, screen_size.x * 0.5 - 340.0), maxf(24.0, screen_size.y * 0.5 - 250.0), minf(680.0, screen_size.x - 40.0), minf(500.0, screen_size.y - 48.0))
 
 
 func _command_panel_rect() -> Rect2:
@@ -6670,6 +6848,7 @@ func _draw() -> void:
 			if mode == GameMode.DEAD: _draw_death_overlay()
 			if active_panel == "skills": _draw_skills_panel()
 			elif active_panel == "recruit": _draw_recruit_panel()
+			elif active_panel == "soldier_upgrades": _draw_soldier_upgrade_panel()
 			elif active_panel == "command": _draw_command_panel()
 			elif active_panel == "map": _draw_map_panel()
 			elif active_panel == "confirm_restart": _draw_confirm_restart()
@@ -7114,6 +7293,10 @@ func _draw_castle(castle: Dictionary) -> void:
 	var p := _world_to_screen(castle["pos"])
 	if not _on_screen(p, 300): return
 	var friendly := bool(castle["owned"])
+	var nation: Dictionary = Dictionary(castle.get("nation", NationCatalog.player_metadata() if friendly else {}))
+	var flag_color := Color(str(nation.get("color_hex", "3B82F6" if friendly else "B84032")))
+	draw_line(p + Vector2(-112.0, -170.0), p + Vector2(-112.0, -242.0), Color("27343A"), 4.0)
+	draw_colored_polygon(PackedVector2Array([p + Vector2(-108.0, -238.0), p + Vector2(-52.0, -224.0), p + Vector2(-108.0, -207.0)]), flag_color)
 	var tier := GameConfig.castle_tier_for_level(int(castle["level"]))
 	var wall_color := Color("7D9195") if friendly else Color("555D5A")
 	if castle["destroyed"]: wall_color = Color("625F5A")
@@ -9025,7 +9208,8 @@ func _draw_chaos_map_icon(position: Vector2, large: bool, engaged: bool, defeate
 func _draw_castle_map_icon(position: Vector2, castle: Dictionary, large: bool) -> void:
 	var tier := GameConfig.castle_tier_for_level(int(castle.get("level", 1)))
 	var scale := 1.25 if large else 0.86
-	var base_color := FRIEND_BLUE if bool(castle.get("owned", false)) else ENEMY_RED
+	var nation: Dictionary = Dictionary(castle.get("nation", {}))
+	var base_color := Color(str(nation.get("color_hex", "3B82F6" if bool(castle.get("owned", false)) else "B84032")))
 	var accent := Color("B97843")
 	if tier >= 30: accent = Color("E2A24C")
 	if tier >= 35: accent = Color("9BA8AC")
@@ -9190,6 +9374,24 @@ func _draw_skills_panel() -> void:
 	_draw_text("目前：攻擊 %.0f　防禦 %.0f　移速 %.0f　軍隊上限 %d" % [_player_damage(1.0), _player_defense(), _player_move_speed(), _army_limit()], Vector2(panel.position.x + 28, stat_y), 14, Color("C8DBE5"))
 	var special_text := "已解鎖：%s　冷卻 %.1f 秒" % [GameConfig.SPECIAL_ATTACKS[str(player["class_id"])]["name"], float(player["special_cd"])] if int(player["level"]) >= 10 else "特殊技能將於等級 10 解鎖"
 	_draw_text(special_text, Vector2(panel.position.x + 28, stat_y + 30), 14, GOLD)
+
+
+func _draw_soldier_upgrade_panel() -> void:
+	var panel := _soldier_upgrade_panel_rect()
+	draw_rect(panel, PANEL_BG)
+	draw_rect(panel, Color("62B7D6"), false, 2.0)
+	_draw_text("士兵永久強化 / Permanent Troop Upgrades", panel.position + Vector2(24.0, 34.0), 23, Color("DDF7FF"), HORIZONTAL_ALIGNMENT_LEFT, panel.size.x - 48.0)
+	_draw_text("弓箭手（K 開關）・只影響未來招募快照", panel.position + Vector2(24.0, 58.0), 14, Color("92B8C8"), HORIZONTAL_ALIGNMENT_LEFT, panel.size.x - 48.0)
+	for upgrade_index in SoldierUpgradeCatalog.BASE_UPGRADE_ORDER.size():
+		var upgrade_id := str(SoldierUpgradeCatalog.BASE_UPGRADE_ORDER[upgrade_index])
+		var row := Rect2(panel.position.x + 28.0, panel.position.y + 76.0 + float(upgrade_index) * 45.0, panel.size.x - 56.0, 36.0)
+		var rank := SoldierUpgradeCatalog.current_rank("archer", upgrade_id, soldier_research)
+		var cost := SoldierUpgradeCatalog.next_rank_cost("archer", upgrade_id, soldier_research)
+		draw_rect(row, Color("173B4A") if cost >= 0 else Color("31434A"))
+		draw_rect(row, Color("4E879E"), false, 1.0)
+		var cost_text := ("MAX" if cost < 0 else "$%d" % cost)
+		_draw_text("%s  Rank %d/%d" % [SoldierUpgradeCatalog.localized_name(upgrade_id, language), rank, SoldierUpgradeCatalog.max_rank(upgrade_id)], row.position + Vector2(10.0, 24.0), 15, Color("E9F7FC"), HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 120.0)
+		_draw_text(cost_text, row.position + Vector2(row.size.x - 105.0, 24.0), 15, GOLD, HORIZONTAL_ALIGNMENT_RIGHT, 94.0)
 
 
 func _draw_recruit_panel() -> void:
@@ -10518,6 +10720,41 @@ func _run_self_test() -> void:
 	malformed_command_save["command"]["point"] = "not-a-vector"
 	GameSaveManager.save_game(malformed_command_save, invalid_path)
 	_test_assert(not _load_game(invalid_path) and int(player["money"]) == money_before_invalid_load, "malformed_command_save_is_rejected")
+
+	# Gameplay-systems update regression coverage.
+	notifications.clear()
+	notifications_hidden = true
+	_add_notification("hidden income", GOLD, 2.0)
+	upgrade_effects = [{"pos": Vector2.ZERO, "radius": 40.0, "ttl": 1.0, "warmup": 0.5, "color": Color.RED}]
+	_test_assert(notifications.is_empty() and upgrade_effects.size() == 1, "notification_toggle_hides_banners_but_preserves_combat_telegraphs")
+	notifications_hidden = false
+	_initialize_empty_player()
+	player["class_id"] = "archer"
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	var research_before_full_upgrade := soldier_research.duplicate(true)
+	_apply_full_hero_upgrade()
+	_test_assert(int(player["level"]) == HERO_LEVEL_CAP and soldier_research == research_before_full_upgrade, "full_upgrade_never_upgrades_soldiers")
+	player["money"] = 100000
+	var base_attack_cost := SoldierUpgradeCatalog.next_rank_cost("archer", "attack_or_healing", soldier_research)
+	var upgrade_purchase_ok := _purchase_soldier_upgrade("archer", "attack_or_healing")
+	var upgraded_archer_snapshot := SoldierUpgradeCatalog.snapshot_for_type("archer", soldier_research)
+	_test_assert(upgrade_purchase_ok and int(player["money"]) == 100000 - base_attack_cost and float(Dictionary(upgraded_archer_snapshot["base_effects"])["attack_or_healing_bonus"]) > 0.0, "soldier_upgrade_purchase_uses_catalog_price_and_effect")
+	var recruited_archer_id := _spawn_soldier("archer", Vector2(640.0, 480.0))
+	var recruited_archer: Variant = _find_soldier_by_id(recruited_archer_id)
+	_test_assert(recruited_archer != null and Dictionary(recruited_archer).has("upgrade_snapshot") and float(Dictionary(Dictionary(recruited_archer)["upgrade_snapshot"])["base_effects"]["attack_or_healing_bonus"]) > 0.0, "future_recruits_receive_permanent_upgrade_snapshot")
+	var legacy_research := SoldierUpgradeCatalog.sanitize_research({})
+	_test_assert(SoldierUpgradeCatalog.research_is_valid(legacy_research), "legacy_save_migrates_to_valid_empty_soldier_research")
+	var player_nation := NationCatalog.player_metadata()
+	var foreign_nation := NationCatalog.metadata_for_castle(world_seed, "nation_test_foreign", Vector2(20000.0, 20000.0))
+	_test_assert(NationCatalog.is_valid_metadata(player_nation) and NationCatalog.are_hostile(player_nation, foreign_nation), "nation_metadata_defines_player_flag_and_hostility")
+	var support_source := {"level": 20, "hp": 100.0, "max_hp": 100.0, "destroyed": false}
+	var support_target := {"level": 20, "hp": 40.0, "max_hp": 100.0, "destroyed": false}
+	_reinforce_nation_castle(support_source, support_target, 2.0)
+	_test_assert(float(support_target["hp"]) > 40.0, "same_nation_castles_send_support")
+	var annex_attacker := {"level": 30, "nation": foreign_nation}
+	var annex_defender := {"destroyed": true, "nation": player_nation, "max_hp": 1000.0, "hp": 0.0, "wall_max_hp": 400.0, "wall_hp": 0.0}
+	_apply_nation_siege(annex_attacker, annex_defender, 2.0)
+	_test_assert(not bool(annex_defender["destroyed"]) and str(Dictionary(annex_defender["nation"])["id"]) == str(foreign_nation["id"]), "hostile_nation_annexes_defeated_castle")
 
 	_test_assert(GameLocalization.translate("開始遠征", "en") == "Start Expedition" and GameLocalization.translate("腐沼蟒皇・薩迦", "en") == "Corrupt Python Emperor · Saga" and GameLocalization.translate("實戰比較：重型大砲 112 傷害 ＞ 普通大砲 72 傷害", "en") == "Live-fire comparison: Heavy Cannon 112 damage > Standard Cannon 72 damage" and GameLocalization.translate("測試場景不會覆寫玩家存檔。", "en") == "Test showcases never overwrite your player save.", "english_localization_core_terms")
 	var technology_name_translations := {

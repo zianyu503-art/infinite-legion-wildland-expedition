@@ -1,5 +1,15 @@
 Original prompt: 依照 `/Users/alex/.codex/attachments/573a9183-7335-45aa-b2d1-68325b99e124/pasted-text.txt` 的完整規格，製作可直接遊玩的 Godot 無限地圖 2D 動作戰鬥／軍隊養成遊戲，並提供繁體中文操作說明與終端開啟指令。使用者明確指定套用 develop-web-game、game-engine、web-games、2d-games、game-ai-behavior、combat-design、level-design、environment-art、character-design、game-art、vfx-realtime、game-audio、game-design 技能。
 
+## 2026-08-05：國家戰線、士兵永久研究與敵軍特殊強化接線
+
+- [x] 存檔升級至 Schema 7；保存士兵研究，舊存檔安全遷移成空研究，城池國家／原國家與玩家征服旗幟隨城池資料保存。
+- [x] 城池取得 deterministic 國家 metadata 與雙語名稱／旗色；玩家佔領改掛玩家國旗，失守恢復原國家。
+- [x] 國家戰略層每 2 秒低頻更新，只處理啟用區域：同國城池互相修復援助，不同國家互相消耗城牆與主城並可吞併敗城。
+- [x] 士兵研究接入 `main.gd`：價格、研究購買、招募折扣、新兵生成快照、未來招募屬性與載入遷移；`K` 開啟永久強化面板。
+- [x] `full upgrade` 仍只提升英雄，新增回歸測試保證士兵研究完全不變。
+- [x] 敵軍強化加入 deterministic 爆擊、吸血、烈焰、麻痺節奏、分裂彈、踐踏、隕石與反應護盾／再生等戰鬥接線；預警特效不受通知開關影響。
+- [x] Godot deterministic self-test 由 203 擴充至 211，全部通過；Web 成品以 Godot 4.6.3 正式匯出。
+
 ## 2026-08-04：程序化蟒蛇 Boss 巢穴正式出現薩迦
 
 - [x] 程序化 `python_boss_lair_*` 不再只是地標；玩家進入 950px 啟動範圍時，會把唯一的「腐沼蟒皇・薩迦」控制器部署到該巢穴。
