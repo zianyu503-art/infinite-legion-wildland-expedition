@@ -10,6 +10,7 @@ const GameSaveManager = preload("res://scripts/save_manager.gd")
 const GameLocalization = preload("res://scripts/game_localization.gd")
 const EnemyEnhancementCatalog = preload("res://scripts/enemy_enhancement_catalog.gd")
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
+const SoldierUpgradeRuntime = preload("res://scripts/soldier_upgrade_runtime.gd")
 const NationCatalog = preload("res://scripts/nation_catalog.gd")
 const PythonBossControllerScript = preload("res://scripts/python_boss.gd")
 const ChaosBossControllerScript = preload("res://scripts/chaos_boss.gd")
@@ -35,7 +36,7 @@ const PLAYER_RADIUS := 17.0
 const PLAYER_HIT_GRACE_SECONDS := 0.14
 const CASTLE_CORE_COLLISION_RADIUS := 121.0
 const CASTLE_OUTER_COLLISION_RADIUS := 205.0
-const SAVE_SCHEMA := 7
+const SAVE_SCHEMA := 8
 const NATION_TICK_INTERVAL := 2.0
 const NATION_SUPPORT_RADIUS := 1750.0
 const NATION_WAR_RADIUS := 1250.0
@@ -55,6 +56,8 @@ const BOSS_HOME_CLEAR_RADIUS := 260.0
 const MAX_UPGRADE_EFFECTS := 72
 const MAX_UPGRADE_MINES_PER_TEAM := 24
 const MAX_UPGRADE_LINGERING_PER_TEAM := 16
+const MAX_UPGRADE_SUMMONS_PER_TEAM := 5
+const UPGRADE_EFFECT_SCAN_INTERVAL := 0.10
 
 const FRIEND_BLUE := Color("3B82F6")
 const FRIEND_DARK := Color("12365A")
@@ -133,6 +136,11 @@ var recruit_anchor := HOUSE_POS
 var tutorial_visible := true
 var notifications_hidden := false
 var soldier_research: Dictionary = {}
+var soldier_upgrade_type_index := 0
+var soldier_upgrade_category := "base"
+var soldier_upgrade_page := 0
+var soldier_upgrade_shared_cooldowns: Dictionary = {}
+var soldier_boss_debuffs: Dictionary = {}
 var nation_tick_timer := 0.0
 var tutorial_step := 0
 var master_volume := 0.75
@@ -140,6 +148,7 @@ var sound_muted := false
 var language := "zh_TW"
 var input_scheme: int = InputScheme.KEYBOARD_MOUSE
 var touch_capable := false
+var touch_ui_coordinate_scale := 1.0
 var touch_move_pointer := -1
 var touch_aim_pointer := -1
 var touch_move_vector := Vector2.ZERO
@@ -175,6 +184,7 @@ var _web_test_showcase_active := false
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	screen_size = get_viewport_rect().size
+	_refresh_touch_ui_coordinate_scale()
 	get_viewport().size_changed.connect(_on_viewport_size_changed)
 	var user_args := OS.get_cmdline_user_args()
 	var self_test_requested := "--self-test" in user_args
@@ -196,6 +206,12 @@ func _ready() -> void:
 	world_generator = WorldGenerator.new(world_seed)
 	_initialize_empty_player()
 	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	soldier_upgrade_type_index = 0
+	soldier_upgrade_category = "base"
+	soldier_upgrade_page = 0
+	soldier_upgrade_shared_cooldowns.clear()
+	soldier_boss_debuffs.clear()
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
 	_load_profile_progression()
 	_initialize_python_boss()
 	_initialize_chaos_boss()
@@ -216,8 +232,25 @@ func _ready() -> void:
 
 func _on_viewport_size_changed() -> void:
 	screen_size = get_viewport_rect().size
+	_refresh_touch_ui_coordinate_scale()
 	_layout_cheat_input()
 	queue_redraw()
+
+
+func _refresh_touch_ui_coordinate_scale() -> void:
+	# canvas_items + expand keeps a 720-high logical viewport on wide phones.
+	# Browser input is converted into those logical coordinates, so controls must
+	# grow by the same ratio to retain their intended CSS-pixel touch targets.
+	touch_ui_coordinate_scale = 1.0
+	if not OS.has_feature("web"):
+		return
+	var css_width: Variant = JavaScriptBridge.eval("Math.max(1, window.innerWidth || 1)", true)
+	var css_height: Variant = JavaScriptBridge.eval("Math.max(1, window.innerHeight || 1)", true)
+	if typeof(css_width) not in [TYPE_INT, TYPE_FLOAT] or typeof(css_height) not in [TYPE_INT, TYPE_FLOAT]:
+		return
+	var width_ratio := screen_size.x / maxf(1.0, float(css_width))
+	var height_ratio := screen_size.y / maxf(1.0, float(css_height))
+	touch_ui_coordinate_scale = clampf(maxf(width_ratio, height_ratio), 1.0, 3.0)
 
 
 func _detect_initial_language_and_input() -> void:
@@ -641,6 +674,12 @@ func _web_force_heavy_cannon_combat_showcase_for_test(arguments: Array) -> bool:
 	projectiles.clear()
 	hazards.clear()
 	upgrade_effects.clear()
+	soldier_boss_debuffs.clear()
+	soldier_upgrade_shared_cooldowns.clear()
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	soldier_upgrade_type_index = 0
+	soldier_upgrade_category = "base"
+	soldier_upgrade_page = 0
 	particles.clear()
 	floaters.clear()
 	spawned_chunks.clear()
@@ -900,6 +939,11 @@ func render_game_to_text() -> String:
 	var visible_soldiers: Array[Dictionary] = []
 	for soldier in soldiers:
 		if player_position.distance_to(soldier["pos"]) <= 900.0:
+			var active_special_ids: Array[String] = []
+			var soldier_snapshot: Dictionary = Dictionary(soldier.get("upgrade_snapshot", {}))
+			for special_value in Array(soldier_snapshot.get("active_specials", [])):
+				if special_value is Dictionary:
+					active_special_ids.append(str(Dictionary(special_value).get("id", "")))
 			visible_soldiers.append({
 				"id": int(soldier["id"]),
 				"type": str(soldier["type"]),
@@ -910,6 +954,7 @@ func render_game_to_text() -> String:
 				"attack": snappedf(float(soldier["attack"]), 0.1),
 				"charge": snappedf(float(soldier.get("charge", 0.0)), 0.01),
 				"state": str(soldier["state"]),
+				"specials": active_special_ids,
 			})
 	var visible_projectiles: Array[Dictionary] = []
 	for projectile in projectiles:
@@ -940,6 +985,83 @@ func render_game_to_text() -> String:
 	var aionis_direction := aionis_delta.normalized() if aionis_delta.length_squared() > 0.001 else Vector2.ZERO
 	var aionis_marker_defeated: bool = aionis_boss_defeated or (aionis_boss != null and bool(aionis_boss.is_defeated()))
 	var aionis_marker_engaged: bool = aionis_boss != null and bool(aionis_boss.is_engaged())
+	var touch_utility_rects := _touch_utility_rects()
+	var touch_upgrade_test_rect := Rect2(touch_utility_rects.get("upgrades", Rect2()))
+	var touch_scale := maxf(0.001, touch_ui_coordinate_scale)
+	var touch_radius := TOUCH_STICK_RADIUS * touch_scale
+	var touch_move_rect := Rect2(_touch_move_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
+	var touch_attack_rect := Rect2(_touch_aim_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
+	var touch_special_button_rect := _touch_special_rect()
+	var touch_recruit_enabled := player_position.distance_to(HOUSE_POS) <= 185.0
+	if not touch_recruit_enabled:
+		for castle_value in castles.values():
+			var recruit_castle: Dictionary = Dictionary(castle_value)
+			if bool(recruit_castle.get("owned", false)) and player_position.distance_to(Vector2(recruit_castle.get("pos", Vector2.ZERO))) <= 210.0:
+				touch_recruit_enabled = true
+				break
+	var touch_utility_state := {}
+	for action_value in touch_utility_rects.keys():
+		var action := str(action_value)
+		var action_rect := Rect2(touch_utility_rects[action])
+		touch_utility_state[action] = {
+			"x": snappedf(action_rect.position.x, 0.1),
+			"y": snappedf(action_rect.position.y, 0.1),
+			"width": snappedf(action_rect.size.x, 0.1),
+			"height": snappedf(action_rect.size.y, 0.1),
+			"enabled": action != "recruit" or touch_recruit_enabled,
+		}
+	var touch_close_rect := _touch_panel_close_rect()
+	var touch_recruit_controls: Array[Dictionary] = []
+	if _is_touch_scheme() and active_panel == "recruit":
+		var recruit_panel := _recruit_panel_rect()
+		var recruit_roster := _recruitable_soldier_order()
+		for recruit_index in recruit_roster.size():
+			var recruit_rect := _recruit_buy_rect(recruit_index, recruit_panel)
+			touch_recruit_controls.append({
+				"type": str(recruit_roster[recruit_index]),
+				"x": snappedf(recruit_rect.position.x, 0.1),
+				"y": snappedf(recruit_rect.position.y, 0.1),
+				"width": snappedf(recruit_rect.size.x, 0.1),
+				"height": snappedf(recruit_rect.size.y, 0.1),
+			})
+	var touch_command_controls: Array[Dictionary] = []
+	if _is_touch_scheme() and active_panel == "command":
+		var command_panel := _command_panel_rect()
+		var command_names := ["跟隨", "防守", "攻擊", "撤退", "駐守", "攻城"]
+		for command_index in command_names.size():
+			var command_rect := _command_button_rect(command_index, command_panel)
+			touch_command_controls.append({
+				"command": str(command_names[command_index]),
+				"x": snappedf(command_rect.position.x, 0.1),
+				"y": snappedf(command_rect.position.y, 0.1),
+				"width": snappedf(command_rect.size.x, 0.1),
+				"height": snappedf(command_rect.size.y, 0.1),
+			})
+	var touch_pause_controls: Array[Dictionary] = []
+	var touch_pause_language := {}
+	var touch_pause_volume := {}
+	if _is_touch_scheme() and mode == GameMode.PAUSED:
+		var pause_action_names := _pause_actions()
+		for pause_index in pause_action_names.size():
+			var pause_rect := _pause_button_rect(pause_index)
+			touch_pause_controls.append({
+				"action": str(pause_action_names[pause_index]),
+				"x": snappedf(pause_rect.position.x, 0.1),
+				"y": snappedf(pause_rect.position.y, 0.1),
+				"width": snappedf(pause_rect.size.x, 0.1),
+				"height": snappedf(pause_rect.size.y, 0.1),
+			})
+		var pause_language_rect := _pause_language_rect()
+		touch_pause_language = {
+			"x": snappedf(pause_language_rect.position.x, 0.1), "y": snappedf(pause_language_rect.position.y, 0.1),
+			"width": snappedf(pause_language_rect.size.x, 0.1), "height": snappedf(pause_language_rect.size.y, 0.1),
+		}
+		for volume_action in ["down", "mute", "up"]:
+			var volume_rect := _pause_volume_rect(str(volume_action))
+			touch_pause_volume[str(volume_action)] = {
+				"x": snappedf(volume_rect.position.x, 0.1), "y": snappedf(volume_rect.position.y, 0.1),
+				"width": snappedf(volume_rect.size.x, 0.1), "height": snappedf(volume_rect.size.y, 0.1),
+			}
 	var payload := {
 		"coordinate_system": "world origin=(0,0); +x right; +y down; distances in Godot pixels",
 		"mode": mode_names[clampi(mode, 0, mode_names.size() - 1)],
@@ -949,6 +1071,48 @@ func render_game_to_text() -> String:
 		"input": {
 			"scheme": "touch" if _is_touch_scheme() else "keyboard_mouse",
 			"touch_capable": touch_capable,
+			"logical_viewport_width": snappedf(screen_size.x, 0.1),
+			"logical_viewport_height": snappedf(screen_size.y, 0.1),
+			"touch_ui_coordinate_scale": snappedf(touch_ui_coordinate_scale, 0.001),
+			"attack_held": attack_held if _is_touch_scheme() else false,
+			"troop_upgrade_button": {
+				"x": snappedf(touch_upgrade_test_rect.position.x, 0.1),
+				"y": snappedf(touch_upgrade_test_rect.position.y, 0.1),
+				"width": snappedf(touch_upgrade_test_rect.size.x, 0.1),
+				"height": snappedf(touch_upgrade_test_rect.size.y, 0.1),
+			},
+			"virtual_controls": {
+				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
+				"coordinate_space": "logical_viewport_pixels",
+				"move": {
+					"x": snappedf(touch_move_rect.position.x, 0.1), "y": snappedf(touch_move_rect.position.y, 0.1),
+					"width": snappedf(touch_move_rect.size.x, 0.1), "height": snappedf(touch_move_rect.size.y, 0.1),
+					"center_x": snappedf(_touch_move_center().x, 0.1), "center_y": snappedf(_touch_move_center().y, 0.1),
+					"radius": snappedf(touch_radius, 0.1), "pointer": touch_move_pointer,
+				},
+				"attack": {
+					"x": snappedf(touch_attack_rect.position.x, 0.1), "y": snappedf(touch_attack_rect.position.y, 0.1),
+					"width": snappedf(touch_attack_rect.size.x, 0.1), "height": snappedf(touch_attack_rect.size.y, 0.1),
+					"center_x": snappedf(_touch_aim_center().x, 0.1), "center_y": snappedf(_touch_aim_center().y, 0.1),
+					"radius": snappedf(touch_radius, 0.1), "pointer": touch_aim_pointer, "held": attack_held,
+				},
+				"special": {
+					"x": snappedf(touch_special_button_rect.position.x, 0.1), "y": snappedf(touch_special_button_rect.position.y, 0.1),
+					"width": snappedf(touch_special_button_rect.size.x, 0.1), "height": snappedf(touch_special_button_rect.size.y, 0.1),
+					"enabled": int(player.get("level", 1)) >= 10,
+				},
+				"utility": touch_utility_state,
+				"panel_close": {
+					"visible": _is_touch_scheme() and mode == GameMode.PLAYING and not active_panel.is_empty() and touch_close_rect.has_area(),
+					"x": snappedf(touch_close_rect.position.x, 0.1), "y": snappedf(touch_close_rect.position.y, 0.1),
+					"width": snappedf(touch_close_rect.size.x, 0.1), "height": snappedf(touch_close_rect.size.y, 0.1),
+				},
+				"recruit_buy": touch_recruit_controls,
+				"command_buttons": touch_command_controls,
+				"pause_actions": touch_pause_controls,
+				"pause_language": touch_pause_language,
+				"pause_volume": touch_pause_volume,
+			},
 			"needs_landscape_rotation": _needs_landscape_rotation(),
 			"notifications_hidden": notifications_hidden,
 			"move_x": snappedf(touch_move_vector.x, 0.01) if _is_touch_scheme() else 0.0,
@@ -970,6 +1134,14 @@ func render_game_to_text() -> String:
 			"special_cooldown": snappedf(float(player.get("special_cd", 0.0)), 0.01),
 		},
 		"army": {"command": soldier_command, "count": soldiers.size(), "limit": _army_limit(), "owned_castle_level_total": _owned_castle_level_total(), "command_castle_id": command_castle_id, "visible": visible_soldiers},
+		"soldier_upgrades": {
+			"catalog_schema": SoldierUpgradeCatalog.SCHEMA_VERSION,
+			"special_count": SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER.size(),
+			"selected_type": _selected_soldier_upgrade_type(),
+			"category": soldier_upgrade_category,
+			"page": soldier_upgrade_page,
+			"selected_research": Dictionary(Dictionary(soldier_research.get("types", {})).get(_selected_soldier_upgrade_type(), {})).duplicate(true),
+		},
 		"enemies": visible_enemies,
 		"projectiles": visible_projectiles,
 		"castles": visible_castles,
@@ -1255,6 +1427,9 @@ func _initialize_empty_player() -> void:
 		"dash_dir": Vector2.RIGHT,
 		"dash_hit": {},
 		"dash_attack_id": "",
+		"support_shield": 0.0,
+		"support_shield_ttl": 0.0,
+		"holy_shield_ready_at": 0.0,
 		"alive": true,
 	}
 
@@ -1313,6 +1488,12 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	projectiles.clear()
 	hazards.clear()
 	upgrade_effects.clear()
+	soldier_boss_debuffs.clear()
+	soldier_upgrade_shared_cooldowns.clear()
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	soldier_upgrade_type_index = 0
+	soldier_upgrade_category = "base"
+	soldier_upgrade_page = 0
 	particles.clear()
 	floaters.clear()
 	tombstones.clear()
@@ -1340,25 +1521,37 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 
 
 func _touch_move_center() -> Vector2:
-	return Vector2(122.0, screen_size.y - 132.0)
+	var scale := touch_ui_coordinate_scale
+	return Vector2(122.0 * scale, screen_size.y - 132.0 * scale)
 
 
 func _touch_aim_center() -> Vector2:
-	return Vector2(screen_size.x - 122.0, screen_size.y - 132.0)
+	var scale := touch_ui_coordinate_scale
+	return Vector2(screen_size.x - 122.0 * scale, screen_size.y - 132.0 * scale)
 
 
 func _touch_special_rect() -> Rect2:
-	return Rect2(Vector2(screen_size.x - 326.0, screen_size.y - 180.0), Vector2(92.0, 92.0))
+	var scale := touch_ui_coordinate_scale
+	return Rect2(Vector2(screen_size.x - 326.0 * scale, screen_size.y - 180.0 * scale), Vector2(92.0, 92.0) * scale)
 
 
 func _touch_utility_rects() -> Dictionary:
-	var gap := 8.0
-	var keys := ["guide", "map", "skills", "recruit", "command", "notices", "cheat", "pause"]
-	var total_width := TOUCH_BUTTON_SIZE * keys.size() + gap * (keys.size() - 1)
-	var start_x := screen_size.x - total_width - 18.0
+	var keys := ["guide", "map", "skills", "upgrades", "recruit", "command", "notices", "cheat", "fullscreen", "pause"]
 	var result := {}
+	var scale := touch_ui_coordinate_scale
+	var css_size := screen_size / scale
+	var compact := css_size.y < 540.0 or css_size.x < 1000.0
+	var button_size := (52.0 if compact else 68.0) * scale
+	var gap := (6.0 if compact else 8.0) * scale
+	var columns := 5
+	var start_y := (82.0 if compact else 106.0) * scale
 	for index in keys.size():
-		result[keys[index]] = Rect2(start_x + float(index) * (TOUCH_BUTTON_SIZE + gap), 186.0, TOUCH_BUTTON_SIZE, TOUCH_BUTTON_SIZE)
+		var row := index / columns
+		var column := index % columns
+		var items_in_row := mini(columns, keys.size() - row * columns)
+		var row_width := button_size * float(items_in_row) + gap * float(items_in_row - 1)
+		var start_x := (screen_size.x - row_width) * 0.5
+		result[keys[index]] = Rect2(start_x + float(column) * (button_size + gap), start_y + float(row) * (button_size + gap), button_size, button_size)
 	return result
 
 
@@ -1367,12 +1560,19 @@ func _touch_panel_close_rect() -> Rect2:
 	match active_panel:
 		"skills": panel = _skills_panel_rect()
 		"recruit": panel = _recruit_panel_rect()
+		"soldier_upgrades":
+			panel = _soldier_upgrade_panel_rect()
+			var scale := touch_ui_coordinate_scale
+			return Rect2(panel.end.x - 72.0 * scale, panel.position.y + 6.0 * scale, 64.0 * scale, 44.0 * scale)
 		"map": panel = _map_panel_rect()
 		"command": panel = _command_panel_rect()
 		"confirm_restart":
 			return Rect2(screen_size.x * 0.5 + 2.0, screen_size.y * 0.5 + 28.0, 132.0, 70.0)
 		_:
 			return Rect2()
+	if _is_touch_scheme():
+		var scale := touch_ui_coordinate_scale
+		return Rect2(panel.end.x - 72.0 * scale, panel.position.y + 6.0 * scale, 64.0 * scale, 44.0 * scale)
 	return Rect2(panel.end.x - 126.0, panel.position.y + 8.0, 110.0, 72.0)
 
 
@@ -1388,6 +1588,10 @@ func _cheat_toggle_rect() -> Rect2:
 	return Rect2(screen_size.x - 230.0, 222.0, 212.0, 34.0)
 
 
+func _soldier_upgrade_toggle_rect() -> Rect2:
+	return Rect2(screen_size.x - 230.0, 262.0, 212.0, 38.0)
+
+
 func _tutorial_panel_rect() -> Rect2:
 	var tutorial_y := 158.0
 	if python_boss != null:
@@ -1399,6 +1603,9 @@ func _tutorial_panel_rect() -> Rect2:
 
 func _tutorial_close_rect() -> Rect2:
 	var tutorial := _tutorial_panel_rect()
+	if _is_touch_scheme():
+		var scale := touch_ui_coordinate_scale
+		return Rect2(tutorial.end.x - 48.0 * scale, tutorial.position.y + 3.0 * scale, 48.0 * scale, 44.0 * scale)
 	return Rect2(tutorial.end.x - 70.0, tutorial.position.y + 3.0, 66.0, 52.0)
 
 
@@ -1452,6 +1659,9 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 			"guide": tutorial_visible = not tutorial_visible
 			"map": active_panel = "map"
 			"skills": active_panel = "skills"
+			"upgrades":
+				active_panel = "soldier_upgrades"
+				soldier_upgrade_page = 0
 			"recruit":
 				if _is_near_recruitment():
 					active_panel = "recruit"
@@ -1460,6 +1670,7 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 			"command": active_panel = "command"
 			"notices": _toggle_notifications()
 			"cheat": _open_cheat_input()
+			"fullscreen": _toggle_fullscreen()
 			"pause": mode = GameMode.PAUSED
 		audio.play("ui", 0.45)
 		queue_redraw()
@@ -1469,18 +1680,22 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 
 func _update_touch_move(position: Vector2) -> void:
 	touch_move_position = position
-	var offset := (position - _touch_move_center()).limit_length(TOUCH_STICK_RADIUS)
+	var scale := touch_ui_coordinate_scale
+	var radius := TOUCH_STICK_RADIUS * scale
+	var deadzone := 10.0 * scale
+	var offset := (position - _touch_move_center()).limit_length(radius)
 	var magnitude := offset.length()
-	if magnitude <= 10.0:
+	if magnitude <= deadzone:
 		touch_move_vector = Vector2.ZERO
 	else:
-		touch_move_vector = offset.normalized() * clampf((magnitude - 10.0) / (TOUCH_STICK_RADIUS - 10.0), 0.0, 1.0)
+		touch_move_vector = offset.normalized() * clampf((magnitude - deadzone) / maxf(1.0, radius - deadzone), 0.0, 1.0)
 
 
 func _update_touch_aim(position: Vector2) -> void:
 	touch_aim_position = position
-	var offset := (position - _touch_aim_center()).limit_length(TOUCH_STICK_RADIUS)
-	if offset.length() >= 8.0:
+	var scale := touch_ui_coordinate_scale
+	var offset := (position - _touch_aim_center()).limit_length(TOUCH_STICK_RADIUS * scale)
+	if offset.length() >= 8.0 * scale:
 		touch_aim_vector = offset.normalized()
 	attack_held = true
 
@@ -1614,6 +1829,7 @@ func _input(event: InputEvent) -> void:
 					_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
 			KEY_K:
 				active_panel = "" if active_panel == "soldier_upgrades" else "soldier_upgrades"
+				soldier_upgrade_page = 0
 			KEY_M:
 				active_panel = "" if active_panel == "map" else "map"
 			KEY_H:
@@ -1690,6 +1906,7 @@ func _simulate_game(delta: float) -> void:
 		_update_castles_and_camps(delta)
 		_update_enemies(delta)
 		_update_soldiers(delta)
+		_update_soldier_boss_debuffs(delta)
 		_update_python_boss(delta)
 		_update_chaos_boss(delta)
 		_update_aionis_boss(delta)
@@ -1725,7 +1942,7 @@ func _update_python_boss(delta: float) -> void:
 	var boss_state: Dictionary = python_boss.get_text_state()
 	if str(boss_state.get("state", "")) == "IDLE":
 		python_boss.refresh_scaling(_python_boss_world_tier_for_lair(active_python_boss_lair_id), int(player.get("level", 1)))
-	var events_value: Variant = python_boss.update(delta, _python_boss_context())
+	var events_value: Variant = python_boss.update(delta * _soldier_boss_time_scale(), _python_boss_context())
 	if not events_value is Array:
 		return
 	for event_value in Array(events_value):
@@ -1851,7 +2068,7 @@ func _apply_python_boss_event(event: Dictionary) -> void:
 func _update_chaos_boss(delta: float) -> void:
 	if chaos_boss == null or final_boss_defeated:
 		return
-	var events_value: Variant = chaos_boss.update(delta, _chaos_boss_context())
+	var events_value: Variant = chaos_boss.update(delta * _soldier_boss_time_scale(), _chaos_boss_context())
 	if events_value is Array:
 		for event_value in Array(events_value):
 			if event_value is Dictionary:
@@ -2131,6 +2348,7 @@ func _chaos_area_damage(center: Vector2, radius: float, damage: float, skill: St
 	for soldier in soldiers:
 		if Vector2(soldier["pos"]).distance_to(center) <= radius + float(soldier["radius"]):
 			_damage_soldier(soldier, minf(damage, float(soldier["max_hp"]) * 0.72), center, "area")
+	_damage_guardians_in_area(center, radius, damage)
 
 
 # -----------------------------------------------------------------------------
@@ -2145,7 +2363,7 @@ func _update_aionis_boss(delta: float) -> void:
 		# needs to finish its own lifetime instead of freezing forever on screen.
 		_update_aionis_runtime(delta)
 		return
-	var events_value: Variant = aionis_boss.update(delta, _aionis_boss_context())
+	var events_value: Variant = aionis_boss.update(delta * _soldier_boss_time_scale(), _aionis_boss_context())
 	if events_value is Array:
 		for event_value in Array(events_value):
 			if event_value is Dictionary:
@@ -2355,6 +2573,9 @@ func _update_aionis_runtime(delta: float) -> void:
 				var soldier_time := _segment_circle_hit_time(previous, impact_position, Vector2(soldier["pos"]), float(soldier["radius"]) + float(projectile.get("radius", 18.0)))
 				if soldier_time < best_time:
 					best_time = soldier_time
+			var guardian_hit := _guardian_projectile_intersection(previous, impact_position, float(projectile.get("radius", 18.0)))
+			if bool(guardian_hit.get("hit", false)) and float(guardian_hit.get("time", 2.0)) < best_time:
+				best_time = float(guardian_hit["time"])
 			if best_time <= 1.0:
 				impacted = true
 				impact_position = previous.lerp(impact_position, best_time)
@@ -2394,6 +2615,7 @@ func _aionis_area_damage(center: Vector2, radius: float, damage: float, skill: S
 		if Vector2(soldier["pos"]).distance_to(center) <= radius + float(soldier["radius"]):
 			var soldier_cap := float(soldier["max_hp"]) * (0.34 if repeated else 0.74)
 			_damage_soldier(soldier, minf(damage, soldier_cap), center, "area")
+	_damage_guardians_in_area(center, radius, damage)
 
 
 func _complete_aionis_boss_victory(gold: int, xp: int) -> void:
@@ -2528,10 +2750,10 @@ func _active_boss_target_proxy() -> Dictionary:
 	var kind := _active_boss_kind()
 	if kind == "aionis":
 		var aionis_state: Dictionary = aionis_boss.get_text_state()
-		return {"id": BOSS_ENTITY_ID, "type": "aionis_boss", "pos": _aionis_boss_position(), "vel": Vector2(float(aionis_state.get("velocity_x", 0.0)), float(aionis_state.get("velocity_y", 0.0))), "radius": aionis_boss.get_radius()}
+		return {"id": BOSS_ENTITY_ID, "type": "aionis_boss", "pos": _aionis_boss_position(), "vel": Vector2(float(aionis_state.get("velocity_x", 0.0)), float(aionis_state.get("velocity_y", 0.0))), "radius": aionis_boss.get_radius(), "hp": float(aionis_state.get("hp", 1.0)), "max_hp": float(aionis_state.get("max_hp", 1.0))}
 	if kind == "chaos":
 		var state: Dictionary = chaos_boss.get_text_state()
-		return {"id": BOSS_ENTITY_ID, "type": "chaos_boss", "pos": _chaos_boss_position(), "vel": Vector2(float(state.get("velocity_x", 0.0)), float(state.get("velocity_y", 0.0))), "radius": chaos_boss.get_radius()}
+		return {"id": BOSS_ENTITY_ID, "type": "chaos_boss", "pos": _chaos_boss_position(), "vel": Vector2(float(state.get("velocity_x", 0.0)), float(state.get("velocity_y", 0.0))), "radius": chaos_boss.get_radius(), "hp": float(state.get("hp", 1.0)), "max_hp": float(state.get("max_hp", 1.0))}
 	return _python_boss_target_proxy()
 
 
@@ -2556,20 +2778,123 @@ func _active_boss_projectile_intersection(from: Vector2, to: Vector2, projectile
 	return {"hit": false}
 
 
+func _update_soldier_boss_debuffs(delta: float) -> void:
+	for timer_key in ["slow_ttl", "void_ttl", "focus_ttl"]:
+		soldier_boss_debuffs[timer_key] = maxf(0.0, float(soldier_boss_debuffs.get(timer_key, 0.0)) - delta)
+	if float(soldier_boss_debuffs.get("slow_ttl", 0.0)) <= 0.0:
+		soldier_boss_debuffs["slow_ratio"] = 0.0
+	if float(soldier_boss_debuffs.get("void_ttl", 0.0)) <= 0.0:
+		soldier_boss_debuffs["void_bonus"] = 0.0
+	if float(soldier_boss_debuffs.get("focus_ttl", 0.0)) <= 0.0:
+		soldier_boss_debuffs["focus_bonus"] = 0.0
+		soldier_boss_debuffs["focus_source_id"] = -1
+
+
+func _soldier_boss_time_scale() -> float:
+	return 1.0 - clampf(float(soldier_boss_debuffs.get("slow_ratio", 0.0)), 0.0, 0.45) if float(soldier_boss_debuffs.get("slow_ttl", 0.0)) > 0.0 else 1.0
+
+
+func _soldier_boss_damage_multiplier(source_id: int) -> float:
+	var multiplier := 1.0
+	if float(soldier_boss_debuffs.get("void_ttl", 0.0)) > 0.0:
+		multiplier *= 1.0 + clampf(float(soldier_boss_debuffs.get("void_bonus", 0.0)), 0.0, 1.0)
+	if float(soldier_boss_debuffs.get("focus_ttl", 0.0)) > 0.0 and int(soldier_boss_debuffs.get("focus_source_id", -1)) != source_id:
+		multiplier *= 1.0 + clampf(float(soldier_boss_debuffs.get("focus_bonus", 0.0)), 0.0, 1.0)
+	return multiplier
+
+
+func _apply_soldier_boss_statuses(soldier: Dictionary, hit_damage: float, damage_type: String) -> void:
+	var source_id := int(soldier.get("id", -1))
+	var frost := _soldier_special(soldier, "frost_arrow")
+	if not frost.is_empty():
+		soldier_boss_debuffs["slow_ttl"] = maxf(float(soldier_boss_debuffs.get("slow_ttl", 0.0)), float(frost.get("duration", 2.0)))
+		soldier_boss_debuffs["slow_ratio"] = maxf(float(soldier_boss_debuffs.get("slow_ratio", 0.0)), float(frost.get("boss_slow_ratio", 0.08)))
+	var paralysis := _soldier_special(soldier, "paralysis_arrow")
+	if not paralysis.is_empty():
+		var sequence := int(Dictionary(soldier.get("special_runtime", {})).get("attack_sequence", 0))
+		if sequence > 0 and sequence % maxi(1, int(paralysis.get("arrow_interval", 7))) == 0:
+			soldier_boss_debuffs["slow_ttl"] = maxf(float(soldier_boss_debuffs.get("slow_ttl", 0.0)), float(paralysis.get("normal_stun", 0.45)) * 2.0)
+			soldier_boss_debuffs["slow_ratio"] = maxf(float(soldier_boss_debuffs.get("slow_ratio", 0.0)), 0.10)
+	var suppression := _soldier_special(soldier, "suppression")
+	if not suppression.is_empty():
+		var hits: Dictionary = Dictionary(soldier_boss_debuffs.get("suppression_hits", {}))
+		var key := str(source_id)
+		var count := int(hits.get(key, 0)) + 1
+		if count >= maxi(1, int(suppression.get("hit_threshold", 6))):
+			count = 0
+			soldier_boss_debuffs["slow_ttl"] = maxf(float(soldier_boss_debuffs.get("slow_ttl", 0.0)), float(suppression.get("effect_duration", 3.5)))
+			var reduced_ratio := maxf(float(suppression.get("move_reduction", 0.2)), float(suppression.get("attack_speed_reduction", 0.1))) * 0.5
+			soldier_boss_debuffs["slow_ratio"] = maxf(float(soldier_boss_debuffs.get("slow_ratio", 0.0)), reduced_ratio)
+		hits[key] = count
+		soldier_boss_debuffs["suppression_hits"] = hits
+	var void_mark := _soldier_special(soldier, "void_mark")
+	if not void_mark.is_empty():
+		soldier_boss_debuffs["void_ttl"] = maxf(float(soldier_boss_debuffs.get("void_ttl", 0.0)), float(void_mark.get("duration", 4.0)))
+		soldier_boss_debuffs["void_bonus"] = maxf(float(soldier_boss_debuffs.get("void_bonus", 0.0)), float(void_mark.get("soldier_damage_taken_bonus", 0.0)))
+	var focus := _soldier_special(soldier, "focus_mark")
+	if not focus.is_empty():
+		soldier_boss_debuffs["focus_ttl"] = float(focus.get("effect_duration", 4.0))
+		soldier_boss_debuffs["focus_source_id"] = source_id
+		soldier_boss_debuffs["focus_bonus"] = float(focus.get("other_ally_damage_bonus", 0.0)) * float(focus.get("boss_multiplier", 0.5))
+	var burn := _soldier_special(soldier, "burning_sword" if damage_type == "melee" else "burning_ammo")
+	if not burn.is_empty():
+		_refresh_soldier_boss_dot("boss_burn", soldier, hit_damage, float(burn.get("total_burn_ratio", 0.0)), float(burn.get("duration", 3.0)), 1)
+	var poison := _soldier_special(soldier, "toxic_payload")
+	if not poison.is_empty():
+		_refresh_soldier_boss_dot("boss_poison", soldier, hit_damage, float(poison.get("total_poison_ratio", 0.0)), float(poison.get("duration", 5.0)), maxi(1, int(poison.get("max_stacks", 3))))
+	var taunt := _soldier_special(soldier, "taunt_guard")
+	if not taunt.is_empty() and _active_boss_kind() == "python" and python_boss != null and python_boss.is_engaged():
+		python_boss.add_threat("soldier", source_id, 14.0)
+
+
+func _refresh_soldier_boss_dot(kind: String, soldier: Dictionary, hit_damage: float, total_ratio: float, duration: float, max_stacks: int) -> void:
+	var safe_duration := maxf(0.1, duration)
+	for effect in upgrade_effects:
+		if str(effect.get("kind", "")) != kind or int(effect.get("source_id", -1)) != int(soldier["id"]):
+			continue
+		effect["ttl"] = safe_duration
+		effect["stacks"] = mini(max_stacks, int(effect.get("stacks", 1)) + 1)
+		effect["damage_per_stack"] = maxf(float(effect.get("damage_per_stack", 0.0)), hit_damage * total_ratio / safe_duration * 0.5)
+		return
+	_add_upgrade_runtime_effect({
+		"kind": kind, "source_id": int(soldier["id"]), "source_kind": "upgrade_dot", "pos": _active_boss_position(),
+		"ttl": safe_duration, "warmup": 0.0, "radius": 34.0, "tick": 0.5, "tick_interval": 0.5,
+		"stacks": 1, "damage_per_stack": hit_damage * total_ratio / safe_duration * 0.5,
+		"max_per_owner": 1, "color": FIRE_ORANGE if kind == "boss_burn" else Color("83D16F"),
+	})
+
+
 func _receive_active_boss_hit(attack_id: Variant, source_kind: String, source_id: int, damage: float, hit_position: Vector2, damage_type: String, armor_penetration: float = 0.0) -> Dictionary:
+	var soldier_source: Variant = _find_soldier_by_id(source_id)
+	var is_direct_soldier_hit := soldier_source != null and GameConfig.SOLDIERS.has(source_kind) and damage_type != "status" and not damage_type.begins_with("upgrade")
+	if is_direct_soldier_hit:
+		damage *= _soldier_boss_damage_multiplier(source_id)
+		_apply_soldier_boss_statuses(soldier_source, damage, damage_type)
+		if damage_type == "melee":
+			var armor_core := _soldier_special(soldier_source, "armor_piercing_core")
+			armor_penetration += float(armor_core.get("ignored_armor", 0.0)) if not armor_core.is_empty() else 0.0
 	var kind := _active_boss_kind()
+	var result: Dictionary
 	if kind == "aionis":
 		for anchor in aionis_boss.get_anchor_targets():
 			if bool(anchor.get("broken", false)):
 				continue
 			if hit_position.distance_to(Vector2(anchor["position"])) <= float(anchor["radius"]) * 1.35:
-				return aionis_boss.receive_anchor_hit(str(anchor["id"]), damage, "%s:%d" % [source_kind, source_id])
-		if damage_type in ["projectile", "beam"] and _aionis_reflection_ratio() > 0.0:
-			return _aionis_reflected_hit_result(source_kind, source_id, damage, hit_position)
-		return aionis_boss.receive_hit(damage, "%s:%d" % [source_kind, source_id], hit_position, "critical" if armor_penetration >= 18.0 else damage_type)
-	if kind == "chaos":
-		return chaos_boss.receive_hit(damage, "%s:%d" % [source_kind, source_id], hit_position, "critical" if armor_penetration >= 18.0 else damage_type)
-	return python_boss.receive_hit(attack_id, source_kind, source_id, damage, hit_position, damage_type, armor_penetration)
+				result = aionis_boss.receive_anchor_hit(str(anchor["id"]), damage, "%s:%d" % [source_kind, source_id])
+				break
+		if result.is_empty():
+			if damage_type in ["projectile", "beam"] and _aionis_reflection_ratio() > 0.0:
+				result = _aionis_reflected_hit_result(source_kind, source_id, damage, hit_position)
+			else:
+				result = aionis_boss.receive_hit(damage, "%s:%d" % [source_kind, source_id], hit_position, "critical" if armor_penetration >= 18.0 else damage_type)
+	elif kind == "chaos":
+		result = chaos_boss.receive_hit(damage, "%s:%d" % [source_kind, source_id], hit_position, "critical" if armor_penetration >= 18.0 else damage_type)
+	elif python_boss != null:
+		result = python_boss.receive_hit(attack_id, source_kind, source_id, damage, hit_position, damage_type, armor_penetration)
+	if is_direct_soldier_hit and bool(result.get("accepted", false)):
+		var specials: Dictionary = Dictionary(Dictionary(soldier_source.get("upgrade_snapshot", {})).get("special_effects", {}))
+		_apply_soldier_lifesteal(source_id, float(result.get("damage", 0.0)), specials)
+	return result
 
 
 func _consume_active_boss_hit_result(result: Dictionary) -> bool:
@@ -2611,7 +2936,7 @@ func _damage_active_boss_melee(attack_id: Variant, origin: Vector2, facing: Vect
 			var anchor_position := Vector2(anchor["position"])
 			var anchor_offset := anchor_position - origin
 			if anchor_offset.length() <= radius + float(anchor["radius"]) and (anchor_offset.length_squared() <= 0.001 or absf(facing.angle_to(anchor_offset.normalized())) <= arc * 0.5):
-				return _consume_aionis_hit_result(aionis_boss.receive_anchor_hit(str(anchor["id"]), damage, "%s:%d" % [source_kind, source_id]))
+				return _consume_active_boss_hit_result(_receive_active_boss_hit(attack_id, source_kind, source_id, damage, anchor_position, "melee", armor_penetration))
 	var target_position := _active_boss_position()
 	var offset := target_position - origin
 	if offset.length() > radius + _active_boss_radius():
@@ -2704,6 +3029,8 @@ func _python_boss_target_proxy() -> Dictionary:
 		"pos": _python_boss_position(),
 		"vel": Vector2(float(state.get("velocity_x", 0.0)), float(state.get("velocity_y", 0.0))),
 		"radius": float(GameConfig.PYTHON_BOSS_CONFIG["body"]["head_radius"]),
+		"hp": float(state.get("hp", 1.0)),
+		"max_hp": float(state.get("max_hp", 1.0)),
 	}
 
 
@@ -2733,8 +3060,8 @@ func _damage_python_boss_melee(attack_id: Variant, origin: Vector2, facing: Vect
 			best_segment = segment
 	if best_segment.is_empty():
 		return false
-	var result: Dictionary = python_boss.receive_hit(attack_id, source_kind, source_id, damage, Vector2(best_segment["pos"]), "melee", armor_penetration)
-	return _consume_python_boss_hit_result(result)
+	var result: Dictionary = _receive_active_boss_hit(attack_id, source_kind, source_id, damage, Vector2(best_segment["pos"]), "melee", armor_penetration)
+	return _consume_active_boss_hit_result(result)
 
 
 func _consume_python_boss_hit_result(result: Dictionary) -> bool:
@@ -2753,6 +3080,9 @@ func _update_player(delta: float) -> void:
 	player["special_cd"] = max(0.0, float(player["special_cd"]) - delta)
 	player["invuln"] = max(0.0, float(player["invuln"]) - delta)
 	player["hit_grace"] = max(0.0, float(player.get("hit_grace", 0.0)) - delta)
+	player["support_shield_ttl"] = max(0.0, float(player.get("support_shield_ttl", 0.0)) - delta)
+	if float(player.get("support_shield_ttl", 0.0)) <= 0.0:
+		player["support_shield"] = 0.0
 	player["flash"] = max(0.0, float(player["flash"]) - delta)
 	var attack_target := _touch_attack_target() if _is_touch_scheme() else _screen_to_world(get_viewport().get_mouse_position())
 	var aim: Vector2 = attack_target - Vector2(player["pos"])
@@ -3475,6 +3805,15 @@ func _damage_player(raw_damage: float, source_pos: Vector2, allow_knockback: boo
 	if _is_in_friendly_safe_zone(Vector2(player["pos"])):
 		return false
 	var damage := _calculate_damage(raw_damage, _player_defense())
+	var shield_absorb := minf(damage, maxf(0.0, float(player.get("support_shield", 0.0))))
+	if shield_absorb > 0.0:
+		player["support_shield"] = float(player.get("support_shield", 0.0)) - shield_absorb
+		damage -= shield_absorb
+		_add_floater(player["pos"] + Vector2(0, -25), "盾 %d" % int(shield_absorb), Color("80D9FF"), 0.75)
+		_spawn_effect("shield", player["pos"], Color("80D9FF"), 0.55)
+	if damage <= 0.0:
+		player["hit_grace"] = PLAYER_HIT_GRACE_SECONDS
+		return true
 	player["hp"] = max(0.0, float(player["hp"]) - damage)
 	player["hit_grace"] = PLAYER_HIT_GRACE_SECONDS
 	player["flash"] = 0.16
@@ -3655,13 +3994,17 @@ func _enemy_radius(type_id: String) -> float:
 
 
 func _update_enemies(delta: float) -> void:
+	_update_soldier_enemy_statuses(delta)
 	for enemy in enemies:
 		enemy["cooldown"] = max(0.0, float(enemy["cooldown"]) - delta)
 		enemy["flash"] = max(0.0, float(enemy["flash"]) - delta)
 		enemy["slow"] = max(0.0, float(enemy["slow"]) - delta)
+		if float(enemy["slow"]) <= 0.0:
+			enemy["slow_factor"] = 0.0
 		enemy["armor_break"] = max(0.0, float(enemy.get("armor_break", 0.0)) - delta)
 		if float(enemy["armor_break"]) <= 0.0:
 			enemy["armor_reduction"] = 0.0
+			enemy["soldier_corrosion_stacks"] = 0
 		enemy["buff_timer"] = max(0.0, float(enemy.get("buff_timer", 0.0)) - delta)
 		enemy["sound_cd"] = max(0.0, float(enemy.get("sound_cd", 0.0)) - delta)
 		enemy["enhancement_stun"] = max(0.0, float(enemy.get("enhancement_stun", 0.0)) - delta)
@@ -3684,6 +4027,51 @@ func _update_enemies(delta: float) -> void:
 		# advances every rendered frame. This removes the visible 80/320 ms hop-pause
 		# cadence that previously made walking enemies shake across the ground.
 		_advance_enemy_motion(enemy, delta)
+
+
+func _update_soldier_enemy_statuses(delta: float) -> void:
+	for enemy_index in range(enemies.size() - 1, -1, -1):
+		if enemy_index >= enemies.size():
+			continue
+		var enemy: Dictionary = enemies[enemy_index]
+		for timer_key in ["soldier_void_mark_ttl", "soldier_focus_mark_ttl", "soldier_suppression_ttl"]:
+			enemy[timer_key] = maxf(0.0, float(enemy.get(timer_key, 0.0)) - delta)
+		if float(enemy.get("soldier_void_mark_ttl", 0.0)) <= 0.0:
+			enemy["soldier_void_damage_bonus"] = 0.0
+		if float(enemy.get("soldier_focus_mark_ttl", 0.0)) <= 0.0:
+			enemy["soldier_focus_damage_bonus"] = 0.0
+			enemy["soldier_focus_source_id"] = -1
+		if float(enemy.get("soldier_suppression_ttl", 0.0)) <= 0.0:
+			enemy["soldier_suppression_move_reduction"] = 0.0
+			enemy["soldier_suppression_attack_reduction"] = 0.0
+		var total_dps := 0.0
+		var dot_source_id := int(enemy.get("soldier_burn_source_id", -1))
+		enemy["soldier_burn_ttl"] = maxf(0.0, float(enemy.get("soldier_burn_ttl", 0.0)) - delta)
+		if float(enemy["soldier_burn_ttl"]) > 0.0:
+			total_dps += maxf(0.0, float(enemy.get("soldier_burn_dps", 0.0)))
+		else:
+			enemy["soldier_burn_dps"] = 0.0
+		var poison_sources: Dictionary = Dictionary(enemy.get("soldier_poison_sources", {}))
+		for poison_key in poison_sources.keys():
+			var poison_entry: Dictionary = Dictionary(poison_sources[poison_key])
+			poison_entry["ttl"] = maxf(0.0, float(poison_entry.get("ttl", 0.0)) - delta)
+			if float(poison_entry["ttl"]) <= 0.0:
+				poison_sources.erase(poison_key)
+				continue
+			poison_sources[poison_key] = poison_entry
+			total_dps += float(poison_entry.get("dps_per_stack", 0.0)) * float(int(poison_entry.get("stacks", 1)))
+			if dot_source_id < 0:
+				dot_source_id = int(str(poison_key))
+		enemy["soldier_poison_sources"] = poison_sources
+		if total_dps <= 0.0:
+			enemy["soldier_dot_tick"] = 0.0
+			continue
+		enemy["soldier_dot_tick"] = float(enemy.get("soldier_dot_tick", 0.0)) + delta
+		if float(enemy["soldier_dot_tick"]) < 0.5:
+			continue
+		var ticks := mini(4, int(floor(float(enemy["soldier_dot_tick"]) / 0.5)))
+		enemy["soldier_dot_tick"] = fmod(float(enemy["soldier_dot_tick"]), 0.5)
+		_damage_enemy(enemy_index, total_dps * 0.5 * float(ticks), enemy["pos"], "status", 999.0, dot_source_id)
 
 
 func _update_single_enemy(enemy: Dictionary, delta: float) -> void:
@@ -3770,6 +4158,8 @@ func _update_single_enemy(enemy: Dictionary, delta: float) -> void:
 				effective_attack_rate *= 1.4
 			if float(enemy.get("buff_timer", 0.0)) > 0.0:
 				effective_attack_rate *= 1.1
+			if float(enemy.get("soldier_suppression_ttl", 0.0)) > 0.0:
+				effective_attack_rate *= 1.0 - clampf(float(enemy.get("soldier_suppression_attack_reduction", 0.0)), 0.0, 0.75)
 			var minimum_attack_gap := 0.10 if str(enemy.get("attack_style", "")) in ["rifle", "gatling"] else 0.42
 			enemy["cooldown"] = max(minimum_attack_gap, 1.0 / effective_attack_rate) + tell
 			if enemy["type"] in ["thrower", "chief"]:
@@ -3810,6 +4200,9 @@ func _choose_friendly_target(enemy: Dictionary) -> Dictionary:
 		if d > aggro:
 			continue
 		var score := d
+		var taunt_guard := _soldier_special(soldier, "taunt_guard")
+		if not taunt_guard.is_empty() and d <= float(taunt_guard.get("radius", 0.0)):
+			score -= 220.0
 		if soldier["type"] == "heavy" and d < 230.0:
 			score -= 170.0
 		elif soldier["type"] in ["healer", "priest", "cannon"]:
@@ -3880,6 +4273,8 @@ func _move_enemy(enemy: Dictionary, direction: Vector2, delta: float) -> void:
 		speed *= 1.25
 	if float(enemy["slow"]) > 0.0:
 		speed *= clamp(1.0 - float(enemy.get("slow_factor", 0.28)), 0.35, 1.0)
+	if float(enemy.get("soldier_suppression_ttl", 0.0)) > 0.0:
+		speed *= 1.0 - clampf(float(enemy.get("soldier_suppression_move_reduction", 0.0)), 0.0, 0.75)
 	var motion := direction.limit_length(1.0) * speed * delta
 	var old_position: Vector2 = Vector2(enemy["pos"])
 	if _enemy_is_air(enemy):
@@ -4064,6 +4459,7 @@ func _enemy_melee_attack(enemy: Dictionary, direction: Vector2) -> void:
 		var to_soldier := Vector2(soldier["pos"]) - Vector2(enemy["pos"])
 		if to_soldier.length() <= radius + float(soldier["radius"]) and abs(direction.angle_to(to_soldier.normalized())) < 1.15:
 			_damage_soldier(soldier, float(enemy["attack"]), enemy["pos"], "melee")
+	_damage_guardians_in_melee(Vector2(enemy["pos"]), direction, radius, float(enemy["attack"]))
 	for castle in castles.values():
 		if not bool(castle.get("owned", false)):
 			continue
@@ -4080,6 +4476,7 @@ func _enemy_area_attack(position: Vector2, radius: float, damage: float) -> void
 		var soldier: Dictionary = soldiers[soldier_index]
 		if Vector2(soldier["pos"]).distance_to(position) <= radius + float(soldier["radius"]):
 			_damage_soldier(soldier, damage, position, "area")
+	_damage_guardians_in_area(position, radius, damage)
 	for castle in castles.values():
 		if bool(castle.get("owned", false)) and Vector2(castle["pos"]).distance_to(position) <= radius + _castle_damage_radius(castle):
 			_damage_owned_castle(castle, damage)
@@ -4115,15 +4512,41 @@ func _army_limit() -> int:
 
 
 func _purchase_soldier_upgrade(type_id: String, upgrade_id: String) -> bool:
-	var preview := SoldierUpgradeCatalog.purchase_preview(type_id, upgrade_id, soldier_research, int(player.get("money", 0)), GameConfig.SOLDIERS.has(type_id))
+	var soldier_unlocked := _soldier_type_is_unlocked(type_id)
+	var preview := SoldierUpgradeCatalog.purchase_preview(type_id, upgrade_id, soldier_research, int(player.get("money", 0)), soldier_unlocked)
 	if not bool(preview.get("allowed", false)):
-		_add_notification("士兵強化尚未符合條件或金錢不足。", Color("F6C177"), 2.0)
+		var reason := str(preview.get("reason", ""))
+		var message := "無法購買此士兵強化。"
+		if language == "en":
+			message = "This troop upgrade cannot be purchased."
+		match reason:
+			"soldier_locked": message = "Defeat Kaeron to unlock this troop." if language == "en" else "擊敗卡厄隆後才可研究此兵種。"
+			"insufficient_gold": message = "Not enough gold for this upgrade." if language == "en" else "金錢不足，無法購買此強化。"
+			"max_rank": message = "This upgrade is already at maximum rank." if language == "en" else "此強化已達最高階。"
+			"base_prerequisite":
+				var prerequisite: Dictionary = preview.get("prerequisite", {})
+				var base_id := str(prerequisite.get("base_upgrade", ""))
+				var required_rank := int(prerequisite.get("base_rank", 0))
+				message = ("Requires %s Rank %d." % [SoldierUpgradeCatalog.localized_name(base_id, language), required_rank]) if language == "en" else ("需要「%s」Rank %d。" % [SoldierUpgradeCatalog.localized_name(base_id, language), required_rank])
+		_add_notification(message, Color("F6C177"), 2.4)
+		audio.play("warning", 0.35)
 		return false
 	soldier_research = Dictionary(preview["research_after"]).duplicate(true)
 	player["money"] = int(preview["gold_after"])
-	_add_notification("士兵永久強化：%s Rank %d" % [SoldierUpgradeCatalog.localized_name(upgrade_id, language), int(preview["next_rank"])], HEAL_GREEN, 2.4)
+	var purchased_name := SoldierUpgradeCatalog.localized_name(upgrade_id, language)
+	var purchased_message := "Permanent upgrade: %s Rank %d · recruit again to apply it automatically" % [purchased_name, int(preview["next_rank"])] if language == "en" else "士兵永久強化：%s Rank %d；重新招募後會自動生效" % [purchased_name, int(preview["next_rank"])]
+	_add_notification(purchased_message, HEAL_GREEN, 2.4)
 	audio.play("purchase", 0.8)
+	queue_redraw()
 	return true
+
+
+func _soldier_recruit_cost(type_id: String) -> int:
+	if not GameConfig.SOLDIERS.has(type_id):
+		return 0
+	var cfg: Dictionary = GameConfig.SOLDIERS[type_id]
+	var discount := SoldierUpgradeCatalog.recruit_discount_for_type(type_id, soldier_research)
+	return maxi(1, int(ceil(float(cfg["recruit_cost"]["gold"]) * (1.0 - discount))))
 
 
 func _recruit_soldier(type_id: String, requested_count: int = 1) -> int:
@@ -4137,8 +4560,7 @@ func _recruit_soldier(type_id: String, requested_count: int = 1) -> int:
 		_add_notification("請靠近出生房屋或友方城堡招募。", Color("F6C177"), 2.0)
 		return 0
 	var cfg: Dictionary = GameConfig.SOLDIERS[type_id]
-	var discount := SoldierUpgradeCatalog.recruit_discount_for_type(type_id, soldier_research)
-	var cost := maxi(1, int(ceil(float(cfg["recruit_cost"]["gold"]) * (1.0 - discount))))
+	var cost := _soldier_recruit_cost(type_id)
 	var bought := 0
 	for _n in requested_count:
 		if soldiers.size() >= _army_limit():
@@ -4219,6 +4641,9 @@ func _spawn_soldier(type_id: String, position: Vector2, hp_ratio: float = 1.0) -
 		"defense": float(combat["armor"]) + floor(float(int(player["level"]) - 1) / 8.0) + float(base_effects.get("armor_bonus", 0.0)),
 		"speed": float(combat["movement_speed"]) * 1.35 * (1.0 + float(base_effects.get("move_speed_bonus", 0.0))), "range": float(combat["range"]) * (1.0 + float(base_effects.get("range_bonus_ratio", 0.0))) + float(base_effects.get("range_bonus_px", 0.0)),
 		"attack_rate": float(combat["attack_speed"]) * (1.0 + float(base_effects.get("attack_or_support_speed_bonus", 0.0))), "radius": radius,
+		"support_power": 1.0 + float(base_effects.get("attack_or_healing_bonus", 0.0)),
+		"support_rate": 1.0 + float(base_effects.get("attack_or_support_speed_bonus", 0.0)),
+		"support_range": float(combat["range"]) * (1.0 + float(base_effects.get("range_bonus_ratio", 0.0))) + float(base_effects.get("range_bonus_px", 0.0)),
 		"cooldown": randf_range(0.0, 0.5), "support_cd": 0.0, "revive_cd": 0.0,
 		"state": "follow", "target_id": -1, "ai_accum": randf_range(0.0, 0.12),
 		"flash": 0.0, "invuln": 0.0, "charge": 0.0, "cast_timer": 0.0, "cast_target": -1,
@@ -4226,20 +4651,145 @@ func _spawn_soldier(type_id: String, position: Vector2, hp_ratio: float = 1.0) -
 		"avoid_dir": Vector2.ZERO, "avoid_timer": 0.0,
 		"domain": str(combat.get("domain", "ground")), "altitude": 38.0 if str(combat.get("domain", "ground")) == "air" else 0.0,
 		"upgrade_snapshot": research_snapshot,
+		"upgrade_cooldowns": {}, "upgrade_counters": {},
 	}
+	soldier["special_runtime"] = SoldierUpgradeRuntime.create_state(research_snapshot, max_hp)
 	soldiers.append(soldier)
 	_spawn_effect("spawn", position, FRIEND_BLUE, 0.65)
 	return id
 
 
+func _soldier_special(soldier: Dictionary, ability_id: String) -> Dictionary:
+	return SoldierUpgradeRuntime.special_effect(soldier.get("upgrade_snapshot", {}), ability_id)
+
+
+func _projectile_special(projectile: Dictionary, ability_id: String) -> Dictionary:
+	var specials: Dictionary = Dictionary(projectile.get("soldier_specials", {}))
+	return Dictionary(specials.get(ability_id, {})).duplicate(true)
+
+
+func _update_soldier_upgrade_cooldowns(soldier: Dictionary, delta: float) -> void:
+	var cooldowns: Dictionary = Dictionary(soldier.get("upgrade_cooldowns", {}))
+	for cooldown_key in cooldowns.keys():
+		cooldowns[cooldown_key] = maxf(0.0, float(cooldowns[cooldown_key]) - delta)
+	soldier["upgrade_cooldowns"] = cooldowns
+
+
+func _soldier_upgrade_cooldown_ready(soldier: Dictionary, ability_id: String) -> bool:
+	return float(Dictionary(soldier.get("upgrade_cooldowns", {})).get(ability_id, 0.0)) <= 0.0
+
+
+func _set_soldier_upgrade_cooldown(soldier: Dictionary, ability_id: String, seconds: float) -> void:
+	var cooldowns: Dictionary = Dictionary(soldier.get("upgrade_cooldowns", {}))
+	cooldowns[ability_id] = maxf(0.0, seconds)
+	soldier["upgrade_cooldowns"] = cooldowns
+
+
+func _update_soldier_passive_upgrades(soldier: Dictionary, delta: float) -> void:
+	var self_repair := _soldier_special(soldier, "self_repair")
+	if not self_repair.is_empty() and game_time - float(soldier.get("last_hit", -99.0)) >= float(self_repair.get("no_hit_delay", 5.0)):
+		var repair := float(soldier.get("max_hp", 1.0)) * float(self_repair.get("max_hp_heal_per_second", 0.0)) * delta
+		soldier["hp"] = minf(float(soldier["max_hp"]), float(soldier["hp"]) + repair)
+
+	var cleanse := _soldier_special(soldier, "cleanse")
+	if not cleanse.is_empty() and _soldier_upgrade_cooldown_ready(soldier, "cleanse"):
+		if _cleanse_friendly_target({"kind": "soldier", "id": int(soldier["id"]), "pos": Vector2(soldier["pos"])}):
+			_set_soldier_upgrade_cooldown(soldier, "cleanse", float(cleanse.get("cooldown", 10.0)))
+
+	var flares := _soldier_special(soldier, "air_flares")
+	if not flares.is_empty() and _soldier_upgrade_cooldown_ready(soldier, "air_flares") and _try_intercept_hostile_homing_projectile(soldier):
+		_set_soldier_upgrade_cooldown(soldier, "air_flares", float(flares.get("cooldown", 14.0)))
+		_spawn_effect("explosion", soldier["pos"], Color("FFDD7A"), 0.6)
+
+	if not _soldier_upgrade_cooldown_ready(soldier, "summon_scan"):
+		return
+	_set_soldier_upgrade_cooldown(soldier, "summon_scan", 0.25)
+	if _nearest_enemy_distance(soldier["pos"]) > 760.0 and not _active_boss_can_be_targeted():
+		return
+	_try_spawn_soldier_upgrade_summon(soldier, "guardian")
+	_try_spawn_soldier_upgrade_summon(soldier, "auto_turret")
+	_try_spawn_soldier_upgrade_summon(soldier, "repair_drone")
+
+
+func _try_intercept_hostile_homing_projectile(soldier: Dictionary) -> bool:
+	var center := Vector2(soldier.get("pos", Vector2.ZERO))
+	for projectile_index in range(projectiles.size() - 1, -1, -1):
+		var hostile_projectile: Dictionary = projectiles[projectile_index]
+		if str(hostile_projectile.get("team", "")) == "friendly" or not bool(hostile_projectile.get("homing", false)):
+			continue
+		if Vector2(hostile_projectile.get("pos", Vector2.ZERO)).distance_to(center) <= 230.0:
+			projectiles.remove_at(projectile_index)
+			return true
+	for projectile_index in range(chaos_runtime_projectiles.size() - 1, -1, -1):
+		var chaos_projectile: Dictionary = chaos_runtime_projectiles[projectile_index]
+		if bool(chaos_projectile.get("homing", false)) and Vector2(chaos_projectile.get("pos", Vector2.ZERO)).distance_to(center) <= 230.0:
+			chaos_runtime_projectiles.remove_at(projectile_index)
+			return true
+	for projectile_index in range(aionis_runtime_projectiles.size() - 1, -1, -1):
+		var aionis_projectile: Dictionary = aionis_runtime_projectiles[projectile_index]
+		if bool(aionis_projectile.get("homing", false)) and Vector2(aionis_projectile.get("pos", Vector2.ZERO)).distance_to(center) <= 230.0:
+			aionis_runtime_projectiles.remove_at(projectile_index)
+			return true
+	return false
+
+
+func _try_spawn_soldier_upgrade_summon(soldier: Dictionary, ability_id: String) -> void:
+	var ability := _soldier_special(soldier, ability_id)
+	if ability.is_empty() or not _soldier_upgrade_cooldown_ready(soldier, ability_id):
+		return
+	var owner_count := 0
+	var team_count := 0
+	for effect in upgrade_effects:
+		var summon_kind := str(effect.get("kind", ""))
+		if summon_kind not in ["guardian", "auto_turret", "repair_drone"]:
+			continue
+		team_count += 1
+		if summon_kind == ability_id and int(effect.get("source_id", -1)) == int(soldier["id"]):
+			owner_count += 1
+	var owner_cap := mini(2, int(ability.get("max_per_owner", 2)))
+	var team_cap := mini(MAX_UPGRADE_SUMMONS_PER_TEAM, int(ability.get("team_summon_cap", MAX_UPGRADE_SUMMONS_PER_TEAM)))
+	if owner_count >= owner_cap or team_count >= team_cap:
+		return
+	var ttl := float(ability.get("ttl", ability.get("duration", 14.0)))
+	var summon := {
+		"kind": ability_id, "source_id": int(soldier["id"]), "source_kind": str(soldier["type"]),
+		"pos": Vector2(soldier["pos"]) + Vector2.from_angle(float(int(soldier["id"]) % 12) * TAU / 12.0) * 42.0,
+		"ttl": ttl, "warmup": 0.45, "scan": 0.0, "radius": 24.0,
+		"color": Color("9BD7FF") if ability_id != "repair_drone" else HEAL_GREEN,
+		"effect": ability.duplicate(true), "owner_attack": float(soldier.get("attack", 1.0)),
+		"owner_max_hp": float(soldier.get("max_hp", 1.0)), "shot_cd": 0.0,
+	}
+	if ability_id == "guardian":
+		var guardian_max_hp := maxf(1.0, float(soldier.get("max_hp", 1.0)) * maxf(0.1, float(ability.get("hp_ratio", 1.0))))
+		summon["hp"] = guardian_max_hp
+		summon["max_hp"] = guardian_max_hp
+		summon["defeated"] = false
+	_add_upgrade_runtime_effect(summon)
+	_set_soldier_upgrade_cooldown(soldier, ability_id, ttl + 8.0)
+	_spawn_effect("spawn", summon["pos"], Color(summon["color"]), 0.7)
+
+
 func _update_soldiers(delta: float) -> void:
+	for shared_key in soldier_upgrade_shared_cooldowns.keys():
+		soldier_upgrade_shared_cooldowns[shared_key] = maxf(0.0, float(soldier_upgrade_shared_cooldowns[shared_key]) - delta)
 	for soldier in soldiers:
+		SoldierUpgradeRuntime.tick_state(soldier, delta)
+		_update_soldier_upgrade_cooldowns(soldier, delta)
+		_update_soldier_passive_upgrades(soldier, delta)
 		soldier["cooldown"] = max(0.0, float(soldier["cooldown"]) - delta)
 		soldier["support_cd"] = max(0.0, float(soldier["support_cd"]) - delta)
 		soldier["revive_cd"] = max(0.0, float(soldier["revive_cd"]) - delta)
 		soldier["flash"] = max(0.0, float(soldier["flash"]) - delta)
 		soldier["invuln"] = max(0.0, float(soldier["invuln"]) - delta)
 		soldier["soul_fatigue"] = max(0.0, float(soldier["soul_fatigue"]) - delta)
+		soldier["revive_reduction_ttl"] = max(0.0, float(soldier.get("revive_reduction_ttl", 0.0)) - delta)
+		soldier["dash_reduction_ttl"] = max(0.0, float(soldier.get("dash_reduction_ttl", 0.0)) - delta)
+		soldier["last_stand_recovery_ttl"] = max(0.0, float(soldier.get("last_stand_recovery_ttl", 0.0)) - delta)
+		if float(soldier.get("last_stand_recovery_ttl", 0.0)) > 0.0:
+			soldier["hp"] = minf(float(soldier["max_hp"]), float(soldier["hp"]) + float(soldier.get("last_stand_recovery_per_second", 0.0)) * delta)
+		soldier["support_shield_ttl"] = max(0.0, float(soldier.get("support_shield_ttl", 0.0)) - delta)
+		if float(soldier.get("support_shield_ttl", 0.0)) <= 0.0:
+			soldier["support_shield"] = 0.0
 		soldier["avoid_timer"] = max(0.0, float(soldier.get("avoid_timer", 0.0)) - delta)
 		soldier["ai_accum"] = float(soldier["ai_accum"]) + delta
 		if float(soldier["ai_accum"]) < 0.08:
@@ -4307,6 +4857,12 @@ func _update_single_soldier(soldier: Dictionary, delta: float) -> void:
 			soldier["aim_dir"] = to_enemy.normalized()
 		var ranged := _soldier_is_ranged(str(soldier["type"]))
 		var preferred := float(soldier["range"]) * (0.72 if ranged else 0.9)
+		if not ranged and _try_soldier_dash_attack(soldier, enemy, target_id, dist):
+			return
+		if str(soldier["type"]) == "tank":
+			var tank_stomp := _soldier_special(soldier, "stomp")
+			if not tank_stomp.is_empty() and dist <= float(tank_stomp.get("radius", 105.0)) + float(enemy["radius"]) and _soldier_upgrade_cooldown_ready(soldier, "stomp"):
+				_trigger_soldier_melee_followups(soldier, target_id, soldier["pos"], float(soldier["attack"]))
 		if dist <= float(soldier["range"]) + float(enemy["radius"]):
 			if float(soldier["cooldown"]) <= 0.0:
 				var charge_seconds := _soldier_charge_seconds(str(soldier["type"]))
@@ -4362,27 +4918,61 @@ func _update_single_soldier(soldier: Dictionary, delta: float) -> void:
 	_move_soldier_toward(soldier, destination, delta)
 
 
+func _try_soldier_dash_attack(soldier: Dictionary, enemy: Dictionary, target_id: int, distance: float) -> bool:
+	var dash := _soldier_special(soldier, "dash")
+	if dash.is_empty() or not _soldier_upgrade_cooldown_ready(soldier, "dash"):
+		return false
+	var dash_distance := float(dash.get("distance", 120.0))
+	if distance <= float(soldier.get("range", 55.0)) * 0.75 or distance > dash_distance + float(soldier.get("range", 55.0)):
+		return false
+	var origin := Vector2(soldier["pos"])
+	var direction := (Vector2(enemy["pos"]) - origin).normalized()
+	var destination := Vector2(enemy["pos"]) - direction * (float(soldier["radius"]) + float(enemy["radius"]) + 5.0)
+	soldier["pos"] = _move_with_collision(origin, destination - origin, float(soldier["radius"]), true)
+	soldier["vel"] = (Vector2(soldier["pos"]) - origin) / 0.18
+	soldier["dash_reduction_ttl"] = 0.35
+	soldier["dash_damage_reduction"] = clampf(float(dash.get("during_dash_damage_reduction", 0.5)), 0.0, 0.85)
+	_set_soldier_upgrade_cooldown(soldier, "dash", float(dash.get("cooldown", 7.0)))
+	var context := _begin_soldier_attack(soldier, enemy, target_id, Vector2(enemy["pos"]))
+	var damage := float(soldier["attack"]) * float(dash.get("damage_ratio", 1.2)) * float(context.get("damage_multiplier", 1.0))
+	if target_id == BOSS_ENTITY_ID:
+		_damage_active_boss_melee(_allocate_attack_id("soldier_dash"), origin, direction, dash_distance + float(soldier["range"]), deg_to_rad(80.0), damage, str(soldier["type"]), int(soldier["id"]))
+	else:
+		var enemy_index := _enemy_index_by_id(target_id)
+		if enemy_index >= 0:
+			var specials: Dictionary = Dictionary(Dictionary(soldier.get("upgrade_snapshot", {})).get("special_effects", {}))
+			_resolve_soldier_enemy_hit(enemy_index, damage, origin, "melee", int(soldier["id"]), specials)
+	_spawn_effect("dash", soldier["pos"], Color("A8DDFF"), 0.9)
+	soldier["cooldown"] = _soldier_attack_cooldown(soldier)
+	return true
+
+
 func _update_healer(soldier: Dictionary, delta: float) -> bool:
-	var target := _lowest_friendly_target(soldier["pos"], 330.0, 0.88)
+	var support_range := maxf(120.0, float(soldier.get("support_range", 330.0)))
+	var target := _lowest_friendly_target(soldier["pos"], support_range, 0.88)
 	if target.is_empty():
 		return false
 	var target_pos: Vector2 = target["pos"]
-	if Vector2(soldier["pos"]).distance_to(target_pos) > 285.0:
+	if Vector2(soldier["pos"]).distance_to(target_pos) > support_range * 0.86:
 		_move_soldier_toward(soldier, target_pos, delta)
 		soldier["state"] = "heal_move"
 		return true
 	if float(soldier["support_cd"]) <= 0.0:
 		var amount := 18.0 + float(int(player["level"])) * 0.6
-		_apply_heal_target(target, amount, int(soldier["id"]))
-		soldier["support_cd"] = 2.35
+		var heal_result := _perform_soldier_heal(soldier, target, amount, true)
+		soldier["support_cd"] = 2.35 / maxf(0.1, float(soldier.get("support_rate", 1.0)))
 		soldier["state"] = "heal"
 		_spawn_effect("heal", target_pos, HEAL_GREEN, 0.85)
-		_add_floater(target_pos + Vector2(0, -20), "+%d" % int(amount), HEAL_GREEN, 0.9)
+		_add_floater(target_pos + Vector2(0, -20), "+%d" % int(heal_result.get("effective", 0.0)), HEAL_GREEN, 0.9)
 		audio.play("heal", 0.42)
 	return true
 
 
 func _update_priest(soldier: Dictionary, delta: float) -> bool:
+	var resurrection := _soldier_special(soldier, "resurrection_ritual")
+	var revive_chant := float(resurrection.get("chant_time", 2.8))
+	var revive_cooldown := float(resurrection.get("cooldown", 14.0)) / maxf(0.1, float(soldier.get("support_rate", 1.0)))
+	var revive_hp_ratio := float(resurrection.get("revive_hp_ratio", 0.45))
 	if float(soldier["cast_timer"]) > 0.0:
 		var tomb: Variant = _find_tombstone_by_id(int(soldier["cast_target"]))
 		if tomb == null or game_time - float(soldier["last_hit"]) < 0.22:
@@ -4393,12 +4983,12 @@ func _update_priest(soldier: Dictionary, delta: float) -> bool:
 		soldier["state"] = "revive_cast"
 		_spawn_particle(tomb["pos"] + Vector2(randf_range(-12, 12), randf_range(-8, 8)), Vector2(0, -24), GOLD, 0.45, 3.0, 1)
 		if float(soldier["cast_timer"]) <= 0.0:
-			_revive_tombstone(tomb, int(soldier["id"]))
-			soldier["revive_cd"] = 14.0
+			_revive_tombstone(tomb, int(soldier["id"]), revive_hp_ratio, _soldier_special(soldier, "soul_shelter"))
+			soldier["revive_cd"] = revive_cooldown
 			audio.play("revive", 0.75)
 		return true
 	if float(soldier["revive_cd"]) <= 0.0:
-		var tomb: Variant = _best_tombstone(soldier["pos"], 420.0)
+		var tomb: Variant = _best_tombstone(soldier["pos"], maxf(420.0, float(soldier.get("support_range", 420.0))))
 		if tomb != null:
 			var dist := Vector2(soldier["pos"]).distance_to(tomb["pos"])
 			if dist > 48.0:
@@ -4406,20 +4996,47 @@ func _update_priest(soldier: Dictionary, delta: float) -> bool:
 				soldier["state"] = "revive_move"
 			else:
 				soldier["cast_target"] = tomb["id"]
-				soldier["cast_timer"] = 2.8
+				soldier["cast_timer"] = revive_chant
 				soldier["state"] = "revive_cast"
 			return true
+	if _try_priest_combat_mark(soldier):
+		return true
 	if float(soldier["support_cd"]) <= 0.0:
 		var healed := false
 		for ally in soldiers:
-			if Vector2(ally["pos"]).distance_to(soldier["pos"]) <= 155.0 and float(ally["hp"]) < float(ally["max_hp"]):
-				ally["hp"] = min(float(ally["max_hp"]), float(ally["hp"]) + 9.0)
+			if Vector2(ally["pos"]).distance_to(soldier["pos"]) <= maxf(155.0, float(soldier.get("support_range", 155.0)) * 0.46) and float(ally["hp"]) < float(ally["max_hp"]):
+				_perform_soldier_heal(soldier, {"kind": "soldier", "id": ally["id"], "pos": ally["pos"]}, 9.0, false)
 				healed = true
 		if healed:
-			soldier["support_cd"] = 4.0
+			soldier["support_cd"] = 4.0 / maxf(0.1, float(soldier.get("support_rate", 1.0)))
 			_spawn_effect("heal", soldier["pos"], GOLD, 0.6)
 			return true
 	return false
+
+
+func _try_priest_combat_mark(priest: Dictionary) -> bool:
+	var void_mark := _soldier_special(priest, "void_mark")
+	var focus_mark := _soldier_special(priest, "focus_mark")
+	if (void_mark.is_empty() and focus_mark.is_empty()) or not _soldier_upgrade_cooldown_ready(priest, "priest_mark"):
+		return false
+	var target_id := _enemy_near_point(Vector2(priest["pos"]), maxf(360.0, float(priest.get("support_range", 420.0))))
+	if target_id < 0 and target_id != BOSS_ENTITY_ID:
+		return false
+	if target_id == BOSS_ENTITY_ID:
+		_apply_soldier_boss_statuses(priest, 0.0, "support")
+		if python_boss != null and python_boss.is_engaged():
+			python_boss.add_threat("priest", int(priest["id"]), 18.0)
+		_spawn_effect("hit", _active_boss_position(), Color("B993FF"), 0.75)
+	else:
+		var enemy_index := _enemy_index_by_id(target_id)
+		if enemy_index < 0:
+			return false
+		var specials: Dictionary = Dictionary(Dictionary(priest.get("upgrade_snapshot", {})).get("special_effects", {}))
+		_apply_soldier_statuses_to_enemy(enemies[enemy_index], 0.0, specials, int(priest["id"]), "support")
+		_spawn_effect("hit", enemies[enemy_index]["pos"], Color("B993FF"), 0.75)
+	_set_soldier_upgrade_cooldown(priest, "priest_mark", 4.0)
+	priest["state"] = "mark"
+	return true
 
 
 func _lowest_friendly_target(position: Vector2, radius: float, threshold: float) -> Dictionary:
@@ -4442,20 +5059,116 @@ func _lowest_friendly_target(position: Vector2, radius: float, threshold: float)
 	return best
 
 
-func _apply_heal_target(target: Dictionary, amount: float, healer_id: int = -1) -> void:
+func _target_health_ratio(target: Dictionary) -> float:
+	if str(target.get("kind", "")) == "player":
+		return clampf(float(player.get("hp", 0.0)) / maxf(1.0, float(player.get("max_hp", 1.0))), 0.0, 1.0)
+	var ally: Variant = _find_soldier_by_id(int(target.get("id", -1)))
+	return clampf(float(ally.get("hp", 0.0)) / maxf(1.0, float(ally.get("max_hp", 1.0))), 0.0, 1.0) if ally != null else 1.0
+
+
+func _target_is_vehicle_or_air(target: Dictionary) -> bool:
+	if str(target.get("kind", "")) != "soldier":
+		return false
+	var ally: Variant = _find_soldier_by_id(int(target.get("id", -1)))
+	return ally != null and (str(ally.get("domain", "ground")) == "air" or str(ally.get("type", "")) in ["roller", "cannon", "tank", "rocket", "gatling"])
+
+
+func _perform_soldier_heal(healer: Dictionary, target: Dictionary, base_amount: float, allow_group: bool) -> Dictionary:
+	var multiplier := SoldierUpgradeRuntime.healing_multiplier(healer, _target_health_ratio(target))
+	var battlefield_repair := _soldier_special(healer, "battlefield_repair")
+	if not battlefield_repair.is_empty() and _target_is_vehicle_or_air(target):
+		multiplier *= 1.0 + float(battlefield_repair.get("vehicle_air_healing_bonus", 0.0))
+	var result := _apply_heal_target(target, base_amount * multiplier, int(healer["id"]))
+	var holy_shield := _soldier_special(healer, "holy_shield")
+	if not holy_shield.is_empty():
+		_grant_healing_shield(target, float(result.get("max_hp", 0.0)) * float(holy_shield.get("shield_max_hp_ratio", 0.0)), float(holy_shield.get("duration", 4.0)), float(holy_shield.get("target_cooldown", 10.0)))
+	var overheal := _soldier_special(healer, "overheal_matrix")
+	if not overheal.is_empty() and float(result.get("overheal", 0.0)) > 0.0:
+		var converted := float(result["overheal"]) * float(overheal.get("overheal_to_shield_ratio", 0.0))
+		var cap := float(result.get("max_hp", 0.0)) * float(overheal.get("shield_target_max_hp_ratio", 0.0))
+		_grant_healing_shield(target, minf(converted, cap), float(overheal.get("duration", 6.0)), 0.0)
+	var cleanse := _soldier_special(healer, "cleanse")
+	if not cleanse.is_empty() and _soldier_upgrade_cooldown_ready(healer, "cleanse_target") and _cleanse_friendly_target(target):
+		_set_soldier_upgrade_cooldown(healer, "cleanse_target", float(cleanse.get("cooldown", 10.0)))
+	if allow_group and str(healer.get("type", "")) == "healer":
+		var group_heal := _soldier_special(healer, "group_heal")
+		var runtime: Dictionary = healer.get("special_runtime", {})
+		if not group_heal.is_empty() and int(runtime.get("healing_sequence", 0)) % maxi(1, int(group_heal.get("trigger_every_heals", 3))) == 0:
+			var remaining := int(group_heal.get("allies", 3))
+			for ally in soldiers:
+				if remaining <= 0:
+					break
+				if int(ally["id"]) == int(target.get("id", -1)) or float(ally["hp"]) >= float(ally["max_hp"]):
+					continue
+				if Vector2(ally["pos"]).distance_to(Vector2(healer["pos"])) > float(healer.get("support_range", 330.0)):
+					continue
+				_apply_heal_target({"kind": "soldier", "id": ally["id"], "pos": ally["pos"]}, base_amount * multiplier * float(group_heal.get("healing_ratio", 0.5)), int(healer["id"]))
+				remaining -= 1
+			_spawn_effect("heal", healer["pos"], Color("8EFFE0"), 1.0)
+	return result
+
+
+func _apply_heal_target(target: Dictionary, amount: float, healer_id: int = -1) -> Dictionary:
 	var effective := 0.0
+	var maximum := 0.0
 	if target["kind"] == "player":
 		var before_player: float = float(player["hp"])
+		maximum = float(player["max_hp"])
 		player["hp"] = min(float(player["max_hp"]), float(player["hp"]) + amount)
 		effective = float(player["hp"]) - before_player
 	else:
 		var ally: Variant = _find_soldier_by_id(int(target["id"]))
 		if ally != null:
 			var before_ally: float = float(ally["hp"])
+			maximum = float(ally["max_hp"])
 			ally["hp"] = min(float(ally["max_hp"]), float(ally["hp"]) + amount)
 			effective = float(ally["hp"]) - before_ally
 	if healer_id >= 0 and effective > 0.0 and python_boss != null and python_boss.is_engaged():
 		python_boss.add_threat("healer", healer_id, effective * float(GameConfig.PYTHON_BOSS_CONFIG["threat"]["healing_multiplier"]))
+	return {"effective": effective, "overheal": maxf(0.0, amount - effective), "max_hp": maximum}
+
+
+func _grant_healing_shield(target: Dictionary, amount: float, duration: float, target_cooldown: float) -> void:
+	if amount <= 0.0:
+		return
+	if str(target.get("kind", "")) == "player":
+		if target_cooldown > 0.0 and game_time < float(player.get("holy_shield_ready_at", 0.0)):
+			return
+		player["support_shield"] = maxf(float(player.get("support_shield", 0.0)), amount)
+		player["support_shield_ttl"] = maxf(float(player.get("support_shield_ttl", 0.0)), duration)
+		if target_cooldown > 0.0:
+			player["holy_shield_ready_at"] = game_time + target_cooldown
+	else:
+		var ally: Variant = _find_soldier_by_id(int(target.get("id", -1)))
+		if ally == null or (target_cooldown > 0.0 and game_time < float(ally.get("holy_shield_ready_at", 0.0))):
+			return
+		ally["support_shield"] = maxf(float(ally.get("support_shield", 0.0)), amount)
+		ally["support_shield_ttl"] = maxf(float(ally.get("support_shield_ttl", 0.0)), duration)
+		if target_cooldown > 0.0:
+			ally["holy_shield_ready_at"] = game_time + target_cooldown
+
+
+func _cleanse_friendly_target(target: Dictionary) -> bool:
+	var target_kind := str(target.get("kind", "soldier"))
+	var target_id := int(target.get("id", 0 if target_kind == "player" else -1))
+	var cleansed := false
+	if python_boss != null:
+		var boss_cleanse: Dictionary = python_boss.cleanse_unit_status(target_kind, target_id)
+		cleansed = bool(boss_cleanse.get("cleansed", false))
+	var target_position := Vector2(target.get("pos", player.get("pos", Vector2.ZERO)))
+	if target_kind == "soldier":
+		var ally: Variant = _find_soldier_by_id(target_id)
+		if ally != null:
+			target_position = Vector2(ally.get("pos", target_position))
+			var had_local_status := float(ally.get("burn_ttl", 0.0)) > 0.0 or float(ally.get("slow_ttl", 0.0)) > 0.0 or float(ally.get("paralysis_ttl", 0.0)) > 0.0
+			ally["burn_ttl"] = 0.0
+			ally["slow_ttl"] = 0.0
+			ally["paralysis_ttl"] = 0.0
+			cleansed = cleansed or had_local_status
+	if cleansed:
+		_spawn_effect("heal", target_position, Color("B9FFF4"), 0.65)
+		_add_floater(target_position + Vector2(0, -24), "Cleanse" if language == "en" else "淨化", Color("B9FFF4"), 0.7)
+	return cleansed
 
 
 func _select_soldier_enemy_target(soldier: Dictionary) -> int:
@@ -4594,7 +5307,72 @@ func _soldier_charge_seconds(type_id: String) -> float:
 func _soldier_attack_cooldown(soldier: Dictionary) -> float:
 	var type_id := str(soldier.get("type", ""))
 	var minimum := 0.10 if type_id in ["gatling", "helicopter"] else (0.16 if type_id == "rifleman" else 0.45)
-	return maxf(minimum, 1.0 / maxf(0.01, float(soldier.get("attack_rate", 1.0))))
+	return maxf(minimum, 1.0 / maxf(0.01, float(soldier.get("attack_rate", 1.0)) * _soldier_rally_attack_multiplier(soldier)))
+
+
+func _soldier_rally_attack_multiplier(soldier: Dictionary) -> float:
+	var best_bonus := 0.0
+	for aura_source in soldiers:
+		var rally := _soldier_special(aura_source, "rally_beacon")
+		if rally.is_empty():
+			continue
+		if Vector2(aura_source["pos"]).distance_to(Vector2(soldier["pos"])) <= float(rally.get("radius", 0.0)):
+			best_bonus = maxf(best_bonus, float(rally.get("ally_attack_speed_bonus", 0.0)))
+	return 1.0 + best_bonus
+
+
+func _soldier_rally_move_multiplier(soldier: Dictionary) -> float:
+	var best_bonus := 0.0
+	for aura_source in soldiers:
+		var rally := _soldier_special(aura_source, "rally_beacon")
+		if rally.is_empty():
+			continue
+		if Vector2(aura_source["pos"]).distance_to(Vector2(soldier["pos"])) <= float(rally.get("radius", 0.0)):
+			best_bonus = maxf(best_bonus, float(rally.get("ally_move_speed_bonus", 0.0)))
+	return 1.0 + best_bonus
+
+
+func _soldier_guardian_aura_reduction(soldier: Dictionary) -> float:
+	var best_reduction := 0.0
+	for aura_source in soldiers:
+		var guardian_aura := _soldier_special(aura_source, "guardian_aura")
+		if guardian_aura.is_empty():
+			continue
+		if Vector2(aura_source["pos"]).distance_to(Vector2(soldier["pos"])) <= float(guardian_aura.get("radius", 0.0)):
+			best_reduction = maxf(best_reduction, float(guardian_aura.get("ally_damage_reduction", 0.0)))
+	return clampf(best_reduction, 0.0, 0.8)
+
+
+func _begin_soldier_attack(soldier: Dictionary, target: Variant, target_id: int, target_position: Vector2) -> Dictionary:
+	var target_ratio := 1.0
+	if target is Dictionary:
+		var target_dictionary: Dictionary = target
+		target_ratio = clampf(float(target_dictionary.get("hp", 1.0)) / maxf(1.0, float(target_dictionary.get("max_hp", 1.0))), 0.0, 1.0)
+	var context := SoldierUpgradeRuntime.begin_attack(soldier, target_ratio)
+	context["target_id"] = target_id
+	soldier["pending_attack_context"] = context.duplicate(true)
+	soldier["pending_split_scheduled"] = false
+	soldier["pending_echo_scheduled"] = false
+	_try_trigger_soldier_meteor(soldier, target_position)
+	if bool(context.get("is_critical", false)):
+		_spawn_effect("hit", soldier["pos"], GOLD, 0.55)
+	return context
+
+
+func _try_trigger_soldier_meteor(soldier: Dictionary, target_position: Vector2) -> void:
+	var meteor := _soldier_special(soldier, "meteor")
+	if meteor.is_empty() or float(soldier_upgrade_shared_cooldowns.get("meteor", 0.0)) > 0.0:
+		return
+	var cooldown := maxf(1.0, float(meteor.get("army_shared_cooldown", 16.0)))
+	soldier_upgrade_shared_cooldowns["meteor"] = cooldown
+	_add_upgrade_runtime_effect({
+		"kind": "meteor", "source_id": int(soldier["id"]), "source_kind": str(soldier["type"]),
+		"pos": target_position, "ttl": float(meteor.get("warning_time", 1.2)) + 0.08,
+		"warmup": float(meteor.get("warning_time", 1.2)), "radius": float(meteor.get("radius", 120.0)),
+		"damage": float(soldier.get("attack", 1.0)) * float(meteor.get("damage_ratio", 2.2)),
+		"color": Color("FFB14A"), "effect": meteor.duplicate(true),
+	})
+	_spawn_effect("warning", target_position, Color("FFB14A"), 0.8)
 
 
 func _fire_soldier_attack(soldier: Dictionary, target_id: int) -> void:
@@ -4616,6 +5394,8 @@ func _fire_soldier_attack(soldier: Dictionary, target_id: int) -> void:
 		return
 	var origin: Vector2 = soldier["pos"]
 	var target_position := Vector2(enemy["pos"])
+	var attack_context := _begin_soldier_attack(soldier, enemy, target_id, target_position)
+	var attack_damage := float(soldier["attack"]) * float(attack_context.get("damage_multiplier", 1.0))
 	if _soldier_is_ranged(str(soldier["type"])):
 		target_position = _predict_intercept_position(
 			origin, target_position, Vector2(enemy.get("vel", Vector2.ZERO)),
@@ -4628,19 +5408,20 @@ func _fire_soldier_attack(soldier: Dictionary, target_id: int) -> void:
 	if target_id == BOSS_ENTITY_ID and _active_boss_kind() == "python":
 		var boss_state: Dictionary = python_boss.get_text_state()
 		if str(boss_state.get("constrict_target", "")) != "" and origin.distance_to(_python_boss_position()) <= float(soldier["range"]) + 95.0:
-			python_boss.damage_constrict_coils(float(soldier["attack"]))
+			python_boss.damage_constrict_coils(attack_damage)
 			_spawn_effect("hit", _python_boss_position(), Color("DDA6FF"), 0.8)
 			return
 	match str(soldier["type"]):
 		"swordsman", "heavy":
 			if target_id == BOSS_ENTITY_ID:
-				_damage_active_boss_melee(_allocate_attack_id("soldier_melee"), origin, direction, float(soldier["range"]) + 34.0, deg_to_rad(120.0), float(soldier["attack"]), str(soldier["type"]), int(soldier["id"]))
+				_damage_active_boss_melee(_allocate_attack_id("soldier_melee"), origin, direction, float(soldier["range"]) + 34.0, deg_to_rad(120.0), attack_damage, str(soldier["type"]), int(soldier["id"]))
 				_spawn_effect("slash", origin + direction * 24.0, FRIEND_BLUE, 0.7)
 			else:
 				var idx := _enemy_index_by_id(target_id)
 				if idx < 0:
 					return
-				_damage_enemy(idx, float(soldier["attack"]), origin, "melee")
+				_resolve_soldier_enemy_hit(idx, attack_damage, origin, "melee", int(soldier["id"]), Dictionary(Dictionary(soldier.get("upgrade_snapshot", {})).get("special_effects", {})), 0.0, true)
+				_trigger_soldier_melee_followups(soldier, target_id, origin, attack_damage)
 				_spawn_effect("slash", origin + direction * 24.0, FRIEND_BLUE, 0.7)
 		"archer":
 			_spawn_projectile({"team": "friendly", "kind": "ally_arrow", "source_kind": "archer", "source_id": soldier["id"], "pos": origin + direction * 14.0, "vel": direction * 720.0, "damage": soldier["attack"], "range": 500.0, "radius": 4.0, "pierce": 1, "aoe": 0.0, "color": Color("A9D8FF")})
@@ -4684,8 +5465,221 @@ func _fire_soldier_attack(soldier: Dictionary, target_id: int) -> void:
 			audio.play("bomb", 0.42)
 		"ufo":
 			var ufo_combat: Dictionary = GameConfig.SOLDIERS["ufo"]["combat"]
-			hazards.append({"id": _allocate_attack_id("friendly_ufo_beam"), "kind": "ufo_beam", "team": "friendly", "source_id": soldier["id"], "source_kind": "ufo", "pos": target_position, "radius": float(ufo_combat["aoe_radius"]), "ttl": 2.5, "warmup": 0.75, "tick": 0.0, "damage": float(soldier["attack"])})
+			hazards.append({"id": _allocate_attack_id("friendly_ufo_beam"), "kind": "ufo_beam", "team": "friendly", "source_id": soldier["id"], "source_kind": "ufo", "pos": target_position, "radius": float(ufo_combat["aoe_radius"]) + float(attack_context.get("bonus_radius", 0.0)), "ttl": 2.5, "warmup": 0.75, "tick": 0.0, "damage": attack_damage, "soldier_specials": Dictionary(Dictionary(soldier.get("upgrade_snapshot", {})).get("special_effects", {})).duplicate(true)})
+			_schedule_ufo_upgrade_effects(soldier, target_position, float(ufo_combat["aoe_radius"]), attack_damage, attack_context)
 			audio.play("magic", 0.64, 1.12)
+
+
+func _schedule_ufo_upgrade_effects(soldier: Dictionary, target_position: Vector2, radius: float, attack_damage: float, attack_context: Dictionary) -> void:
+	var gravity := _soldier_special(soldier, "gravity_warhead")
+	if not gravity.is_empty():
+		var gravity_duration := maxf(0.1, float(gravity.get("duration", 2.5)))
+		var gravity_warmup := minf(0.75, gravity_duration)
+		_add_upgrade_runtime_effect({
+			"kind": "gravity", "source_id": int(soldier["id"]), "source_kind": str(soldier["type"]), "pos": target_position,
+			"ttl": gravity_duration, "warmup": gravity_warmup, "radius": float(gravity.get("radius", radius)),
+			"pull_distance": float(gravity.get("pull_distance", 70.0)), "slow_ratio": float(gravity.get("slow_ratio", 0.15)),
+			"pull_duration": maxf(0.1, gravity_duration - gravity_warmup), "pull_elapsed": 0.0, "color": Color("9C7CFF"),
+		})
+	if bool(attack_context.get("echo", false)):
+		_add_upgrade_runtime_effect({
+			"kind": "ufo_echo", "source_id": int(soldier["id"]), "source_kind": str(soldier["type"]), "pos": target_position,
+			"ttl": float(attack_context.get("echo_delay", 0.35)) + 0.08, "warmup": float(attack_context.get("echo_delay", 0.35)),
+			"radius": radius, "damage": attack_damage * float(attack_context.get("echo_damage_ratio", 0.45)), "color": Color("B993FF"),
+		})
+
+
+func _special_from_map(specials: Dictionary, ability_id: String) -> Dictionary:
+	var value: Dictionary = Dictionary(specials.get(ability_id, {}))
+	return Dictionary(value.get("effect", value)).duplicate(true)
+
+
+func _resolve_soldier_enemy_hit(
+	enemy_index: int,
+	raw_damage: float,
+	source_pos: Vector2,
+	damage_kind: String,
+	source_id: int,
+	specials: Dictionary,
+	armor_penetration: float = 0.0,
+	allow_followups: bool = false
+) -> float:
+	if enemy_index < 0 or enemy_index >= enemies.size():
+		return 0.0
+	var enemy: Dictionary = enemies[enemy_index]
+	var primary_enemy_id := int(enemy.get("id", -1))
+	var primary_enemy_position := Vector2(enemy.get("pos", source_pos))
+	var adjusted_damage := maxf(0.0, raw_damage)
+	if float(enemy.get("soldier_void_mark_ttl", 0.0)) > 0.0:
+		adjusted_damage *= 1.0 + clampf(float(enemy.get("soldier_void_damage_bonus", 0.0)), 0.0, 1.0)
+	if float(enemy.get("soldier_focus_mark_ttl", 0.0)) > 0.0 and int(enemy.get("soldier_focus_source_id", -1)) != source_id:
+		adjusted_damage *= 1.0 + clampf(float(enemy.get("soldier_focus_damage_bonus", 0.0)), 0.0, 1.0)
+	var armor_core := _special_from_map(specials, "armor_piercing_core")
+	if damage_kind == "melee" and not armor_core.is_empty():
+		armor_penetration += maxf(0.0, float(armor_core.get("ignored_armor", 0.0)))
+	_apply_soldier_statuses_to_enemy(enemy, adjusted_damage, specials, source_id, damage_kind)
+	var dealt := _damage_enemy(enemy_index, adjusted_damage, source_pos, damage_kind, armor_penetration, source_id)
+	_apply_soldier_lifesteal(source_id, dealt, specials)
+	if allow_followups and dealt > 0.0:
+		_trigger_soldier_ranged_followups(primary_enemy_id, primary_enemy_position, adjusted_damage, source_id, specials)
+	return dealt
+
+
+func _apply_soldier_statuses_to_enemy(enemy: Dictionary, hit_damage: float, specials: Dictionary, source_id: int, damage_kind: String) -> void:
+	var burn := _special_from_map(specials, "burning_sword" if damage_kind == "melee" else "burning_ammo")
+	if not burn.is_empty():
+		var proc_times: Dictionary = Dictionary(enemy.get("soldier_burn_proc_times", {}))
+		var proc_key := str(source_id)
+		if game_time >= float(proc_times.get(proc_key, -99.0)):
+			var burn_duration := maxf(0.1, float(burn.get("duration", 3.0)))
+			enemy["soldier_burn_ttl"] = maxf(float(enemy.get("soldier_burn_ttl", 0.0)), burn_duration)
+			enemy["soldier_burn_dps"] = maxf(float(enemy.get("soldier_burn_dps", 0.0)), hit_damage * float(burn.get("total_burn_ratio", 0.0)) / burn_duration)
+			enemy["soldier_burn_source_id"] = source_id
+			proc_times[proc_key] = game_time + maxf(0.0, float(burn.get("source_target_proc_cooldown", 0.0)))
+			enemy["soldier_burn_proc_times"] = proc_times
+	var toxic := _special_from_map(specials, "toxic_payload")
+	if not toxic.is_empty():
+		var poison_sources: Dictionary = Dictionary(enemy.get("soldier_poison_sources", {}))
+		var poison_key := str(source_id)
+		var poison_entry: Dictionary = Dictionary(poison_sources.get(poison_key, {}))
+		var duration := maxf(0.1, float(toxic.get("duration", 5.0)))
+		poison_entry["stacks"] = mini(maxi(1, int(toxic.get("max_stacks", 3))), int(poison_entry.get("stacks", 0)) + 1)
+		poison_entry["ttl"] = duration
+		poison_entry["dps_per_stack"] = maxf(float(poison_entry.get("dps_per_stack", 0.0)), hit_damage * float(toxic.get("total_poison_ratio", 0.0)) / duration)
+		poison_sources[poison_key] = poison_entry
+		enemy["soldier_poison_sources"] = poison_sources
+	var frost := _special_from_map(specials, "frost_arrow")
+	if not frost.is_empty():
+		enemy["slow"] = maxf(float(enemy.get("slow", 0.0)), float(frost.get("duration", 2.0)))
+		enemy["slow_factor"] = maxf(float(enemy.get("slow_factor", 0.0)), float(frost.get("slow_ratio", 0.25)))
+	var paralysis := _special_from_map(specials, "paralysis_arrow")
+	if not paralysis.is_empty():
+		var source_soldier: Variant = _find_soldier_by_id(source_id)
+		var sequence := int(Dictionary(source_soldier.get("special_runtime", {})).get("attack_sequence", 0)) if source_soldier != null else 0
+		if sequence > 0 and sequence % maxi(1, int(paralysis.get("arrow_interval", 7))) == 0:
+			enemy["enhancement_stun"] = maxf(float(enemy.get("enhancement_stun", 0.0)), float(paralysis.get("normal_stun", 0.45)))
+	var corrosion := _special_from_map(specials, "corrosion")
+	if not corrosion.is_empty():
+		var stacks := mini(maxi(1, int(corrosion.get("max_stacks", 2))), int(enemy.get("soldier_corrosion_stacks", 0)) + 1)
+		enemy["soldier_corrosion_stacks"] = stacks
+		enemy["armor_break"] = maxf(float(enemy.get("armor_break", 0.0)), float(corrosion.get("duration", 4.0)))
+		enemy["armor_reduction"] = maxf(float(enemy.get("armor_reduction", 0.0)), float(corrosion.get("armor_reduction", 0.0)) * float(stacks))
+	var void_mark := _special_from_map(specials, "void_mark")
+	if not void_mark.is_empty():
+		enemy["soldier_void_mark_ttl"] = maxf(float(enemy.get("soldier_void_mark_ttl", 0.0)), float(void_mark.get("duration", 4.0)))
+		enemy["soldier_void_damage_bonus"] = maxf(float(enemy.get("soldier_void_damage_bonus", 0.0)), float(void_mark.get("soldier_damage_taken_bonus", 0.0)))
+	var suppression := _special_from_map(specials, "suppression")
+	if not suppression.is_empty():
+		var suppression_hits: Dictionary = Dictionary(enemy.get("soldier_suppression_hits", {}))
+		var suppression_key := str(source_id)
+		var hits := int(suppression_hits.get(suppression_key, 0)) + 1
+		if hits >= maxi(1, int(suppression.get("hit_threshold", 6))):
+			hits = 0
+			enemy["soldier_suppression_ttl"] = maxf(float(enemy.get("soldier_suppression_ttl", 0.0)), float(suppression.get("effect_duration", 3.5)))
+			enemy["soldier_suppression_move_reduction"] = maxf(float(enemy.get("soldier_suppression_move_reduction", 0.0)), float(suppression.get("move_reduction", 0.2)))
+			enemy["soldier_suppression_attack_reduction"] = maxf(float(enemy.get("soldier_suppression_attack_reduction", 0.0)), float(suppression.get("attack_speed_reduction", 0.1)))
+		suppression_hits[suppression_key] = hits
+		enemy["soldier_suppression_hits"] = suppression_hits
+	var focus := _special_from_map(specials, "focus_mark")
+	if not focus.is_empty():
+		enemy["soldier_focus_mark_ttl"] = float(focus.get("effect_duration", 4.0))
+		enemy["soldier_focus_source_id"] = source_id
+		enemy["soldier_focus_damage_bonus"] = maxf(float(enemy.get("soldier_focus_damage_bonus", 0.0)), float(focus.get("other_ally_damage_bonus", 0.0)))
+
+
+func _apply_soldier_lifesteal(source_id: int, dealt_damage: float, specials: Dictionary) -> void:
+	if dealt_damage <= 0.0:
+		return
+	var lifesteal := _special_from_map(specials, "lifesteal")
+	var soldier: Variant = _find_soldier_by_id(source_id)
+	if lifesteal.is_empty() or soldier == null:
+		return
+	var window := int(floor(game_time))
+	if int(soldier.get("lifesteal_window", -1)) != window:
+		soldier["lifesteal_window"] = window
+		soldier["lifesteal_used"] = 0.0
+	var cap := float(soldier.get("max_hp", 1.0)) * float(lifesteal.get("max_hp_heal_cap_per_second_ratio", 0.06))
+	var available := maxf(0.0, cap - float(soldier.get("lifesteal_used", 0.0)))
+	var healed := minf(available, dealt_damage * float(lifesteal.get("lifesteal_ratio", 0.0)))
+	if healed <= 0.0:
+		return
+	soldier["hp"] = minf(float(soldier["max_hp"]), float(soldier["hp"]) + healed)
+	soldier["lifesteal_used"] = float(soldier.get("lifesteal_used", 0.0)) + healed
+
+
+func _trigger_soldier_melee_followups(soldier: Dictionary, primary_enemy_id: int, origin: Vector2, attack_damage: float) -> void:
+	var specials: Dictionary = Dictionary(Dictionary(soldier.get("upgrade_snapshot", {})).get("special_effects", {}))
+	var sweep := _special_from_map(specials, "sweeping_slash")
+	if not sweep.is_empty():
+		var candidates: Array[Dictionary] = []
+		for enemy in enemies:
+			if int(enemy["id"]) == primary_enemy_id or _enemy_is_air(enemy):
+				continue
+			var distance := Vector2(enemy["pos"]).distance_to(origin)
+			if distance <= float(soldier.get("range", 70.0)) + 58.0:
+				candidates.append({"id": int(enemy["id"]), "distance": distance})
+		candidates.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return float(a["distance"]) < float(b["distance"]))
+		for candidate_index in mini(int(sweep.get("extra_targets", 2)), candidates.size()):
+			var enemy_index := _enemy_index_by_id(int(candidates[candidate_index]["id"]))
+			if enemy_index >= 0:
+				_resolve_soldier_enemy_hit(enemy_index, attack_damage * float(sweep.get("sweep_damage_ratio", 0.6)), origin, "melee", int(soldier["id"]), specials)
+	var stomp := _special_from_map(specials, "stomp")
+	if stomp.is_empty() or not _soldier_upgrade_cooldown_ready(soldier, "stomp"):
+		return
+	_set_soldier_upgrade_cooldown(soldier, "stomp", float(stomp.get("cooldown", 5.5)))
+	var radius := float(stomp.get("radius", 105.0))
+	var hit_ids: Array[int] = []
+	for enemy in enemies:
+		if not _enemy_is_air(enemy) and Vector2(enemy["pos"]).distance_to(origin) <= radius + float(enemy["radius"]):
+			hit_ids.append(int(enemy["id"]))
+	for hit_id in hit_ids:
+		var enemy_index := _enemy_index_by_id(hit_id)
+		if enemy_index >= 0:
+			enemies[enemy_index]["enhancement_stun"] = maxf(float(enemies[enemy_index].get("enhancement_stun", 0.0)), float(stomp.get("stun_duration", 0.45)))
+			_resolve_soldier_enemy_hit(enemy_index, attack_damage * float(stomp.get("damage_ratio", 0.65)), origin, "area", int(soldier["id"]), specials)
+	_spawn_effect("explosion", origin, Color("D6A66D"), clampf(radius / 110.0, 0.7, 1.4))
+
+
+func _trigger_soldier_ranged_followups(primary_enemy_id: int, primary_position: Vector2, damage: float, source_id: int, specials: Dictionary) -> void:
+	var excluded: Dictionary = {primary_enemy_id: true}
+	var chain := _special_from_map(specials, "chain_lightning")
+	if not chain.is_empty():
+		var chain_origin := primary_position
+		for _jump in clampi(int(chain.get("jumps", 0)), 0, 6):
+			var next_id := _nearest_enemy_excluding(chain_origin, float(chain.get("jump_range", 240.0)), excluded)
+			if next_id < 0:
+				break
+			excluded[next_id] = true
+			var next_index := _enemy_index_by_id(next_id)
+			if next_index < 0:
+				break
+			var next_position := Vector2(enemies[next_index]["pos"])
+			_damage_enemy(next_index, damage * float(chain.get("jump_damage_ratio", 0.35)), chain_origin, "chain", 0.0, source_id)
+			_spawn_effect("hit", next_position, Color("9EEAFF"), 0.6)
+			chain_origin = next_position
+	var ricochet := _special_from_map(specials, "ricochet")
+	if not ricochet.is_empty():
+		for _bounce in clampi(int(ricochet.get("extra_targets", 0)), 0, 4):
+			var bounce_id := _nearest_enemy_excluding(primary_position, float(ricochet.get("ricochet_range", 280.0)), excluded)
+			if bounce_id < 0:
+				break
+			excluded[bounce_id] = true
+			var bounce_index := _enemy_index_by_id(bounce_id)
+			if bounce_index >= 0:
+				_damage_enemy(bounce_index, damage * float(ricochet.get("ricochet_damage_ratio", 0.45)), primary_position, "projectile", 0.0, source_id)
+
+
+func _nearest_enemy_excluding(position: Vector2, radius: float, excluded: Dictionary) -> int:
+	var result := -1
+	var nearest := radius
+	for enemy in enemies:
+		if excluded.has(int(enemy["id"])):
+			continue
+		var distance := Vector2(enemy["pos"]).distance_to(position)
+		if distance < nearest:
+			nearest = distance
+			result = int(enemy["id"])
+	return result
 
 
 func _attack_castle_with_soldier(soldier: Dictionary, castle: Dictionary) -> void:
@@ -4695,6 +5689,7 @@ func _attack_castle_with_soldier(soldier: Dictionary, castle: Dictionary) -> voi
 	var direction := (Vector2(castle["pos"]) - origin).normalized()
 	if direction.length_squared() < 0.01: direction = Vector2.RIGHT
 	soldier["aim_dir"] = direction
+	var attack_context := _begin_soldier_attack(soldier, castle, -int(abs(str(castle["id"]).hash())), Vector2(castle["pos"]))
 	var projectile_range := maxf(float(combat["range"]) + 260.0, origin.distance_to(Vector2(castle["pos"])) + 90.0)
 	# 科技遠程兵攻城仍使用真實飛行彈體；外牆會在命中／爆炸時才受傷。
 	match type_id:
@@ -4735,9 +5730,12 @@ func _attack_castle_with_soldier(soldier: Dictionary, castle: Dictionary) -> voi
 		"ufo":
 			hazards.append({"id": _allocate_attack_id("friendly_ufo_siege"), "kind": "ufo_beam", "team": "friendly", "source_id": soldier["id"], "source_kind": "ufo", "pos": Vector2(castle["pos"]), "radius": float(combat["aoe_radius"]), "ttl": 2.5, "warmup": 0.75, "tick": 0.0, "damage": float(soldier["attack"])})
 			return
-	var damage := float(soldier["attack"])
+	var damage := float(soldier["attack"]) * float(attack_context.get("damage_multiplier", 1.0))
 	if combat.has("siege_multiplier"): damage *= float(combat["siege_multiplier"])
 	elif type_id not in ["swordsman", "heavy"]: damage *= 0.8
+	var siege_warhead := _soldier_special(soldier, "siege_warhead")
+	if not siege_warhead.is_empty():
+		damage *= 1.0 + float(siege_warhead.get("structure_damage_bonus", 0.0))
 	_damage_castle(castle, damage)
 	_spawn_effect("hit", castle["pos"] + Vector2(randf_range(-80, 80), randf_range(-70, 70)), FRIEND_BLUE, 0.9)
 
@@ -4840,8 +5838,12 @@ func _move_soldier_toward(soldier: Dictionary, destination: Vector2, delta: floa
 				air_separation += air_away.normalized() * (1.0 - air_away.length() / air_desired)
 		var air_direction := (air_offset.normalized() + air_separation * 1.15).limit_length(1.0)
 		var air_old_position := Vector2(soldier["pos"])
-		soldier["pos"] = air_old_position + air_direction * float(soldier["speed"]) * speed_scale * delta
+		var air_speed := float(soldier["speed"]) * speed_scale * _soldier_rally_move_multiplier(soldier)
+		soldier["pos"] = air_old_position + air_direction * air_speed * delta
 		soldier["vel"] = (Vector2(soldier["pos"]) - air_old_position) / maxf(delta, 0.0001)
+		var air_barrier_result := SoldierUpgradeRuntime.record_movement(soldier, air_old_position.distance_to(Vector2(soldier["pos"])))
+		if bool(air_barrier_result.get("activated", false)):
+			_spawn_effect("shield", soldier["pos"], Color("7DD8FF"), 0.72)
 		return
 	if _position_hits_tree(Vector2(soldier["pos"]), float(soldier["radius"])):
 		var escape_direction := (destination - Vector2(soldier["pos"])).normalized()
@@ -4879,7 +5881,7 @@ func _move_soldier_toward(soldier: Dictionary, destination: Vector2, delta: floa
 	var desired_from_player := float(soldier["radius"]) + PLAYER_RADIUS + 2.0
 	if distance_from_player > 0.01 and distance_from_player < desired_from_player:
 		separation += player_away.normalized() * (1.0 - distance_from_player / desired_from_player) * 0.7
-	var speed := float(soldier["speed"]) * speed_scale
+	var speed := float(soldier["speed"]) * speed_scale * _soldier_rally_move_multiplier(soldier)
 	if python_boss != null:
 		speed *= float(python_boss.get_speed_multiplier("soldier", int(soldier["id"])))
 	var player_distance := Vector2(soldier["pos"]).distance_to(player["pos"])
@@ -4904,6 +5906,9 @@ func _move_soldier_toward(soldier: Dictionary, destination: Vector2, delta: floa
 	if aionis_boss != null and timeless_gate_unlocked and not aionis_boss.is_defeated():
 		soldier["pos"] = _resolve_aionis_body_collision(soldier["pos"], float(soldier["radius"]))
 	soldier["vel"] = (Vector2(soldier["pos"]) - old_position) / maxf(delta, 0.0001)
+	var barrier_result := SoldierUpgradeRuntime.record_movement(soldier, old_position.distance_to(Vector2(soldier["pos"])))
+	if bool(barrier_result.get("activated", false)):
+		_spawn_effect("shield", soldier["pos"], Color("7DD8FF"), 0.72)
 
 
 func _damage_soldier(soldier: Dictionary, raw_damage: float, source_pos: Vector2, damage_kind: String) -> void:
@@ -4912,11 +5917,40 @@ func _damage_soldier(soldier: Dictionary, raw_damage: float, source_pos: Vector2
 	if _is_in_friendly_safe_zone(Vector2(soldier["pos"])):
 		return
 	var damage := raw_damage
+	if float(soldier.get("dash_reduction_ttl", 0.0)) > 0.0:
+		damage *= 1.0 - clampf(float(soldier.get("dash_damage_reduction", 0.0)), 0.0, 0.85)
 	if soldier["type"] == "heavy" and damage_kind in ["projectile", "area"]:
 		damage *= 0.72
 	damage = _calculate_damage(damage, float(soldier["defense"]))
+	damage *= 1.0 - _soldier_guardian_aura_reduction(soldier)
+	if float(soldier.get("revive_reduction_ttl", 0.0)) > 0.0:
+		damage *= 1.0 - clampf(float(soldier.get("revive_damage_reduction", 0.0)), 0.0, 0.85)
+	var damage_plan := SoldierUpgradeRuntime.incoming_damage_plan(soldier, damage_kind, damage)
+	damage = float(damage_plan.get("damage", damage))
+	var sidestep := float(damage_plan.get("sidestep_distance", 0.0))
+	if sidestep > 0.0:
+		var away := (Vector2(soldier["pos"]) - source_pos).normalized()
+		if away.length_squared() <= 0.001:
+			away = Vector2.UP.rotated(float(int(soldier["id"]) % 8) * TAU / 8.0)
+		var side := away.rotated(PI * 0.5 if int(soldier["id"]) % 2 == 0 else -PI * 0.5)
+		soldier["pos"] = _move_with_collision(soldier["pos"], side * sidestep, float(soldier["radius"]), true)
+	if float(damage_plan.get("invulnerability", 0.0)) > 0.0:
+		soldier["invuln"] = maxf(float(soldier.get("invuln", 0.0)), float(damage_plan["invulnerability"]))
+	if float(damage_plan.get("absorbed", 0.0)) > 0.0:
+		_add_floater(soldier["pos"] + Vector2(0, -22), "盾 %d" % int(damage_plan["absorbed"]), Color("80D9FF"), 0.7)
+		_spawn_effect("shield", soldier["pos"], Color("80D9FF"), 0.55)
+	if bool(damage_plan.get("evaded", false)):
+		_spawn_effect("dash", soldier["pos"], Color("B9F3FF"), 0.55)
+		return
+	if damage <= 0.0:
+		return
 	soldier["hp"] = max(0.0, float(soldier["hp"]) - damage)
-	soldier["invuln"] = 0.10
+	soldier["invuln"] = maxf(float(soldier.get("invuln", 0.0)), 0.10)
+	if bool(damage_plan.get("last_stand_triggered", false)):
+		var last_stand := _soldier_special(soldier, "last_stand")
+		var recovery_duration := maxf(0.1, float(last_stand.get("recovery_duration", 3.0)))
+		soldier["last_stand_recovery_ttl"] = recovery_duration
+		soldier["last_stand_recovery_per_second"] = float(soldier["max_hp"]) * float(last_stand.get("recovery_max_hp_ratio", 0.12)) / recovery_duration
 	soldier["flash"] = 0.12
 	soldier["last_hit"] = game_time
 	_add_floater(soldier["pos"] + Vector2(0, -18), "-%d" % int(damage), Color("FF9B79"), 0.75)
@@ -4929,7 +5963,13 @@ func _kill_soldier(id: int) -> void:
 		if int(soldiers[i]["id"]) != id: continue
 		var fallen: Dictionary = soldiers[i]
 		if float(fallen["soul_fatigue"]) <= 0.0:
-			tombstones.append({"id": next_entity_id, "type": fallen["type"], "pos": fallen["pos"], "ttl": 18.0, "cost": int(GameConfig.SOLDIERS[fallen["type"]]["recruit_cost"]["gold"])})
+			var tombstone_bonus := 0.0
+			for priest in soldiers:
+				if str(priest.get("type", "")) != "priest" or int(priest.get("id", -1)) == id:
+					continue
+				var shelter := _soldier_special(priest, "soul_shelter")
+				tombstone_bonus = maxf(tombstone_bonus, float(shelter.get("tombstone_bonus_seconds", 0.0)))
+			tombstones.append({"id": next_entity_id, "type": fallen["type"], "pos": fallen["pos"], "ttl": 18.0 + tombstone_bonus, "cost": int(GameConfig.SOLDIERS[fallen["type"]]["recruit_cost"]["gold"])})
 			next_entity_id += 1
 		_spawn_effect("death", fallen["pos"], Color("B6C8D6"), 0.7)
 		soldiers.remove_at(i)
@@ -4949,13 +5989,16 @@ func _best_tombstone(position: Vector2, radius: float) -> Variant:
 	return best
 
 
-func _revive_tombstone(tomb: Dictionary, priest_id: int = -1) -> void:
+func _revive_tombstone(tomb: Dictionary, priest_id: int = -1, hp_ratio: float = 0.45, soul_shelter: Dictionary = {}) -> void:
 	if soldiers.size() >= _army_limit():
 		_add_notification("軍隊已達上限，暫時無法復活士兵。", Color("F6C177"), 1.8)
 		return
-	_spawn_soldier(str(tomb["type"]), tomb["pos"], 0.45)
+	_spawn_soldier(str(tomb["type"]), tomb["pos"], clampf(hp_ratio, 0.05, 1.0))
 	var revived: Dictionary = soldiers.back()
 	revived["soul_fatigue"] = 20.0
+	if not soul_shelter.is_empty():
+		revived["revive_damage_reduction"] = clampf(float(soul_shelter.get("revived_damage_reduction", 0.0)), 0.0, 0.85)
+		revived["revive_reduction_ttl"] = maxf(0.0, float(soul_shelter.get("reduction_duration", 0.0)))
 	_spawn_effect("revive", tomb["pos"], GOLD, 1.0)
 	_add_floater(tomb["pos"] + Vector2(0, -25), "復活", GOLD, 1.2)
 	if priest_id >= 0 and python_boss != null and python_boss.is_engaged():
@@ -4971,6 +6014,21 @@ func _revive_tombstone(tomb: Dictionary, priest_id: int = -1) -> void:
 # -----------------------------------------------------------------------------
 
 func _spawn_projectile(data: Dictionary) -> void:
+	var source_soldier: Variant = null
+	if str(data.get("team", "")) == "friendly" and int(data.get("source_id", 0)) > 0:
+		source_soldier = _find_soldier_by_id(int(data.get("source_id", 0)))
+	if source_soldier != null and not data.has("soldier_specials"):
+		var pending_context: Dictionary = Dictionary(source_soldier.get("pending_attack_context", {})).duplicate(true)
+		if pending_context.is_empty():
+			pending_context = SoldierUpgradeRuntime.begin_attack(source_soldier, 1.0)
+		if data.has("target_id"):
+			pending_context["target_id"] = int(data["target_id"])
+		elif pending_context.has("target_id"):
+			data["target_id"] = int(pending_context["target_id"])
+		data = SoldierUpgradeRuntime.decorate_projectile(data, source_soldier, pending_context)
+		var siege_warhead := _soldier_special(source_soldier, "siege_warhead")
+		if not siege_warhead.is_empty():
+			data["siege"] = float(data.get("siege", 1.0)) * (1.0 + float(siege_warhead.get("structure_damage_bonus", 0.0)))
 	if projectiles.size() >= MAX_PROJECTILES:
 		projectiles.pop_front()
 	data["id"] = next_entity_id
@@ -4993,12 +6051,50 @@ func _spawn_projectile(data: Dictionary) -> void:
 	data["fire_duration"] = float(data.get("fire_duration", 5.0))
 	data["fire_tick_damage"] = float(data.get("fire_tick_damage", 0.0))
 	projectiles.append(data)
+	if source_soldier != null and bool(data.get("allow_special_generation", false)):
+		_spawn_soldier_projectile_children(source_soldier, data)
+
+
+func _spawn_soldier_projectile_children(soldier: Dictionary, projectile: Dictionary) -> void:
+	var split := _projectile_special(projectile, "split_shot")
+	if not split.is_empty() and not bool(soldier.get("pending_split_scheduled", false)):
+		soldier["pending_split_scheduled"] = true
+		var extra_count := clampi(int(split.get("extra_projectiles", 0)), 0, 4)
+		var spread := deg_to_rad(float(split.get("spread_degrees", 12.0)))
+		var ratio := clampf(float(split.get("damage_ratio", 0.12)), 0.0, 1.0)
+		for split_index in extra_count:
+			var child := projectile.duplicate(true)
+			var centered := float(split_index) - float(extra_count - 1) * 0.5
+			child["vel"] = Vector2(projectile["vel"]).rotated(spread * (centered if extra_count > 1 else 1.0))
+			child["damage"] = float(projectile["damage"]) * ratio
+			child["special_generation"] = 1
+			child["allow_special_generation"] = false
+			child["soldier_attack_context"] = Dictionary(projectile.get("soldier_attack_context", {})).duplicate(true)
+			child["soldier_attack_context"]["allow_special_generation"] = false
+			_spawn_projectile(child)
+	var context: Dictionary = Dictionary(projectile.get("soldier_attack_context", {}))
+	if bool(context.get("echo", false)) and not bool(soldier.get("pending_echo_scheduled", false)):
+		soldier["pending_echo_scheduled"] = true
+		var delay := maxf(0.01, float(context.get("echo_delay", 0.35)))
+		var echo_projectile := projectile.duplicate(true)
+		echo_projectile["damage"] = float(projectile["damage"]) * clampf(float(context.get("echo_damage_ratio", 0.45)), 0.0, 2.0)
+		echo_projectile["special_generation"] = 1
+		echo_projectile["allow_special_generation"] = false
+		echo_projectile["soldier_attack_context"] = context.duplicate(true)
+		echo_projectile["soldier_attack_context"]["allow_special_generation"] = false
+		_add_upgrade_runtime_effect({
+			"kind": "temporal_echo", "source_id": int(soldier["id"]), "source_kind": str(soldier["type"]),
+			"pos": Vector2(projectile["pos"]), "ttl": delay + 0.08, "warmup": delay,
+			"radius": maxf(12.0, float(projectile.get("radius", 4.0)) * 2.0), "color": Color("B993FF"),
+			"projectile": echo_projectile,
+		})
 
 
 func _update_projectiles(delta: float) -> void:
 	for p_index in range(projectiles.size() - 1, -1, -1):
 		if p_index >= projectiles.size(): continue
 		var projectile: Dictionary = projectiles[p_index]
+		_update_projectile_homing(projectile, delta)
 		# Snapshot the structure lock before resolving hits. If this projectile
 		# kills the final defender, that same shell still cannot spill damage into
 		# the wall; a later attack begins the structure phase.
@@ -5066,6 +6162,8 @@ func _update_projectiles(delta: float) -> void:
 						_explode_projectile(projectile)
 						consumed = true
 					else:
+						_trigger_soldier_projectile_impact_effects(projectile, impact_position, BOSS_ENTITY_ID)
+						_apply_lingering_first_hit_damage(projectile)
 						var boss_result: Dictionary = _receive_active_boss_hit(
 							projectile["id"], str(projectile["source_kind"]), int(projectile["source_id"]),
 							float(projectile["damage"]), impact_position, "projectile",
@@ -5086,7 +6184,13 @@ func _update_projectiles(delta: float) -> void:
 						consumed = true
 					else:
 						_apply_projectile_status(enemies[enemy_index], projectile)
-						_damage_enemy(enemy_index, float(projectile["damage"]), impact_position, "projectile", float(projectile["armor_penetration"]))
+						_trigger_soldier_projectile_impact_effects(projectile, impact_position, hit_enemy_id)
+						_apply_lingering_first_hit_damage(projectile)
+						var soldier_specials: Dictionary = Dictionary(projectile.get("soldier_specials", {}))
+						if soldier_specials.is_empty():
+							_damage_enemy(enemy_index, float(projectile["damage"]), impact_position, "projectile", float(projectile["armor_penetration"]))
+						else:
+							_resolve_soldier_enemy_hit(enemy_index, float(projectile["damage"]), impact_position, "projectile", int(projectile.get("source_id", -1)), soldier_specials, float(projectile["armor_penetration"]), bool(projectile.get("allow_special_generation", false)))
 				if not consumed and float(projectile["aoe"]) <= 0.0:
 					projectile["damage"] = float(projectile["damage"]) * float(projectile["falloff"])
 					projectile["pierce"] = int(projectile["pierce"]) - 1
@@ -5123,6 +6227,17 @@ func _update_projectiles(delta: float) -> void:
 						consumed = true
 						break
 			if not bool(projectile.get("delayed_impact", false)) and not consumed:
+				var guardian_hit := _guardian_projectile_intersection(previous_pos, Vector2(projectile["pos"]), float(projectile["radius"]))
+				if bool(guardian_hit.get("hit", false)):
+					projectile["pos"] = Vector2(guardian_hit["position"])
+					if float(projectile["aoe"]) > 0.0:
+						_explode_projectile(projectile)
+					else:
+						var guardian_index := int(guardian_hit.get("effect_index", -1))
+						if guardian_index >= 0 and guardian_index < upgrade_effects.size():
+							_damage_guardian(upgrade_effects[guardian_index], float(projectile["damage"]), previous_pos)
+					consumed = true
+			if not bool(projectile.get("delayed_impact", false)) and not consumed:
 				for castle in castles.values():
 					if not bool(castle.get("owned", false)):
 						continue
@@ -5142,9 +6257,177 @@ func _update_projectiles(delta: float) -> void:
 			projectiles.remove_at(p_index)
 
 
+func _update_projectile_homing(projectile: Dictionary, delta: float) -> void:
+	if not bool(projectile.get("homing", false)) or Vector2(projectile.get("vel", Vector2.ZERO)).length_squared() <= 0.001:
+		return
+	var target_id := int(projectile.get("target_id", -1))
+	var target_position: Variant = null
+	if target_id == BOSS_ENTITY_ID and _active_boss_can_be_targeted():
+		target_position = _active_boss_position()
+	else:
+		var target: Variant = _find_enemy_by_id(target_id)
+		if target != null:
+			target_position = Vector2(target["pos"])
+	if target_position == null:
+		target_id = _enemy_near_point(Vector2(projectile["pos"]), 620.0)
+		projectile["target_id"] = target_id
+		if target_id == BOSS_ENTITY_ID:
+			target_position = _active_boss_position()
+		else:
+			var replacement: Variant = _find_enemy_by_id(target_id)
+			if replacement != null:
+				target_position = Vector2(replacement["pos"])
+	if target_position == null:
+		return
+	var velocity := Vector2(projectile["vel"])
+	var desired := (Vector2(target_position) - Vector2(projectile["pos"])).normalized()
+	if desired.length_squared() <= 0.001:
+		return
+	var max_turn := deg_to_rad(maxf(0.0, float(projectile.get("homing_turn_degrees_per_second", 0.0)))) * delta
+	var angle_delta := clampf(velocity.normalized().angle_to(desired), -max_turn, max_turn)
+	projectile["vel"] = velocity.normalized().rotated(angle_delta) * velocity.length()
+
+
+func _trigger_soldier_projectile_impact_effects(projectile: Dictionary, position: Vector2, target_id: int = -1) -> void:
+	if not bool(projectile.get("allow_special_generation", false)) or bool(projectile.get("upgrade_impact_triggered", false)):
+		return
+	projectile["upgrade_impact_triggered"] = true
+	var lingering := _projectile_special(projectile, "lingering_projectile")
+	if not lingering.is_empty():
+		var duration := maxf(0.2, float(lingering.get("linger_duration", 2.0)))
+		var base_damage := float(projectile.get("upgrade_base_damage", projectile.get("damage", 0.0)))
+		projectile["lingering_first_hit_ratio"] = clampf(float(lingering.get("first_hit_ratio", 0.70)), 0.0, 1.0)
+		_add_upgrade_runtime_effect({
+			"kind": "lingering", "source_id": int(projectile.get("source_id", -1)), "source_kind": str(projectile.get("source_kind", "soldier")),
+			"pos": position, "target_id": target_id, "ttl": duration, "warmup": 0.0,
+			"radius": maxf(22.0, float(projectile.get("radius", 4.0)) * 3.0), "color": Color(projectile.get("color", Color("C4E7FF"))),
+			"damage": base_damage * float(lingering.get("tick_damage_ratio", 0.12)),
+			"armor_penetration": maxf(0.0, float(projectile.get("armor_penetration", 0.0))),
+			"tick_interval": maxf(0.1, float(lingering.get("tick_interval", 0.5))), "tick": 0.0,
+			"max_per_owner": int(lingering.get("max_per_unit", 2)), "team_cap": int(lingering.get("team_cap", MAX_UPGRADE_LINGERING_PER_TEAM)),
+		})
+
+
+func _apply_lingering_first_hit_damage(projectile: Dictionary) -> void:
+	if bool(projectile.get("lingering_first_hit_applied", false)) or not projectile.has("lingering_first_hit_ratio"):
+		return
+	projectile["damage"] = float(projectile.get("damage", 0.0)) * clampf(float(projectile.get("lingering_first_hit_ratio", 1.0)), 0.0, 1.0)
+	projectile["lingering_first_hit_applied"] = true
+
+
+func _prepare_soldier_explosion_payload(projectile: Dictionary) -> void:
+	if bool(projectile.get("upgrade_payload_prepared", false)):
+		return
+	projectile["upgrade_payload_prepared"] = true
+	var position := Vector2(projectile["pos"])
+	var base_damage := float(projectile.get("damage", 0.0))
+	var base_radius := maxf(1.0, float(projectile.get("aoe", 0.0)))
+	projectile["upgrade_base_damage"] = base_damage
+	projectile["upgrade_base_radius"] = base_radius
+	_trigger_soldier_projectile_impact_effects(projectile, position)
+	var mine := _projectile_special(projectile, "mine_round")
+	if not mine.is_empty() and bool(projectile.get("allow_special_generation", false)):
+		projectile["damage"] = base_damage * float(mine.get("impact_damage_ratio", 0.3))
+		projectile["aoe"] = minf(base_radius, 48.0)
+		_add_upgrade_runtime_effect({
+			"kind": "mine", "source_id": int(projectile.get("source_id", -1)), "source_kind": str(projectile.get("source_kind", "soldier")),
+			"pos": position, "ttl": float(mine.get("mine_ttl", 7.0)), "warmup": float(mine.get("arming_time", 0.7)),
+			"radius": float(mine.get("trigger_radius", 78.0)), "damage": base_damage * float(mine.get("trigger_damage_ratio", 1.2)),
+			"color": Color("F2B84B"), "scan": 0.0, "max_per_owner": int(mine.get("max_per_unit", 2)),
+			"team_cap": int(mine.get("team_cap", MAX_UPGRADE_MINES_PER_TEAM)),
+		})
+	var cluster := _projectile_special(projectile, "cluster_warhead")
+	if not cluster.is_empty() and bool(projectile.get("allow_special_generation", false)):
+		projectile["damage"] = float(projectile["damage"]) * float(cluster.get("main_damage_ratio", 0.7))
+		var bomblets := clampi(int(cluster.get("bomblets", 3)), 0, 8)
+		for bomblet_index in bomblets:
+			var offset := Vector2.from_angle(TAU * float(bomblet_index) / maxf(1.0, float(bomblets)) + float(int(projectile.get("id", 0)) % 7) * 0.17) * (base_radius * 0.52 + 26.0)
+			_add_upgrade_runtime_effect({
+				"kind": "bomblet", "source_id": int(projectile.get("source_id", -1)), "source_kind": str(projectile.get("source_kind", "soldier")),
+				"pos": position + offset, "ttl": 0.28 + float(bomblet_index % 3) * 0.08, "warmup": 0.20 + float(bomblet_index % 3) * 0.08,
+				"radius": maxf(42.0, base_radius * 0.46), "damage": base_damage * float(cluster.get("bomblet_damage_ratio", 0.25)),
+				"color": FIRE_ORANGE,
+			})
+	_apply_lingering_first_hit_damage(projectile)
+
+
+func _trigger_soldier_explosion_followups(projectile: Dictionary, position: Vector2, radius: float) -> void:
+	if not bool(projectile.get("allow_special_generation", false)) or bool(projectile.get("upgrade_followups_triggered", false)):
+		return
+	projectile["upgrade_followups_triggered"] = true
+	var base_damage := float(projectile.get("upgrade_base_damage", projectile.get("damage", 0.0)))
+	var base_radius := float(projectile.get("upgrade_base_radius", radius))
+	var source_id := int(projectile.get("source_id", -1))
+	var source_kind := str(projectile.get("source_kind", "soldier"))
+	var chain := _projectile_special(projectile, "chain_explosion")
+	if not chain.is_empty():
+		var ratios: Array = Array(chain.get("blast_damage_ratios", []))
+		for blast_index in mini(int(chain.get("extra_blasts", ratios.size())), ratios.size()):
+			var blast_offset := Vector2.from_angle(float(blast_index) * 2.39996 + float(source_id % 11) * 0.13) * minf(base_radius * 0.55, 70.0)
+			_add_upgrade_runtime_effect({
+				"kind": "chain_blast", "source_id": source_id, "source_kind": source_kind, "pos": position + blast_offset,
+				"ttl": 0.20 + float(blast_index) * 0.16, "warmup": 0.14 + float(blast_index) * 0.16,
+				"radius": maxf(44.0, base_radius * (0.78 - float(blast_index) * 0.06)), "damage": base_damage * float(ratios[blast_index]),
+				"color": Color("FF8B5A"),
+			})
+	var burning_zone := _projectile_special(projectile, "burning_zone")
+	if not burning_zone.is_empty():
+		_add_upgrade_runtime_effect({
+			"kind": "burning_zone", "source_id": source_id, "source_kind": source_kind, "pos": position,
+			"ttl": float(burning_zone.get("zone_ttl", 3.0)), "warmup": 0.0, "radius": maxf(54.0, base_radius * 0.82),
+			"damage": base_damage * float(burning_zone.get("tick_damage_ratio", 0.08)),
+			"tick_interval": float(burning_zone.get("tick_interval", 0.5)), "tick": 0.0, "color": FIRE_ORANGE,
+		})
+	var gravity := _projectile_special(projectile, "gravity_warhead")
+	if not gravity.is_empty():
+		var gravity_duration := maxf(0.1, float(gravity.get("duration", 2.5)))
+		_add_upgrade_runtime_effect({
+			"kind": "gravity", "source_id": source_id, "source_kind": source_kind, "pos": position,
+			"ttl": gravity_duration, "warmup": 0.0, "radius": float(gravity.get("radius", 130.0)),
+			"pull_distance": float(gravity.get("pull_distance", 70.0)), "slow_ratio": float(gravity.get("slow_ratio", 0.15)),
+			"pull_duration": gravity_duration, "pull_elapsed": 0.0, "color": Color("9C7CFF"),
+		})
+	var shockwave := _projectile_special(projectile, "shockwave_round")
+	if not shockwave.is_empty():
+		var shock_ids: Array[int] = []
+		for enemy in enemies:
+			if not _enemy_is_air(enemy) and Vector2(enemy["pos"]).distance_to(position) <= radius + float(enemy["radius"]):
+				shock_ids.append(int(enemy["id"]))
+		for shock_id in shock_ids:
+			var shock_index := _enemy_index_by_id(shock_id)
+			if shock_index < 0:
+				continue
+			var away := (Vector2(enemies[shock_index]["pos"]) - position).normalized()
+			enemies[shock_index]["pos"] = _move_with_collision(enemies[shock_index]["pos"], away * float(shockwave.get("knockback", 60.0)), float(enemies[shock_index]["radius"]))
+			enemies[shock_index]["slow"] = maxf(float(enemies[shock_index].get("slow", 0.0)), float(shockwave.get("slow_duration", 1.5)))
+			enemies[shock_index]["slow_factor"] = maxf(float(enemies[shock_index].get("slow_factor", 0.0)), float(shockwave.get("slow_ratio", 0.22)))
+			enemies[shock_index]["enhancement_stun"] = maxf(float(enemies[shock_index].get("enhancement_stun", 0.0)), float(shockwave.get("normal_stun", 0.0)))
+	var shrapnel := _projectile_special(projectile, "shrapnel_storm")
+	if not shrapnel.is_empty():
+		var nearby_ids: Array[int] = []
+		for enemy in enemies:
+			if Vector2(enemy["pos"]).distance_to(position) <= base_radius + 190.0:
+				nearby_ids.append(int(enemy["id"]))
+		nearby_ids.sort()
+		var hit_counts: Dictionary = {}
+		for shard_index in clampi(int(shrapnel.get("shards", 6)), 0, 12):
+			if nearby_ids.is_empty():
+				break
+			var shard_target := nearby_ids[shard_index % nearby_ids.size()]
+			if int(hit_counts.get(shard_target, 0)) >= int(shrapnel.get("same_target_hit_cap", 2)):
+				continue
+			hit_counts[shard_target] = int(hit_counts.get(shard_target, 0)) + 1
+			var shard_enemy_index := _enemy_index_by_id(shard_target)
+			if shard_enemy_index >= 0:
+				_damage_enemy(shard_enemy_index, base_damage * float(shrapnel.get("shard_damage_ratio", 0.15)), position, "projectile", 0.0, source_id)
+
+
 func _explode_projectile(projectile: Dictionary) -> void:
 	var position: Vector2 = projectile["pos"]
 	var radius := float(projectile["aoe"])
+	if str(projectile.get("team", "")) == "friendly" and not Dictionary(projectile.get("soldier_specials", {})).is_empty():
+		_prepare_soldier_explosion_payload(projectile)
+		radius = float(projectile["aoe"])
 	var siege_locked_castle_id := str(projectile.get("siege_locked_castle_id", ""))
 	if not projectile.has("siege_locked_castle_id") and projectile["team"] == "friendly" and command_castle_id != "" and castles.has(command_castle_id):
 		var immediate_siege_castle: Dictionary = castles[command_castle_id]
@@ -5165,7 +6448,12 @@ func _explode_projectile(projectile: Dictionary) -> void:
 			if distance <= radius + float(enemies[i]["radius"]):
 				var falloff: float = lerp(1.0, 0.68, clamp(distance / max(radius, 1.0), 0.0, 1.0))
 				_apply_projectile_status(enemies[i], projectile)
-				_damage_enemy(i, float(projectile["damage"]) * falloff, position, "area", float(projectile["armor_penetration"]))
+				var soldier_specials: Dictionary = Dictionary(projectile.get("soldier_specials", {}))
+				if soldier_specials.is_empty():
+					_damage_enemy(i, float(projectile["damage"]) * falloff, position, "area", float(projectile["armor_penetration"]))
+				else:
+					_resolve_soldier_enemy_hit(i, float(projectile["damage"]) * falloff, position, "area", int(projectile.get("source_id", -1)), soldier_specials, float(projectile["armor_penetration"]))
+		_trigger_soldier_explosion_followups(projectile, position, radius)
 		for castle in castles.values():
 			if str(castle["id"]) == siege_locked_castle_id:
 				continue
@@ -5215,7 +6503,12 @@ func _update_hazards(delta: float) -> void:
 					if str(hazard.get("team", "enemy")) == "friendly":
 						for enemy_index in range(enemies.size() - 1, -1, -1):
 							if Vector2(enemies[enemy_index]["pos"]).distance_to(beam_position) <= beam_radius + float(enemies[enemy_index]["radius"]):
-								_damage_enemy(enemy_index, float(hazard["damage"]), beam_position, "beam", 10.0)
+								var beam_specials: Dictionary = Dictionary(hazard.get("soldier_specials", {}))
+								if beam_specials.is_empty():
+									_damage_enemy(enemy_index, float(hazard["damage"]), beam_position, "beam", 10.0)
+								else:
+									var armor_core := _special_from_map(beam_specials, "armor_piercing_core")
+									_resolve_soldier_enemy_hit(enemy_index, float(hazard["damage"]), beam_position, "beam", int(hazard.get("source_id", -1)), beam_specials, 10.0 + float(armor_core.get("ignored_armor", 0.0)), true)
 						if _active_boss_can_be_targeted():
 							var boss_hit := _active_boss_projectile_intersection(beam_position, beam_position, beam_radius)
 							if bool(boss_hit.get("hit", false)):
@@ -5232,6 +6525,7 @@ func _update_hazards(delta: float) -> void:
 							if Vector2(beam_soldier["pos"]).distance_to(beam_position) <= beam_radius + float(beam_soldier["radius"]):
 								var soldier_beam_damage := minf(float(hazard["damage"]), float(beam_soldier["max_hp"]) * 0.18)
 								_damage_soldier(beam_soldier, soldier_beam_damage, beam_position, "beam")
+						_damage_guardians_in_area(beam_position, beam_radius, float(hazard["damage"]))
 						for beam_castle in castles.values():
 							if bool(beam_castle.get("owned", false)) and Vector2(beam_castle["pos"]).distance_to(beam_position) <= beam_radius + _castle_damage_radius(beam_castle):
 								_damage_owned_castle(beam_castle, float(hazard["damage"]))
@@ -5273,8 +6567,9 @@ func _update_hazards(delta: float) -> void:
 			hazards.remove_at(i)
 
 
-func _damage_enemy(index: int, raw_damage: float, source_pos: Vector2, damage_kind: String, armor_penetration: float = 0.0) -> void:
-	if index < 0 or index >= enemies.size(): return
+func _damage_enemy(index: int, raw_damage: float, source_pos: Vector2, damage_kind: String, armor_penetration: float = 0.0, soldier_source_id: int = -1) -> float:
+	if index < 0 or index >= enemies.size():
+		return 0.0
 	var enemy: Dictionary = enemies[index]
 	var damage := raw_damage
 	if float(enemy.get("enhancement_reactive_reduction", 0.0)) > 0.0 and float(enemy.get("enhancement_reactive_timer", 0.0)) <= 0.0 and damage_kind in ["projectile", "area", "beam"]:
@@ -5290,6 +6585,12 @@ func _damage_enemy(index: int, raw_damage: float, source_pos: Vector2, damage_ki
 		effective_defense -= float(enemy.get("armor_reduction", 0.0))
 	effective_defense = max(0.0, effective_defense - armor_penetration)
 	damage = _calculate_damage(damage, effective_defense)
+	if soldier_source_id >= 0:
+		enemy["last_soldier_source_id"] = soldier_source_id
+		var source_soldier: Variant = _find_soldier_by_id(soldier_source_id)
+		if source_soldier != null:
+			var salvage := _soldier_special(source_soldier, "salvage_protocol")
+			enemy["last_soldier_salvage_bonus"] = float(salvage.get("bonus_gold_ratio", 0.0)) if not salvage.is_empty() else 0.0
 	enemy["hp"] = max(0.0, float(enemy["hp"]) - damage)
 	enemy["flash"] = 0.11
 	enemy["last_hit"] = game_time
@@ -5297,13 +6598,18 @@ func _damage_enemy(index: int, raw_damage: float, source_pos: Vector2, damage_ki
 	_spawn_effect("hit", enemy["pos"], Color("FFF0DA"), clamp(damage / 34.0, 0.45, 1.2))
 	if float(enemy["hp"]) <= 0.0:
 		_kill_enemy(index)
+	return damage
 
 
 func _kill_enemy(index: int) -> void:
 	if index < 0 or index >= enemies.size(): return
 	var enemy: Dictionary = enemies[index]
 	var pos: Vector2 = enemy["pos"]
-	drops.append({"kind": "loot", "pos": pos, "gold": int(enemy["reward_gold"]), "xp": int(enemy["reward_xp"]), "ttl": 24.0})
+	var base_gold := int(enemy["reward_gold"])
+	var salvage_bonus := maxi(0, int(round(float(base_gold) * clampf(float(enemy.get("last_soldier_salvage_bonus", 0.0)), 0.0, 1.0))))
+	drops.append({"kind": "loot", "pos": pos, "gold": base_gold + salvage_bonus, "xp": int(enemy["reward_xp"]), "ttl": 24.0})
+	if salvage_bonus > 0:
+		_add_floater(pos + Vector2(0, -34), "+$%d" % salvage_bonus, GOLD, 0.9)
 	player["kills"] = int(player["kills"]) + 1
 	_spawn_effect("death", pos, ENEMY_RED, 0.8 if enemy["type"] != "chief" else 1.4)
 	if enemy["type"] == "chief":
@@ -5972,18 +7278,370 @@ func _toggle_notifications() -> void:
 	queue_redraw()
 
 
+func _add_upgrade_runtime_effect(effect: Dictionary) -> void:
+	if effect.is_empty() or typeof(effect.get("pos", null)) != TYPE_VECTOR2:
+		return
+	var stored := effect.duplicate(true)
+	var kind := str(stored.get("kind", "generic"))
+	stored["kind"] = kind
+	stored["created_at"] = float(stored.get("created_at", game_time))
+	stored["ttl"] = maxf(0.01, float(stored.get("ttl", 0.01)))
+	var source_id := int(stored.get("source_id", -1))
+	var definition: Dictionary = Dictionary(stored.get("effect", {}))
+	var owner_cap := maxi(0, int(stored.get("max_per_owner", definition.get("max_per_owner", 0))))
+	if owner_cap > 0:
+		while _upgrade_effect_count(kind, source_id) >= owner_cap:
+			if not _remove_oldest_upgrade_effect(kind, source_id):
+				break
+	var team_cap := MAX_UPGRADE_EFFECTS
+	if kind == "mine":
+		team_cap = mini(MAX_UPGRADE_MINES_PER_TEAM, maxi(1, int(stored.get("team_cap", definition.get("team_cap", MAX_UPGRADE_MINES_PER_TEAM)))))
+	elif kind == "lingering":
+		team_cap = mini(MAX_UPGRADE_LINGERING_PER_TEAM, maxi(1, int(stored.get("team_cap", definition.get("team_cap", MAX_UPGRADE_LINGERING_PER_TEAM)))))
+	elif kind in ["guardian", "auto_turret", "repair_drone"]:
+		team_cap = mini(MAX_UPGRADE_SUMMONS_PER_TEAM, maxi(1, int(stored.get("team_cap", definition.get("team_summon_cap", MAX_UPGRADE_SUMMONS_PER_TEAM)))))
+	if kind in ["guardian", "auto_turret", "repair_drone"]:
+		while _upgrade_summon_count() >= team_cap:
+			if not _remove_oldest_upgrade_summon():
+				break
+	else:
+		while _upgrade_effect_count(kind) >= team_cap:
+			if not _remove_oldest_upgrade_effect(kind):
+				break
+	while upgrade_effects.size() >= MAX_UPGRADE_EFFECTS:
+		upgrade_effects.pop_front()
+	upgrade_effects.append(stored)
+
+
+func _upgrade_effect_count(kind: String, source_id: int = -2147483648) -> int:
+	var count := 0
+	for active_effect in upgrade_effects:
+		if str(active_effect.get("kind", "")) != kind:
+			continue
+		if source_id != -2147483648 and int(active_effect.get("source_id", -1)) != source_id:
+			continue
+		count += 1
+	return count
+
+
+func _remove_oldest_upgrade_effect(kind: String, source_id: int = -2147483648) -> bool:
+	var oldest_index := -1
+	var oldest_time := INF
+	for effect_index in upgrade_effects.size():
+		var active_effect: Dictionary = upgrade_effects[effect_index]
+		if str(active_effect.get("kind", "")) != kind:
+			continue
+		if source_id != -2147483648 and int(active_effect.get("source_id", -1)) != source_id:
+			continue
+		var created := float(active_effect.get("created_at", 0.0))
+		if created < oldest_time:
+			oldest_time = created
+			oldest_index = effect_index
+	if oldest_index < 0:
+		return false
+	upgrade_effects.remove_at(oldest_index)
+	return true
+
+
+func _upgrade_summon_count() -> int:
+	var count := 0
+	for effect in upgrade_effects:
+		if str(effect.get("kind", "")) in ["guardian", "auto_turret", "repair_drone"]:
+			count += 1
+	return count
+
+
+func _remove_oldest_upgrade_summon() -> bool:
+	var oldest_index := -1
+	var oldest_time := INF
+	for effect_index in upgrade_effects.size():
+		var effect: Dictionary = upgrade_effects[effect_index]
+		if str(effect.get("kind", "")) not in ["guardian", "auto_turret", "repair_drone"]:
+			continue
+		var created := float(effect.get("created_at", 0.0))
+		if created < oldest_time:
+			oldest_time = created
+			oldest_index = effect_index
+	if oldest_index < 0:
+		return false
+	upgrade_effects.remove_at(oldest_index)
+	return true
+
+
+func _guardian_is_damageable(effect: Dictionary) -> bool:
+	return str(effect.get("kind", "")) == "guardian" and not bool(effect.get("defeated", false)) and float(effect.get("hp", 0.0)) > 0.0 and float(effect.get("ttl", 0.0)) > 0.0
+
+
+func _damage_guardian(effect: Dictionary, raw_damage: float, source_position: Vector2) -> float:
+	if not _guardian_is_damageable(effect) or raw_damage <= 0.0:
+		return 0.0
+	var dealt := minf(float(effect.get("hp", 0.0)), maxf(0.0, raw_damage))
+	effect["hp"] = maxf(0.0, float(effect.get("hp", 0.0)) - dealt)
+	_add_floater(Vector2(effect["pos"]) + Vector2(0.0, -22.0), "-%d" % int(dealt), Color("9BD7FF"), 0.65)
+	_spawn_effect("hit", effect["pos"], Color("9BD7FF"), 0.55)
+	if float(effect["hp"]) <= 0.0:
+		effect["defeated"] = true
+		effect["ttl"] = 0.0
+		_spawn_effect("death", effect["pos"], Color("9BD7FF"), 0.85)
+	return dealt
+
+
+func _damage_guardians_in_area(center: Vector2, radius: float, damage: float) -> int:
+	var damaged := 0
+	for effect in upgrade_effects:
+		if not _guardian_is_damageable(effect):
+			continue
+		if Vector2(effect["pos"]).distance_to(center) <= radius + float(effect.get("radius", 24.0)):
+			if _damage_guardian(effect, damage, center) > 0.0:
+				damaged += 1
+	return damaged
+
+
+func _damage_guardians_in_melee(origin: Vector2, facing: Vector2, radius: float, damage: float) -> int:
+	var damaged := 0
+	for effect in upgrade_effects:
+		if not _guardian_is_damageable(effect):
+			continue
+		var offset := Vector2(effect["pos"]) - origin
+		if offset.length() > radius + float(effect.get("radius", 24.0)):
+			continue
+		if offset.length_squared() > 0.001 and absf(facing.angle_to(offset.normalized())) >= 1.15:
+			continue
+		if _damage_guardian(effect, damage, origin) > 0.0:
+			damaged += 1
+	return damaged
+
+
+func _guardian_projectile_intersection(from: Vector2, to: Vector2, projectile_radius: float) -> Dictionary:
+	var best_time := 2.0
+	var best_index := -1
+	for effect_index in upgrade_effects.size():
+		var effect: Dictionary = upgrade_effects[effect_index]
+		if not _guardian_is_damageable(effect):
+			continue
+		var hit_time := _segment_circle_hit_time(from, to, Vector2(effect["pos"]), float(effect.get("radius", 24.0)) + projectile_radius)
+		if hit_time < best_time:
+			best_time = hit_time
+			best_index = effect_index
+	return {"hit": best_index >= 0 and best_time <= 1.0, "time": best_time, "effect_index": best_index, "position": from.lerp(to, clampf(best_time, 0.0, 1.0))}
+
+
 func _update_upgrade_effects(delta: float) -> void:
 	# Upgrade payloads use their own bounded visual/runtime list so they cannot
 	# evict player attacks or Boss telegraphs from the regular projectile pool.
 	for index in range(upgrade_effects.size() - 1, -1, -1):
+		if index >= upgrade_effects.size():
+			continue
 		var effect: Dictionary = upgrade_effects[index]
-		effect["ttl"] = maxf(0.0, float(effect.get("ttl", 0.0)) - delta)
+		var ttl_before := maxf(0.0, float(effect.get("ttl", 0.0)))
+		var warmup_before := maxf(0.0, float(effect.get("warmup", 0.0)))
+		var lifetime_delta := minf(maxf(0.0, delta), ttl_before)
+		effect["ttl"] = maxf(0.0, ttl_before - delta)
 		if effect.has("warmup"):
-			effect["warmup"] = maxf(0.0, float(effect.get("warmup", 0.0)) - delta)
-		if float(effect["ttl"]) <= 0.0:
+			effect["warmup"] = maxf(0.0, warmup_before - delta)
+		effect["active_delta"] = maxf(0.0, lifetime_delta - minf(warmup_before, lifetime_delta))
+		var consumed := _update_single_upgrade_effect(effect, delta)
+		if consumed or float(effect["ttl"]) <= 0.0:
 			upgrade_effects.remove_at(index)
 	while upgrade_effects.size() > MAX_UPGRADE_EFFECTS:
 		upgrade_effects.pop_front()
+
+
+func _update_single_upgrade_effect(effect: Dictionary, delta: float) -> bool:
+	var kind := str(effect.get("kind", "generic"))
+	if float(effect.get("warmup", 0.0)) > 0.0:
+		return false
+	match kind:
+		"temporal_echo":
+			if bool(effect.get("triggered", false)):
+				return true
+			effect["triggered"] = true
+			var echo_projectile: Dictionary = Dictionary(effect.get("projectile", {})).duplicate(true)
+			if not echo_projectile.is_empty():
+				echo_projectile["pos"] = Vector2(effect["pos"])
+				_spawn_projectile(echo_projectile)
+				_spawn_effect("spawn", effect["pos"], Color("B993FF"), 0.65)
+			return true
+		"meteor", "chain_blast", "bomblet", "ufo_echo":
+			if bool(effect.get("triggered", false)):
+				return true
+			effect["triggered"] = true
+			_upgrade_area_damage(effect, false)
+			return true
+		"mine":
+			effect["scan"] = float(effect.get("scan", 0.0)) - delta
+			if float(effect["scan"]) > 0.0:
+				return false
+			effect["scan"] = UPGRADE_EFFECT_SCAN_INTERVAL
+			if _nearest_ground_enemy_id(Vector2(effect["pos"]), float(effect.get("radius", 78.0))) >= 0:
+				_upgrade_area_damage(effect, true)
+				return true
+		"lingering":
+			effect["tick"] = float(effect.get("tick", 0.0)) - delta
+			if float(effect["tick"]) <= 0.0:
+				effect["tick"] = maxf(0.1, float(effect.get("tick_interval", 0.5)))
+				var target_id := int(effect.get("target_id", -1))
+				var effect_position := Vector2(effect["pos"])
+				var effect_radius := float(effect.get("radius", 24.0))
+				var hit_boss := target_id == BOSS_ENTITY_ID and _active_boss_can_be_targeted() and _active_boss_position().distance_to(effect_position) <= effect_radius + _active_boss_radius()
+				if hit_boss:
+					var tick_id := _allocate_attack_id("soldier_lingering")
+					_consume_active_boss_hit_result(_receive_active_boss_hit(tick_id, str(effect.get("source_kind", "soldier")), int(effect.get("source_id", -1)), float(effect.get("damage", 0.0)), effect_position, "upgrade_lingering", float(effect.get("armor_penetration", 0.0))))
+				else:
+					var target_index := _enemy_index_by_id(target_id)
+					if target_index < 0 or Vector2(enemies[target_index]["pos"]).distance_to(effect_position) > effect_radius + float(enemies[target_index]["radius"]):
+						target_id = _nearest_ground_enemy_id(effect_position, effect_radius + 36.0)
+						target_index = _enemy_index_by_id(target_id)
+					if target_index >= 0:
+						_damage_enemy(target_index, float(effect.get("damage", 0.0)), effect_position, "lingering", float(effect.get("armor_penetration", 0.0)), int(effect.get("source_id", -1)))
+		"burning_zone":
+			effect["tick"] = float(effect.get("tick", 0.0)) - delta
+			if float(effect["tick"]) <= 0.0:
+				effect["tick"] = maxf(0.1, float(effect.get("tick_interval", 0.5)))
+				_upgrade_area_damage(effect, true, false)
+		"boss_burn", "boss_poison":
+			if not _active_boss_can_be_targeted():
+				return true
+			effect["pos"] = _active_boss_position()
+			effect["tick"] = float(effect.get("tick", 0.0)) - delta
+			if float(effect["tick"]) <= 0.0:
+				effect["tick"] = maxf(0.1, float(effect.get("tick_interval", 0.5)))
+				effect["tick_sequence"] = int(effect.get("tick_sequence", 0)) + 1
+				var dot_damage := float(effect.get("damage_per_stack", 0.0)) * float(int(effect.get("stacks", 1)))
+				var dot_id := "%s:%d:%d" % [str(effect.get("kind", "boss_dot")), int(effect.get("source_id", -1)), int(effect["tick_sequence"])]
+				_consume_active_boss_hit_result(_receive_active_boss_hit(dot_id, "upgrade_dot", int(effect.get("source_id", -1)), dot_damage, effect["pos"], "status", 999.0))
+		"gravity":
+			var pull_step := _gravity_pull_step(effect, float(effect.get("active_delta", delta)))
+			if pull_step > 0.0:
+				var center := Vector2(effect["pos"])
+				var field_radius := maxf(1.0, float(effect.get("radius", 130.0)))
+				for enemy in enemies:
+					if _enemy_is_air(enemy) or Vector2(enemy["pos"]).distance_to(center) > field_radius + float(enemy["radius"]):
+						continue
+					var toward := (center - Vector2(enemy["pos"])).normalized()
+					enemy["pos"] = _move_with_collision(enemy["pos"], toward * pull_step, float(enemy["radius"]))
+					enemy["slow"] = maxf(float(enemy.get("slow", 0.0)), 0.24)
+					enemy["slow_factor"] = maxf(float(enemy.get("slow_factor", 0.0)), float(effect.get("slow_ratio", 0.15)))
+		"guardian":
+			_update_guardian_effect(effect, delta)
+		"auto_turret":
+			_update_auto_turret_effect(effect, delta)
+		"repair_drone":
+			_update_repair_drone_effect(effect, delta)
+	return false
+
+
+func _gravity_pull_step(effect: Dictionary, active_delta: float) -> float:
+	var duration := maxf(0.1, float(effect.get("pull_duration", effect.get("duration", 2.5))))
+	var elapsed_before := clampf(float(effect.get("pull_elapsed", 0.0)), 0.0, duration)
+	var elapsed_after := minf(duration, elapsed_before + maxf(0.0, active_delta))
+	effect["pull_elapsed"] = elapsed_after
+	return maxf(0.0, float(effect.get("pull_distance", 70.0))) * (elapsed_after - elapsed_before) / duration
+
+
+func _nearest_ground_enemy_id(position: Vector2, radius: float) -> int:
+	var result := -1
+	var best_distance := radius
+	for enemy in enemies:
+		if _enemy_is_air(enemy):
+			continue
+		var distance := Vector2(enemy["pos"]).distance_to(position)
+		if distance < best_distance:
+			best_distance = distance
+			result = int(enemy["id"])
+	return result
+
+
+func _upgrade_area_damage(effect: Dictionary, ground_only: bool = false, spawn_burst: bool = true) -> void:
+	var position := Vector2(effect.get("pos", Vector2.ZERO))
+	var radius := maxf(1.0, float(effect.get("radius", 32.0)))
+	var damage := maxf(0.0, float(effect.get("damage", 0.0)))
+	var source_id := int(effect.get("source_id", -1))
+	var hit_ids: Array[int] = []
+	for enemy in enemies:
+		if ground_only and _enemy_is_air(enemy):
+			continue
+		if Vector2(enemy["pos"]).distance_to(position) <= radius + float(enemy["radius"]):
+			hit_ids.append(int(enemy["id"]))
+	for hit_id in hit_ids:
+		var enemy_index := _enemy_index_by_id(hit_id)
+		if enemy_index >= 0:
+			_damage_enemy(enemy_index, damage, position, "area", 0.0, source_id)
+	if not ground_only and _active_boss_can_be_targeted():
+		var boss_hit := _active_boss_projectile_intersection(position, position, radius)
+		if bool(boss_hit.get("hit", false)):
+			var attack_id := _allocate_attack_id("soldier_upgrade_%s" % str(effect.get("kind", "area")))
+			_consume_active_boss_hit_result(_receive_active_boss_hit(attack_id, str(effect.get("source_kind", "soldier")), source_id, damage, Vector2(boss_hit["position"]), "upgrade_area", 0.0))
+	if spawn_burst:
+		_spawn_effect("explosion", position, Color(effect.get("color", FIRE_ORANGE)), clampf(radius / 100.0, 0.55, 1.6))
+
+
+func _update_guardian_effect(effect: Dictionary, delta: float) -> void:
+	var owner: Variant = _find_soldier_by_id(int(effect.get("source_id", -1)))
+	if owner != null:
+		var orbit := Vector2.from_angle(game_time * 1.4 + float(int(effect.get("source_id", 0)) % 9)) * 48.0
+		effect["pos"] = Vector2(effect["pos"]).lerp(Vector2(owner["pos"]) + orbit, minf(1.0, delta * 4.5))
+	effect["shot_cd"] = maxf(0.0, float(effect.get("shot_cd", 0.0)) - delta)
+	if float(effect["shot_cd"]) > 0.0:
+		return
+	var definition: Dictionary = Dictionary(effect.get("effect", {}))
+	var target_id := _enemy_near_point(Vector2(effect["pos"]), float(definition.get("attack_range", 280.0)))
+	if target_id < 0:
+		return
+	effect["shot_cd"] = maxf(0.25, float(definition.get("attack_interval", 1.1)))
+	var damage := float(effect.get("owner_attack", 1.0)) * float(definition.get("attack_ratio", 0.45))
+	if target_id == BOSS_ENTITY_ID:
+		_consume_active_boss_hit_result(_receive_active_boss_hit(_allocate_attack_id("guardian"), "guardian", int(effect.get("source_id", -1)), damage, _active_boss_position(), "projectile", 0.0))
+	else:
+		var enemy_index := _enemy_index_by_id(target_id)
+		if enemy_index >= 0:
+			_damage_enemy(enemy_index, damage, effect["pos"], "projectile", 0.0, int(effect.get("source_id", -1)))
+	_spawn_effect("slash", effect["pos"], Color("9BD7FF"), 0.45)
+
+
+func _update_auto_turret_effect(effect: Dictionary, delta: float) -> void:
+	effect["shot_cd"] = maxf(0.0, float(effect.get("shot_cd", 0.0)) - delta)
+	if float(effect["shot_cd"]) > 0.0:
+		return
+	var definition: Dictionary = Dictionary(effect.get("effect", {}))
+	var target_id := _enemy_near_point(Vector2(effect["pos"]), float(definition.get("attack_range", 520.0)))
+	if target_id < 0:
+		return
+	effect["shot_cd"] = 1.0 / maxf(0.1, float(definition.get("shots_per_second", 2.0)))
+	var damage := float(effect.get("owner_attack", 1.0)) * float(definition.get("shot_damage_ratio", 0.25))
+	if target_id == BOSS_ENTITY_ID:
+		_consume_active_boss_hit_result(_receive_active_boss_hit(_allocate_attack_id("auto_turret"), "auto_turret", int(effect.get("source_id", -1)), damage, _active_boss_position(), "projectile", 3.0))
+	else:
+		var enemy_index := _enemy_index_by_id(target_id)
+		if enemy_index >= 0:
+			_damage_enemy(enemy_index, damage, effect["pos"], "projectile", 3.0, int(effect.get("source_id", -1)))
+	_spawn_effect("muzzle", effect["pos"], Color("83E8FF"), 0.35)
+
+
+func _update_repair_drone_effect(effect: Dictionary, delta: float) -> void:
+	var owner: Variant = _find_soldier_by_id(int(effect.get("source_id", -1)))
+	if owner != null:
+		var hover := Vector2(38.0, -42.0).rotated(sin(game_time * 0.9 + float(int(effect.get("source_id", 0)))) * 0.35)
+		effect["pos"] = Vector2(effect["pos"]).lerp(Vector2(owner["pos"]) + hover, minf(1.0, delta * 5.0))
+	var best: Variant = null
+	var best_ratio := 1.0
+	var definition: Dictionary = Dictionary(effect.get("effect", {}))
+	for ally in soldiers:
+		if str(ally.get("domain", "ground")) != "air" and str(ally.get("type", "")) not in ["roller", "cannon", "tank", "rocket", "gatling"]:
+			continue
+		if Vector2(ally["pos"]).distance_to(Vector2(effect["pos"])) > float(definition.get("healing_range", 360.0)):
+			continue
+		var ratio := float(ally["hp"]) / maxf(1.0, float(ally["max_hp"]))
+		if ratio < best_ratio:
+			best_ratio = ratio
+			best = ally
+	if best == null:
+		return
+	best["hp"] = minf(float(best["max_hp"]), float(best["hp"]) + float(best["max_hp"]) * float(definition.get("max_hp_heal_per_second", 0.025)) * delta)
+	effect["scan"] = float(effect.get("scan", 0.0)) - delta
+	if float(effect["scan"]) <= 0.0:
+		effect["scan"] = 0.6
+		_spawn_effect("heal", best["pos"], HEAL_GREEN, 0.45)
 
 
 func _draw_upgrade_effects() -> void:
@@ -6137,7 +7795,7 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 		var loaded_id := str(loaded_castle.get("id", ""))
 		var generated_nation := NationCatalog.normalized_or_generated(loaded_castle.get("original_nation", loaded_castle.get("nation", {})), world_seed, loaded_id, loaded_castle.get("pos", Vector2.ZERO))
 		loaded_castle["original_nation"] = generated_nation
-		loaded_castle["nation"] = NationCatalog.conquest_metadata(NationCatalog.player_metadata()) if bool(loaded_castle.get("owned", false)) else NationCatalog.normalized_or_generated(loaded_castle.get("nation", generated_nation), world_seed, loaded_id, loaded_castle.get("pos", Vector2.ZERO))
+		loaded_castle["nation"] = NationCatalog.conquest_metadata(NationCatalog.player_metadata()) if bool(loaded_castle.get("owned", false)) else NationCatalog.normalized_owner_or_generated(loaded_castle.get("nation", generated_nation), world_seed, loaded_id, loaded_castle.get("pos", Vector2.ZERO))
 	camps = Dictionary(data.get("camps", {})).duplicate(true)
 	snake_nests = _migrate_loaded_python_boss_lairs(data.get("snake_nests", {}))
 	var loaded_lair_state: Dictionary = Dictionary(data.get("boss_lair_state", {}))
@@ -6198,6 +7856,8 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 	projectiles.clear()
 	hazards.clear()
 	upgrade_effects.clear()
+	soldier_boss_debuffs.clear()
+	soldier_upgrade_shared_cooldowns.clear()
 	chaos_runtime_projectiles.clear()
 	chaos_runtime_hazards.clear()
 	aionis_runtime_projectiles.clear()
@@ -6255,6 +7915,20 @@ func _normalize_loaded_soldier(loaded_soldier: Dictionary) -> void:
 	loaded_soldier["altitude"] = 38.0 if str(loaded_soldier["domain"]) == "air" else 0.0
 	if not loaded_soldier.has("upgrade_snapshot"):
 		loaded_soldier["upgrade_snapshot"] = SoldierUpgradeCatalog.snapshot_for_type(loaded_type, soldier_research)
+	var loaded_snapshot: Dictionary = Dictionary(loaded_soldier.get("upgrade_snapshot", {})).duplicate(true)
+	# Schema-7 snapshots stored purchased abilities only in `active_specials`.
+	# Materialize the newer lookup map from those saved effect records so old
+	# soldiers retain exactly the abilities they owned without inheriting current
+	# research or newly added catalog effects.
+	loaded_snapshot["special_effects"] = SoldierUpgradeRuntime.special_effect_map(loaded_snapshot)
+	loaded_soldier["upgrade_snapshot"] = loaded_snapshot
+	var loaded_base_effects: Dictionary = Dictionary(loaded_snapshot.get("base_effects", {}))
+	loaded_soldier["support_power"] = maxf(0.01, float(loaded_soldier.get("support_power", 1.0 + float(loaded_base_effects.get("attack_or_healing_bonus", 0.0)))))
+	loaded_soldier["support_rate"] = maxf(0.01, float(loaded_soldier.get("support_rate", 1.0 + float(loaded_base_effects.get("attack_or_support_speed_bonus", 0.0)))))
+	loaded_soldier["support_range"] = maxf(1.0, float(loaded_soldier.get("support_range", loaded_soldier.get("range", 1.0))))
+	loaded_soldier["special_runtime"] = SoldierUpgradeRuntime.normalize_state(loaded_soldier.get("special_runtime", {}), loaded_snapshot, float(loaded_soldier.get("max_hp", 1.0)))
+	loaded_soldier["upgrade_cooldowns"] = Dictionary(loaded_soldier.get("upgrade_cooldowns", {})).duplicate(true)
+	loaded_soldier["upgrade_counters"] = Dictionary(loaded_soldier.get("upgrade_counters", {})).duplicate(true)
 	# Older releases also used the `cannon` id. Keep those saves compatible while
 	# guaranteeing that a unit now sold as the Heavy Cannon receives its current
 	# player-only damage floor instead of retaining the former ordinary-cannon stat.
@@ -6280,6 +7954,8 @@ func _is_valid_save_data(data: Dictionary) -> bool:
 	if schema >= 6 and not data.has("aionis_boss"):
 		return false
 	if schema >= 7 and (not data.has("soldier_research") or typeof(data["soldier_research"]) != TYPE_DICTIONARY):
+		return false
+	if schema >= 8 and not SoldierUpgradeCatalog.research_is_valid(data.get("soldier_research", {})):
 		return false
 	if schema >= 5:
 		if typeof(data["progression"]) != TYPE_DICTIONARY or typeof(data["chaos_boss"]) != TYPE_DICTIONARY:
@@ -6356,7 +8032,7 @@ func _is_valid_save_data(data: Dictionary) -> bool:
 	for entry in data.get("enemies", []):
 		if not _is_valid_saved_enemy(entry): return false
 	for entry in data.get("soldiers", []):
-		if not _is_valid_saved_soldier(entry): return false
+		if not _is_valid_saved_soldier(entry, schema): return false
 	for entry in data.get("tombstones", []):
 		if typeof(entry) != TYPE_DICTIONARY or typeof(entry.get("pos")) != TYPE_VECTOR2 or not GameConfig.SOLDIERS.has(str(entry.get("type", ""))): return false
 	for entry in data.get("drops", []):
@@ -6551,15 +8227,102 @@ func _is_valid_saved_enemy(value: Variant) -> bool:
 	return true
 
 
-func _is_valid_saved_soldier(value: Variant) -> bool:
+func _is_valid_saved_soldier(value: Variant, schema: int = 1) -> bool:
 	if typeof(value) != TYPE_DICTIONARY:
 		return false
 	var soldier: Dictionary = value
-	return (
-		GameConfig.SOLDIERS.has(str(soldier.get("type", "")))
+	var type_id := str(soldier.get("type", ""))
+	var base_valid := (
+		GameConfig.SOLDIERS.has(type_id)
 		and typeof(soldier.get("pos")) == TYPE_VECTOR2
 		and _dictionary_has_numbers(soldier, ["id", "hp", "max_hp", "attack", "defense", "speed", "radius"])
 	)
+	if not base_valid:
+		return false
+	if schema >= 8 and not soldier.has("upgrade_snapshot"):
+		return false
+	if soldier.has("upgrade_snapshot") and not _is_valid_saved_soldier_snapshot(soldier["upgrade_snapshot"], type_id, schema >= 8):
+		return false
+	for runtime_key in ["special_runtime", "upgrade_cooldowns", "upgrade_counters"]:
+		if schema >= 8 and not soldier.has(runtime_key):
+			return false
+		if soldier.has(runtime_key):
+			if typeof(soldier[runtime_key]) != TYPE_DICTIONARY or not _dictionary_has_finite_scalar_values(Dictionary(soldier[runtime_key])):
+				return false
+	return true
+
+
+func _is_valid_saved_soldier_snapshot(value: Variant, type_id: String, strict_map: bool) -> bool:
+	if typeof(value) != TYPE_DICTIONARY:
+		return false
+	var snapshot: Dictionary = value
+	if typeof(snapshot.get("type")) != TYPE_STRING or str(snapshot.get("type", "")) != type_id:
+		return false
+	if typeof(snapshot.get("base_effects")) != TYPE_DICTIONARY or not _is_valid_snapshot_base_effects(Dictionary(snapshot["base_effects"])):
+		return false
+	if typeof(snapshot.get("active_specials")) != TYPE_ARRAY:
+		return false
+	if strict_map and typeof(snapshot.get("special_effects")) != TYPE_DICTIONARY:
+		return false
+	if snapshot.has("special_effects") and typeof(snapshot["special_effects"]) != TYPE_DICTIONARY:
+		return false
+
+	var active_ids: Dictionary = {}
+	for entry_value in Array(snapshot["active_specials"]):
+		if typeof(entry_value) != TYPE_DICTIONARY:
+			return false
+		var entry: Dictionary = entry_value
+		var ability_id := str(entry.get("id", ""))
+		if active_ids.has(ability_id) or not SoldierUpgradeCatalog.is_compatible(type_id, ability_id):
+			return false
+		var rank_value: Variant = entry.get("rank")
+		if not _is_integral_save_number(rank_value):
+			return false
+		var rank := int(rank_value)
+		if rank < 1 or rank > SoldierUpgradeCatalog.max_rank(ability_id) or typeof(entry.get("effect")) != TYPE_DICTIONARY:
+			return false
+		active_ids[ability_id] = true
+
+	var mapped_ids: Dictionary = {}
+	for ability_key in Dictionary(snapshot.get("special_effects", {})).keys():
+		var ability_id := str(ability_key)
+		if mapped_ids.has(ability_id) or not SoldierUpgradeCatalog.is_compatible(type_id, ability_id):
+			return false
+		if typeof(Dictionary(snapshot["special_effects"])[ability_key]) != TYPE_DICTIONARY:
+			return false
+		mapped_ids[ability_id] = true
+	if strict_map and mapped_ids != active_ids:
+		return false
+	return true
+
+
+func _is_valid_snapshot_base_effects(effects: Dictionary) -> bool:
+	for effect_key in effects.keys():
+		var effect_value: Variant = effects[effect_key]
+		if str(effect_key) == "critical_mode":
+			if typeof(effect_value) != TYPE_STRING or str(effect_value) not in ["damage", "healing"]:
+				return false
+			continue
+		if typeof(effect_value) not in [TYPE_INT, TYPE_FLOAT] or not is_finite(float(effect_value)):
+			return false
+	return true
+
+
+func _dictionary_has_finite_scalar_values(value: Dictionary, numbers_only: bool = false) -> bool:
+	for entry_value in value.values():
+		if typeof(entry_value) in [TYPE_INT, TYPE_FLOAT]:
+			if not is_finite(float(entry_value)):
+				return false
+		elif numbers_only or typeof(entry_value) != TYPE_BOOL:
+			return false
+	return true
+
+
+func _is_integral_save_number(value: Variant) -> bool:
+	if typeof(value) not in [TYPE_INT, TYPE_FLOAT]:
+		return false
+	var number := float(value)
+	return is_finite(number) and is_equal_approx(number, roundf(number))
 
 
 func _handle_ui_click(position: Vector2) -> bool:
@@ -6641,6 +8404,12 @@ func _handle_ui_click(position: Vector2) -> bool:
 		_open_cheat_input()
 		audio.play("ui", 0.45)
 		return true
+	if not _is_touch_scheme() and _soldier_upgrade_toggle_rect().has_point(position):
+		active_panel = "" if active_panel == "soldier_upgrades" else "soldier_upgrades"
+		soldier_upgrade_page = 0
+		audio.play("ui", 0.45)
+		queue_redraw()
+		return true
 	if active_panel == "command":
 		var command_panel := _command_panel_rect()
 		if not command_panel.has_point(position):
@@ -6668,7 +8437,7 @@ func _handle_ui_click(position: Vector2) -> bool:
 		var roster := _recruitable_soldier_order()
 		for i in roster.size():
 			var buy_rect := _recruit_buy_rect(i, panel)
-			var buy_hit := buy_rect.grow(5.0) if _is_touch_scheme() else buy_rect
+			var buy_hit := buy_rect
 			if buy_hit.has_point(position):
 				var recruit_type := str(roster[i])
 				var purchase_msec := Time.get_ticks_msec()
@@ -6686,10 +8455,42 @@ func _handle_ui_click(position: Vector2) -> bool:
 		var upgrade_panel := _soldier_upgrade_panel_rect()
 		if not upgrade_panel.has_point(position):
 			return false
-		for upgrade_index in SoldierUpgradeCatalog.BASE_UPGRADE_ORDER.size():
-			var upgrade_rect := Rect2(upgrade_panel.position.x + 28.0, upgrade_panel.position.y + 76.0 + float(upgrade_index) * 45.0, upgrade_panel.size.x - 56.0, 36.0)
-			if upgrade_rect.has_point(position):
-				_purchase_soldier_upgrade("archer", str(SoldierUpgradeCatalog.BASE_UPGRADE_ORDER[upgrade_index]))
+		var controls := _soldier_upgrade_control_rects(upgrade_panel)
+		if Rect2(controls["type_prev"]).has_point(position):
+			_cycle_soldier_upgrade_type(-1)
+			return true
+		if Rect2(controls["type_next"]).has_point(position):
+			_cycle_soldier_upgrade_type(1)
+			return true
+		if Rect2(controls["base_tab"]).has_point(position):
+			soldier_upgrade_category = "base"
+			soldier_upgrade_page = 0
+			audio.play("ui", 0.4)
+			return true
+		if Rect2(controls["special_tab"]).has_point(position):
+			soldier_upgrade_category = "special"
+			soldier_upgrade_page = 0
+			audio.play("ui", 0.4)
+			return true
+		if Rect2(controls["page_prev"]).has_point(position):
+			soldier_upgrade_page = maxi(0, soldier_upgrade_page - 1)
+			audio.play("ui", 0.35)
+			return true
+		if Rect2(controls["page_next"]).has_point(position):
+			var page_count := _soldier_upgrade_page_count(upgrade_panel)
+			soldier_upgrade_page = mini(maxi(0, page_count - 1), soldier_upgrade_page + 1)
+			audio.play("ui", 0.35)
+			return true
+		var selected_type := _selected_soldier_upgrade_type()
+		var option_ids := _soldier_upgrade_option_ids(selected_type)
+		var rows_per_page := _soldier_upgrade_rows_per_page(upgrade_panel)
+		var first_index := soldier_upgrade_page * rows_per_page
+		for row_index in rows_per_page:
+			var option_index := first_index + row_index
+			if option_index >= option_ids.size():
+				break
+			if _soldier_upgrade_row_rect(row_index, upgrade_panel).has_point(position):
+				_purchase_soldier_upgrade(selected_type, str(option_ids[option_index]))
 				return true
 		return true
 	if active_panel == "map":
@@ -6702,7 +8503,81 @@ func _skills_panel_rect() -> Rect2:
 
 
 func _soldier_upgrade_panel_rect() -> Rect2:
-	return Rect2(maxf(20.0, screen_size.x * 0.5 - 340.0), maxf(24.0, screen_size.y * 0.5 - 250.0), minf(680.0, screen_size.x - 40.0), minf(500.0, screen_size.y - 48.0))
+	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
+	var margin := (12.0 if _is_touch_scheme() else 24.0) * scale
+	var width := minf(920.0 * scale, screen_size.x - margin * 2.0)
+	var height := minf(620.0 * scale, screen_size.y - margin * 2.0)
+	return Rect2((screen_size.x - width) * 0.5, (screen_size.y - height) * 0.5, width, height)
+
+
+func _selected_soldier_upgrade_type() -> String:
+	if SoldierUpgradeCatalog.SOLDIER_ORDER.is_empty():
+		return ""
+	soldier_upgrade_type_index = posmod(soldier_upgrade_type_index, SoldierUpgradeCatalog.SOLDIER_ORDER.size())
+	return str(SoldierUpgradeCatalog.SOLDIER_ORDER[soldier_upgrade_type_index])
+
+
+func _soldier_type_is_unlocked(type_id: String) -> bool:
+	return GameConfig.SOLDIERS.has(type_id) and (not _is_chaos_unlock_soldier(type_id) or all_soldiers_unlocked)
+
+
+func _cycle_soldier_upgrade_type(direction: int) -> void:
+	soldier_upgrade_type_index = posmod(soldier_upgrade_type_index + direction, SoldierUpgradeCatalog.SOLDIER_ORDER.size())
+	soldier_upgrade_page = 0
+	audio.play("ui", 0.4)
+	queue_redraw()
+
+
+func _soldier_upgrade_control_rects(panel: Rect2) -> Dictionary:
+	if _is_touch_scheme():
+		var scale := touch_ui_coordinate_scale
+		var touch_tab_gap := 8.0 * scale
+		var touch_tab_width := (panel.size.x - 36.0 * scale - touch_tab_gap) * 0.5
+		return {
+			"type_prev": Rect2(panel.position.x + 18.0 * scale, panel.position.y + 43.0 * scale, 62.0 * scale, 46.0 * scale),
+			"type_next": Rect2(panel.end.x - 150.0 * scale, panel.position.y + 43.0 * scale, 62.0 * scale, 46.0 * scale),
+			"base_tab": Rect2(panel.position.x + 18.0 * scale, panel.position.y + 94.0 * scale, touch_tab_width, 44.0 * scale),
+			"special_tab": Rect2(panel.position.x + 18.0 * scale + touch_tab_width + touch_tab_gap, panel.position.y + 94.0 * scale, touch_tab_width, 44.0 * scale),
+			"page_prev": Rect2(panel.position.x + 18.0 * scale, panel.end.y - 52.0 * scale, 108.0 * scale, 44.0 * scale),
+			"page_next": Rect2(panel.end.x - 126.0 * scale, panel.end.y - 52.0 * scale, 108.0 * scale, 44.0 * scale),
+		}
+	var side_width := 54.0
+	var type_y := panel.position.y + 46.0
+	var tab_y := panel.position.y + 92.0
+	var tab_gap := 8.0
+	var tab_width := (panel.size.x - 36.0 - tab_gap) * 0.5
+	return {
+		"type_prev": Rect2(panel.position.x + 18.0, type_y, side_width, 40.0),
+		"type_next": Rect2(panel.end.x - 72.0, type_y, side_width, 40.0),
+		"base_tab": Rect2(panel.position.x + 18.0, tab_y, tab_width, 34.0),
+		"special_tab": Rect2(panel.position.x + 18.0 + tab_width + tab_gap, tab_y, tab_width, 34.0),
+		"page_prev": Rect2(panel.position.x + 18.0, panel.end.y - 40.0, 94.0, 32.0),
+		"page_next": Rect2(panel.end.x - 112.0, panel.end.y - 40.0, 94.0, 32.0),
+	}
+
+
+func _soldier_upgrade_rows_per_page(panel: Rect2) -> int:
+	if _is_touch_scheme():
+		var scale := touch_ui_coordinate_scale
+		return maxi(2, floori((panel.size.y / scale - 210.0) / 60.0))
+	return maxi(2, floori((panel.size.y - 176.0) / 58.0))
+
+
+func _soldier_upgrade_row_rect(row_index: int, panel: Rect2) -> Rect2:
+	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
+	var start_y := (144.0 if _is_touch_scheme() else 134.0) * scale
+	return Rect2(panel.position.x + 18.0 * scale, panel.position.y + start_y + float(row_index) * 60.0 * scale, panel.size.x - 36.0 * scale, 54.0 * scale)
+
+
+func _soldier_upgrade_option_ids(type_id: String) -> Array[String]:
+	if soldier_upgrade_category == "special":
+		return SoldierUpgradeCatalog.compatible_special_ids(type_id)
+	return SoldierUpgradeCatalog.compatible_base_ids(type_id)
+
+
+func _soldier_upgrade_page_count(panel: Rect2) -> int:
+	var options := _soldier_upgrade_option_ids(_selected_soldier_upgrade_type())
+	return maxi(1, ceili(float(options.size()) / float(_soldier_upgrade_rows_per_page(panel))))
 
 
 func _command_panel_rect() -> Rect2:
@@ -6724,8 +8599,11 @@ func _command_button_rect(index: int, panel: Rect2) -> Rect2:
 
 func _recruit_panel_rect() -> Rect2:
 	if _is_touch_scheme():
-		var touch_height := minf(500.0, maxf(240.0, screen_size.y - 24.0))
-		return Rect2(max(12.0, screen_size.x * 0.5 - 390.0), maxf(12.0, (screen_size.y - touch_height) * 0.5), min(780.0, screen_size.x - 24.0), touch_height)
+		var scale := touch_ui_coordinate_scale
+		var css_size := screen_size / scale
+		var touch_width := minf(780.0, maxf(320.0, css_size.x - 24.0)) * scale
+		var touch_height := minf(500.0, maxf(240.0, css_size.y - 24.0)) * scale
+		return Rect2((screen_size.x - touch_width) * 0.5, (screen_size.y - touch_height) * 0.5, touch_width, touch_height)
 	return Rect2(max(20.0, screen_size.x * 0.5 - 390.0), max(24.0, screen_size.y * 0.5 - 250.0), min(780.0, screen_size.x - 40.0), min(500.0, screen_size.y - 48.0))
 
 
@@ -6735,23 +8613,26 @@ func _recruit_item_rect(index: int, panel: Rect2) -> Rect2:
 	var rows_per_column := ceili(float(roster_size) / float(columns))
 	var column := floori(float(index) / float(rows_per_column))
 	var row := index % rows_per_column
-	var side_margin := 18.0
-	var column_gap := 12.0
+	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
+	var side_margin := 18.0 * scale
+	var column_gap := 12.0 * scale
 	var column_width := (panel.size.x - side_margin * 2.0 - column_gap * float(columns - 1)) / float(columns)
-	var list_top := 62.0 if _is_touch_scheme() else 78.0
-	var row_pitch := minf(65.0, (panel.size.y - list_top - 12.0) / float(rows_per_column))
+	var list_top := (62.0 if _is_touch_scheme() else 78.0) * scale
+	var row_pitch := minf(65.0 * scale, (panel.size.y - list_top - 12.0 * scale) / float(rows_per_column))
 	return Rect2(
 		panel.position.x + side_margin + float(column) * (column_width + column_gap),
 		panel.position.y + list_top + float(row) * row_pitch,
 		column_width,
-		maxf(34.0, row_pitch - 4.0)
+		maxf((44.0 if _is_touch_scheme() else 34.0) * scale, row_pitch - (2.0 if _is_touch_scheme() else 4.0) * scale)
 	)
 
 
 func _recruit_buy_rect(index: int, panel: Rect2) -> Rect2:
 	var item := _recruit_item_rect(index, panel)
-	var button_height := minf(36.0, item.size.y - 8.0)
-	return Rect2(item.end.x - 76.0, item.position.y + (item.size.y - button_height) * 0.5, 67.0, button_height)
+	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
+	var button_height := minf((44.0 if _is_touch_scheme() else 36.0) * scale, item.size.y)
+	var button_width := (72.0 if _is_touch_scheme() else 67.0) * scale
+	return Rect2(item.end.x - (8.0 * scale + button_width), item.position.y + (item.size.y - button_height) * 0.5, button_width, button_height)
 
 
 func _map_panel_rect() -> Rect2:
@@ -6759,9 +8640,11 @@ func _map_panel_rect() -> Rect2:
 
 
 func _pause_language_rect() -> Rect2:
-	var center := screen_size * 0.5
 	if _is_touch_scheme():
-		return Rect2(center.x - 110.0, center.y + 70.0, 220.0, 60.0)
+		var panel := _pause_panel_rect()
+		var scale := touch_ui_coordinate_scale
+		return Rect2(panel.get_center().x - 110.0 * scale, panel.position.y + 206.0 * scale, 220.0 * scale, 44.0 * scale)
+	var center := screen_size * 0.5
 	return Rect2(center.x - 78.0, center.y + 139.0, 156.0, 42.0)
 
 
@@ -6786,30 +8669,45 @@ func _pause_actions() -> Array[String]:
 func _pause_panel_rect() -> Rect2:
 	var center := screen_size * 0.5
 	if _is_touch_scheme():
-		return Rect2(center - Vector2(190.0, 330.0), Vector2(380.0, 660.0))
+		var scale := touch_ui_coordinate_scale
+		var css_size := screen_size / scale
+		var panel_size := Vector2(
+			minf(380.0, maxf(320.0, css_size.x - 24.0)),
+			minf(366.0, maxf(320.0, css_size.y - 24.0))
+		) * scale
+		return Rect2(center - panel_size * 0.5, panel_size)
 	return Rect2(center - Vector2(180.0, 260.0), Vector2(360.0, 520.0))
 
 
 func _pause_button_rect(index: int) -> Rect2:
-	var center := screen_size * 0.5
 	var action_count := _pause_actions().size()
 	if _is_touch_scheme():
-		var touch_start := -248.0 if action_count >= 5 else -225.0
-		var touch_pitch := 72.0 if action_count <= 4 else minf(61.0, 300.0 / float(maxi(1, action_count)))
-		var touch_height := 64.0 if action_count <= 4 else maxf(44.0, touch_pitch - 5.0)
-		return Rect2(center.x - 145.0, center.y + touch_start + float(index) * touch_pitch, 290.0, touch_height)
+		var panel := _pause_panel_rect()
+		var scale := touch_ui_coordinate_scale
+		var columns := 2
+		var column := index % columns
+		var row := index / columns
+		var side := 12.0 * scale
+		var gap := 6.0 * scale
+		var button_width := (panel.size.x - side * 2.0 - gap) * 0.5
+		return Rect2(panel.position.x + side + float(column) * (button_width + gap), panel.position.y + (44.0 + float(row) * 54.0) * scale, button_width, 48.0 * scale)
+	var center := screen_size * 0.5
 	var desktop_start := -136.0 if action_count >= 6 else (-108.0 if action_count >= 5 else -68.0)
 	var desktop_pitch := 43.0 if action_count >= 6 else (47.0 if action_count >= 5 else 51.0)
 	return Rect2(center.x - 130.0, center.y + desktop_start + float(index) * desktop_pitch, 260.0, 42.0)
 
 
 func _pause_volume_rect(action: String) -> Rect2:
-	var center := screen_size * 0.5
 	if _is_touch_scheme():
+		var panel := _pause_panel_rect()
+		var center := panel.get_center()
+		var scale := touch_ui_coordinate_scale
+		var top := panel.position.y + 276.0 * scale
 		match action:
-			"down": return Rect2(center.x - 150.0, center.y + 174.0, 70.0, 58.0)
-			"mute": return Rect2(center.x - 72.0, center.y + 174.0, 144.0, 58.0)
-			"up": return Rect2(center.x + 80.0, center.y + 174.0, 70.0, 58.0)
+			"down": return Rect2(center.x - 146.0 * scale, top, 50.0 * scale, 44.0 * scale)
+			"mute": return Rect2(center.x - 90.0 * scale, top, 180.0 * scale, 44.0 * scale)
+			"up": return Rect2(center.x + 96.0 * scale, top, 50.0 * scale, 44.0 * scale)
+	var center := screen_size * 0.5
 	match action:
 		"down": return Rect2(center.x - 130.0, center.y + 214.0, 52.0, 36.0)
 		"mute": return Rect2(center.x - 68.0, center.y + 214.0, 136.0, 36.0)
@@ -8722,6 +10620,7 @@ func _draw_hud() -> void:
 		var notice_color := Color("557A66") if notifications_hidden else Color("466B76")
 		_draw_button(notice_toggle, "顯示通知（N）" if notifications_hidden else "隱藏通知（N）", notice_color)
 		_draw_button(_cheat_toggle_rect(), "輸入作弊碼（T）", Color("654C75"))
+		_draw_button(_soldier_upgrade_toggle_rect(), "Troop Upgrades (K)" if language == "en" else "強化士兵（K）", Color("356E83"))
 	if _aionis_boss_hud_should_show():
 		_draw_aionis_boss_hud()
 	elif _chaos_boss_hud_should_show():
@@ -8758,17 +10657,30 @@ func _draw_hud() -> void:
 		var notice: Dictionary = notifications[notifications.size() - 1 - i]
 		var alpha: float = clamp(float(notice["ttl"]) / min(0.4, float(notice["max_ttl"])), 0.0, 1.0)
 		var boss_hud_visible := _python_boss_hud_should_show() or _chaos_boss_hud_should_show() or _aionis_boss_hud_should_show()
-		# On high-DPI phones the six utility buttons occupy the band from roughly
-		# y=186 to y=276 in game coordinates. Keep combat notices below that band
-		# so neither the Boss HUD nor a warning can hide a touch target.
-		var notice_y := 296.0 if (_is_touch_scheme() and boss_hud_visible) else (112.0 if boss_hud_visible else 22.0)
-		# Desktop milestone messages need enough room for the bilingual technology names.
-		# Touch screens keep clear margins for the compact HUD and minimap.
-		var available_notice_width := screen_size.x - (720.0 if _is_touch_scheme() else 80.0)
-		var notice_width := minf(760.0, maxf(320.0, available_notice_width))
-		var rect := Rect2(screen_size.x * 0.5 - notice_width * 0.5, notice_y + i * 42, notice_width, 34)
+		var notice_y := 112.0 if boss_hud_visible else 22.0
+		var notice_width := minf(760.0, maxf(320.0, screen_size.x - 80.0))
+		var notice_x := screen_size.x * 0.5 - notice_width * 0.5
+		var notice_height := 34.0
+		var notice_pitch := 42.0
+		var notice_font := 15
+		if _is_touch_scheme():
+			# Keep warnings below the two utility rows and horizontally between the
+			# move pad and the special button. Notifications must never hide a control.
+			var scale := touch_ui_coordinate_scale
+			var utility_bottom := 0.0
+			for utility_value in _touch_utility_rects().values():
+				utility_bottom = maxf(utility_bottom, Rect2(utility_value).end.y)
+			var safe_left := _touch_move_center().x + (TOUCH_STICK_RADIUS + 12.0) * scale
+			var safe_right := _touch_special_rect().position.x - 12.0 * scale
+			notice_x = safe_left
+			notice_width = maxf(180.0 * scale, safe_right - safe_left)
+			notice_y = utility_bottom + 10.0 * scale
+			notice_height = 34.0 * scale
+			notice_pitch = 42.0 * scale
+			notice_font = roundi(14.0 * scale)
+		var rect := Rect2(notice_x, notice_y + i * notice_pitch, notice_width, notice_height)
 		draw_rect(rect, Color(0.015, 0.03, 0.045, 0.76 * alpha))
-		_draw_text(str(notice["text"]), rect.position + Vector2(notice_width * 0.5, 23), 15, Color(Color(notice["color"]), alpha), HORIZONTAL_ALIGNMENT_CENTER, notice_width - 20.0)
+		_draw_text(str(notice["text"]), rect.position + Vector2(notice_width * 0.5, notice_height * 0.68), notice_font, Color(Color(notice["color"]), alpha), HORIZONTAL_ALIGNMENT_CENTER, notice_width - 20.0 * (touch_ui_coordinate_scale if _is_touch_scheme() else 1.0))
 
 	if tutorial_visible and mode == GameMode.PLAYING and active_panel == "":
 		var tutorial := _tutorial_panel_rect()
@@ -8784,7 +10696,7 @@ func _draw_hud() -> void:
 			_draw_text("技能鈕施放絕招；上方按鈕開啟功能", tutorial.position + Vector2(14, 72), 13, Color("C8DBE5"))
 			_draw_text("靠近據點後點擊招募；能力可分配技能點", tutorial.position + Vector2(14, 94), 13, Color("C8DBE5"))
 			_draw_text("軍令鈕可選跟隨、防守、攻擊、撤退、駐守與攻城", tutorial.position + Vector2(14, 116), 12, Color("C8DBE5"))
-			_draw_text("裝置接上鍵盤或滑鼠後會自動切換", tutorial.position + Vector2(14, 138), 13, Color("C8DBE5"))
+			_draw_text("兵強→特殊：購買後重新招募，戰鬥時自動觸發", tutorial.position + Vector2(14, 138), 12, Color("A9D9E7"))
 		else:
 			_draw_text("新手指南（H 隱藏）", tutorial.position + Vector2(14, 25), 15, GOLD)
 			_draw_text("WASD 移動　滑鼠瞄準", tutorial.position + Vector2(14, 50), 13, Color("C8DBE5"))
@@ -8992,29 +10904,43 @@ func _draw_language_toggle() -> void:
 
 
 func _draw_touch_round_button(rect: Rect2, label: String, color: Color, pressed: bool = false, enabled: bool = true) -> void:
+	var scale := touch_ui_coordinate_scale
 	var center := rect.get_center()
 	var radius := minf(rect.size.x, rect.size.y) * 0.5
 	var base_color := color if enabled else Color("596168")
-	draw_circle(center + Vector2(0.0, 3.0), radius, Color(0.015, 0.025, 0.035, 0.72))
-	draw_circle(center, radius - 2.0, Color(base_color.darkened(0.60), 0.82 if enabled else 0.62))
+	draw_circle(center + Vector2(0.0, 3.0 * scale), radius, Color(0.015, 0.025, 0.035, 0.72))
+	draw_circle(center, radius - 2.0 * scale, Color(base_color.darkened(0.60), 0.82 if enabled else 0.62))
 	if pressed:
-		draw_circle(center, radius - 7.0, Color(base_color, 0.34))
-	draw_arc(center, radius - 2.0, 0.0, TAU, 32, Color(base_color.lightened(0.22), 0.95), 2.8, true)
-	_draw_text(label, center + Vector2(0.0, 6.0), 14, Color("F5FAFF") if enabled else Color("A2ABB0"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0)
+		draw_circle(center, radius - 7.0 * scale, Color(base_color, 0.34))
+	draw_arc(center, radius - 2.0 * scale, 0.0, TAU, 32, Color(base_color.lightened(0.22), 0.95), 2.8 * scale, true)
+	_draw_text(label, center + Vector2(0.0, 6.0 * scale), maxi(12, roundi(14.0 * scale)), Color("F5FAFF") if enabled else Color("A2ABB0"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0 * scale)
 
 
 func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color: Color, active: bool) -> void:
+	var scale := touch_ui_coordinate_scale
+	var radius := TOUCH_STICK_RADIUS * scale
 	var alpha := 0.72 if active else 0.48
-	draw_circle(center + Vector2(0.0, 5.0), TOUCH_STICK_RADIUS + 6.0, Color(0.01, 0.02, 0.025, 0.50))
-	draw_circle(center, TOUCH_STICK_RADIUS, Color(0.025, 0.055, 0.07, alpha))
-	draw_arc(center, TOUCH_STICK_RADIUS, 0.0, TAU, 42, Color(color, 0.74 if active else 0.45), 3.0, true)
-	for direction in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
-		draw_line(center + direction * 46.0, center + direction * 60.0, Color(color, 0.42), 2.0)
-	var knob_position := center + vector.limit_length(1.0) * (TOUCH_STICK_RADIUS * 0.62)
-	draw_circle(knob_position + Vector2(0.0, 3.0), 29.0, Color(0.01, 0.02, 0.03, 0.62))
-	draw_circle(knob_position, 27.0, Color(color.darkened(0.42), 0.96))
-	draw_arc(knob_position, 27.0, 0.0, TAU, 28, Color(color.lightened(0.25), 0.95), 2.5, true)
-	_draw_text(label, center + Vector2(0.0, -TOUCH_STICK_RADIUS - 12.0), 13, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 130.0)
+	draw_circle(center + Vector2(0.0, 5.0 * scale), radius + 6.0 * scale, Color(0.01, 0.02, 0.025, 0.50))
+	draw_circle(center, radius, Color(0.025, 0.055, 0.07, alpha))
+	draw_arc(center, radius, 0.0, TAU, 42, Color(color, 0.74 if active else 0.45), 3.0 * scale, true)
+	for direction_value in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
+		var direction := Vector2(direction_value)
+		var marker_center: Vector2 = center + direction * 52.0 * scale
+		var perpendicular := Vector2(-direction.y, direction.x)
+		var selected := active and vector.length_squared() > 0.04 and vector.normalized().dot(direction) > 0.55
+		draw_circle(marker_center, 12.0 * scale, Color(color.darkened(0.62), 0.84 if selected else 0.58))
+		draw_arc(marker_center, 12.0 * scale, 0.0, TAU, 20, Color(color, 0.95 if selected else 0.62), 1.8 * scale, true)
+		var arrow := PackedVector2Array([
+			marker_center + direction * 8.0 * scale,
+			marker_center - direction * 5.0 * scale + perpendicular * 6.0 * scale,
+			marker_center - direction * 5.0 * scale - perpendicular * 6.0 * scale,
+		])
+		draw_colored_polygon(arrow, Color("F5FAFF") if selected else Color(color.lightened(0.30), 0.92))
+	var knob_position := center + vector.limit_length(1.0) * (radius * 0.62)
+	draw_circle(knob_position + Vector2(0.0, 3.0 * scale), 29.0 * scale, Color(0.01, 0.02, 0.03, 0.62))
+	draw_circle(knob_position, 27.0 * scale, Color(color.darkened(0.42), 0.96))
+	draw_arc(knob_position, 27.0 * scale, 0.0, TAU, 28, Color(color.lightened(0.25), 0.95), 2.5 * scale, true)
+	_draw_text(label, center + Vector2(0.0, -radius - 12.0 * scale), maxi(11, roundi(13.0 * scale)), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 130.0 * scale)
 
 
 func _draw_touch_controls() -> void:
@@ -9023,23 +10949,28 @@ func _draw_touch_controls() -> void:
 	if active_panel != "":
 		var close_rect := _touch_panel_close_rect()
 		if close_rect.size.x > 0.0:
+			var close_scale := touch_ui_coordinate_scale
 			draw_rect(close_rect, Color(0.025, 0.045, 0.06, 0.96))
-			draw_rect(close_rect, Color("E6B8F7") if _touch_feedback_active("close") else PANEL_EDGE, false, 2.0)
-			_draw_text("關閉", close_rect.get_center() + Vector2(0.0, 6.0), 14, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, close_rect.size.x - 8.0)
+			draw_rect(close_rect, Color("E6B8F7") if _touch_feedback_active("close") else PANEL_EDGE, false, 2.0 * close_scale)
+			_draw_text("Close" if language == "en" else "關閉", close_rect.get_center() + Vector2(0.0, 6.0 * close_scale), maxi(12, roundi(14.0 * close_scale)), Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, close_rect.size.x - 8.0 * close_scale)
 		return
 
-	_draw_touch_joystick(_touch_move_center(), touch_move_vector, "移動", FRIEND_BLUE, touch_move_pointer >= 0)
-	_draw_touch_joystick(_touch_aim_center(), touch_aim_vector, "瞄準攻擊", FIRE_ORANGE, touch_aim_pointer >= 0)
+	_draw_touch_joystick(_touch_move_center(), touch_move_vector, "Move" if language == "en" else "移動", FRIEND_BLUE, touch_move_pointer >= 0)
+	_draw_touch_joystick(_touch_aim_center(), touch_aim_vector, "Aim & Attack" if language == "en" else "瞄準攻擊", FIRE_ORANGE, touch_aim_pointer >= 0)
 
 	var unlocked := int(player.get("level", 1)) >= 10
 	var special_rect := _touch_special_rect()
-	_draw_touch_round_button(special_rect, "技能" if unlocked else "Lv.10", GOLD, _touch_feedback_active("special"), unlocked)
+	var special_label := ("Skill" if language == "en" else "技能") if unlocked else "Lv.10"
+	_draw_touch_round_button(special_rect, special_label, GOLD, _touch_feedback_active("special"), unlocked)
 	if unlocked and float(player.get("special_cd", 0.0)) > 0.0:
-		_draw_text("%.1f" % float(player["special_cd"]), special_rect.get_center() + Vector2(0.0, 28.0), 12, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, special_rect.size.x)
+		var cooldown_scale := touch_ui_coordinate_scale
+		_draw_text("%.1f" % float(player["special_cd"]), special_rect.get_center() + Vector2(0.0, 28.0 * cooldown_scale), maxi(10, roundi(12.0 * cooldown_scale)), Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, special_rect.size.x)
 
 	var utility_rects := _touch_utility_rects()
-	var labels := {"guide": "說明", "map": "地圖", "skills": "能力", "recruit": "招募", "command": "軍令", "notices": "通知開" if notifications_hidden else "通知關", "cheat": "作弊", "pause": "暫停"}
-	var colors := {"guide": Color("7893A3"), "map": MAGIC_PURPLE, "skills": FRIEND_BLUE, "recruit": HEAL_GREEN, "command": GOLD, "notices": Color("557A66") if notifications_hidden else Color("6B7188"), "cheat": Color("76528D"), "pause": Color("D36D68")}
+	var labels := {"guide": "說明", "map": "地圖", "skills": "能力", "upgrades": "兵強", "recruit": "招募", "command": "軍令", "notices": "通知開" if notifications_hidden else "通知關", "cheat": "作弊", "fullscreen": "全螢", "pause": "暫停"}
+	if language == "en":
+		labels = {"guide": "Help", "map": "Map", "skills": "Hero", "upgrades": "Troops", "recruit": "Recruit", "command": "Orders", "notices": "Show" if notifications_hidden else "Hide", "cheat": "Cheat", "fullscreen": "Full", "pause": "Pause"}
+	var colors := {"guide": Color("7893A3"), "map": MAGIC_PURPLE, "skills": FRIEND_BLUE, "upgrades": Color("48A0BF"), "recruit": HEAL_GREEN, "command": GOLD, "notices": Color("557A66") if notifications_hidden else Color("6B7188"), "cheat": Color("76528D"), "fullscreen": Color("4E7693"), "pause": Color("D36D68")}
 	for action_value in utility_rects.keys():
 		var action := str(action_value)
 		var enabled := action != "recruit" or _is_near_recruitment()
@@ -9378,47 +11309,107 @@ func _draw_skills_panel() -> void:
 
 func _draw_soldier_upgrade_panel() -> void:
 	var panel := _soldier_upgrade_panel_rect()
+	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
 	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, Color("62B7D6"), false, 2.0)
-	_draw_text("士兵永久強化 / Permanent Troop Upgrades", panel.position + Vector2(24.0, 34.0), 23, Color("DDF7FF"), HORIZONTAL_ALIGNMENT_LEFT, panel.size.x - 48.0)
-	_draw_text("弓箭手（K 開關）・只影響未來招募快照", panel.position + Vector2(24.0, 58.0), 14, Color("92B8C8"), HORIZONTAL_ALIGNMENT_LEFT, panel.size.x - 48.0)
-	for upgrade_index in SoldierUpgradeCatalog.BASE_UPGRADE_ORDER.size():
-		var upgrade_id := str(SoldierUpgradeCatalog.BASE_UPGRADE_ORDER[upgrade_index])
-		var row := Rect2(panel.position.x + 28.0, panel.position.y + 76.0 + float(upgrade_index) * 45.0, panel.size.x - 56.0, 36.0)
-		var rank := SoldierUpgradeCatalog.current_rank("archer", upgrade_id, soldier_research)
-		var cost := SoldierUpgradeCatalog.next_rank_cost("archer", upgrade_id, soldier_research)
-		draw_rect(row, Color("173B4A") if cost >= 0 else Color("31434A"))
-		draw_rect(row, Color("4E879E"), false, 1.0)
-		var cost_text := ("MAX" if cost < 0 else "$%d" % cost)
-		_draw_text("%s  Rank %d/%d" % [SoldierUpgradeCatalog.localized_name(upgrade_id, language), rank, SoldierUpgradeCatalog.max_rank(upgrade_id)], row.position + Vector2(10.0, 24.0), 15, Color("E9F7FC"), HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 120.0)
-		_draw_text(cost_text, row.position + Vector2(row.size.x - 105.0, 24.0), 15, GOLD, HORIZONTAL_ALIGNMENT_RIGHT, 94.0)
+	draw_rect(panel, Color("62B7D6"), false, 2.0 * scale)
+	var compact := _is_touch_scheme() or panel.size.y < 470.0
+	var selected_type := _selected_soldier_upgrade_type()
+	var soldier_cfg: Dictionary = GameConfig.SOLDIERS.get(selected_type, {})
+	var type_name := str(soldier_cfg.get("name", selected_type))
+	if language == "en":
+		type_name = GameLocalization.translate(type_name, "en")
+	var unlocked := _soldier_type_is_unlocked(selected_type)
+	var title := "Permanent Troop Upgrades" if language == "en" else "士兵永久強化"
+	var subtitle := "Only troops recruited or revived after purchase receive these abilities." if language == "en" else "購買後才招募或復活的此兵種會取得能力；現有士兵不變。"
+	_draw_text(title, panel.position + Vector2(18.0, 28.0) * scale, roundi(float(19 if compact else 23) * scale), Color("DDF7FF"), HORIZONTAL_ALIGNMENT_LEFT, panel.size.x - 100.0 * scale)
+	if not compact:
+		_draw_text(subtitle, panel.position + Vector2(panel.size.x * 0.5, 28.0 * scale), roundi(12.0 * scale), Color("92B8C8"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x * 0.62)
+	var controls := _soldier_upgrade_control_rects(panel)
+	var button_font := roundi(15.0 * scale)
+	_draw_button(Rect2(controls["type_prev"]), "◀", Color("39758A"), button_font, 2.0 * scale)
+	_draw_button(Rect2(controls["type_next"]), "▶", Color("39758A"), button_font, 2.0 * scale)
+	var type_line := "%s  ×%.2f%s" % [type_name, SoldierUpgradeCatalog.soldier_multiplier(selected_type), "  LOCKED" if not unlocked and language == "en" else ("  未解鎖" if not unlocked else "")]
+	_draw_text(type_line, Vector2(panel.get_center().x, panel.position.y + 73.0 * scale), roundi(float(16 if compact else 18) * scale), Color("FFB08D") if not unlocked else Color("F1FBFF"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 170.0 * scale)
+	var base_selected := soldier_upgrade_category == "base"
+	_draw_button(Rect2(controls["base_tab"]), "Base Stats" if language == "en" else "基礎強化", Color("4F9BB5") if base_selected else Color("475A64"), button_font, 2.0 * scale)
+	_draw_button(Rect2(controls["special_tab"]), "Special Abilities" if language == "en" else "特殊能力", MAGIC_PURPLE if not base_selected else Color("4B485B"), button_font, 2.0 * scale)
+
+	var option_ids := _soldier_upgrade_option_ids(selected_type)
+	var rows_per_page := _soldier_upgrade_rows_per_page(panel)
+	var page_count := _soldier_upgrade_page_count(panel)
+	soldier_upgrade_page = clampi(soldier_upgrade_page, 0, page_count - 1)
+	var first_index := soldier_upgrade_page * rows_per_page
+	for row_index in rows_per_page:
+		var option_index := first_index + row_index
+		if option_index >= option_ids.size():
+			break
+		var upgrade_id := str(option_ids[option_index])
+		var row := _soldier_upgrade_row_rect(row_index, panel)
+		var rank := SoldierUpgradeCatalog.current_rank(selected_type, upgrade_id, soldier_research)
+		var max_rank := SoldierUpgradeCatalog.max_rank(upgrade_id)
+		var cost := SoldierUpgradeCatalog.next_rank_cost(selected_type, upgrade_id, soldier_research)
+		var preview := SoldierUpgradeCatalog.purchase_preview(selected_type, upgrade_id, soldier_research, int(player.get("money", 0)), unlocked)
+		var allowed := bool(preview.get("allowed", false))
+		var row_color := Color("173B4A") if allowed else (Color("3A3434") if cost >= 0 else Color("31434A"))
+		draw_rect(row, row_color)
+		draw_rect(row, Color("63BCD7") if allowed else Color("596A72"), false, 1.5 * scale)
+		var cost_text := "MAX" if cost < 0 else "$%s" % _format_integer(cost)
+		var display_rank := rank if rank >= max_rank else rank + 1
+		var effect_text := SoldierUpgradeCatalog.localized_effect_text(upgrade_id, display_rank, language)
+		if effect_text.is_empty():
+			effect_text = SoldierUpgradeCatalog.localized_summary(upgrade_id, language)
+		var name_text := "%s  Rank %d/%d" % [SoldierUpgradeCatalog.localized_name(upgrade_id, language), rank, max_rank] if language == "en" else "%s  階級 %d/%d" % [SoldierUpgradeCatalog.localized_name(upgrade_id, language), rank, max_rank]
+		_draw_text(name_text, row.position + Vector2(10.0, 19.0) * scale, roundi(float(12 if compact else 14) * scale), Color("E9F7FC"), HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 142.0 * scale)
+		_draw_text(cost_text, row.position + Vector2(row.size.x - 112.0 * scale, 19.0 * scale), roundi(float(13 if compact else 15) * scale), GOLD if allowed or cost < 0 else Color("D99A7A"), HORIZONTAL_ALIGNMENT_RIGHT, 100.0 * scale)
+		var effect_color := Color("A9D9E7") if allowed or cost < 0 else Color("B8A9A3")
+		_draw_text(effect_text, row.position + Vector2(10.0, 41.0) * scale, roundi(float(10 if compact else 11) * scale), effect_color, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 20.0 * scale)
+
+	_draw_button(Rect2(controls["page_prev"]), "◀ Prev" if language == "en" else "◀ 上頁", Color("4A6673"), button_font, 2.0 * scale)
+	_draw_button(Rect2(controls["page_next"]), "Next ▶" if language == "en" else "下頁 ▶", Color("4A6673"), button_font, 2.0 * scale)
+	if _is_touch_scheme():
+		var touch_hint := "Specials trigger automatically · recruit this troop again after purchase" if language == "en" else "特殊能力會自動觸發；購買後請重新招募此兵種"
+		_draw_text(touch_hint, Vector2(panel.get_center().x, panel.end.y - 78.0 * scale), roundi(11.0 * scale), Color("A9D9E7"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 48.0 * scale)
+	var page_text := "Page %d/%d · Gold $%s" % [soldier_upgrade_page + 1, page_count, _format_integer(int(player.get("money", 0)))] if language == "en" else "第 %d/%d 頁・金幣 $%s" % [soldier_upgrade_page + 1, page_count, _format_integer(int(player.get("money", 0)))]
+	_draw_text(page_text, Vector2(panel.get_center().x, panel.end.y - 17.0 * scale), roundi(12.0 * scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 240.0 * scale)
 
 
 func _draw_recruit_panel() -> void:
 	var panel := _recruit_panel_rect()
+	var ui_scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
 	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0)
+	draw_rect(panel, PANEL_EDGE, false, 3.0 * ui_scale)
 	var touch_compact := _is_touch_scheme()
-	_draw_text("據點招募", panel.position + Vector2(26, 30 if touch_compact else 35), 22 if touch_compact else 24, Color("EAF6FF"))
+	_draw_text("據點招募", panel.position + Vector2(26.0, 30.0 if touch_compact else 35.0) * ui_scale, roundi(float(22 if touch_compact else 24) * ui_scale), Color("EAF6FF"))
 	var buy_hint := "金幣 %d　軍隊 %d / %d" % [int(player["money"]), soldiers.size(), _army_limit()] if touch_compact else "金幣 %d　軍隊 %d / %d　Shift 點擊可購買 5 名" % [int(player["money"]), soldiers.size(), _army_limit()]
-	_draw_text(buy_hint, panel.position + Vector2(26, 53 if touch_compact else 61), 13 if touch_compact else 14, GOLD)
+	_draw_text(buy_hint, panel.position + Vector2(26.0, 53.0 if touch_compact else 61.0) * ui_scale, roundi(float(13 if touch_compact else 14) * ui_scale), GOLD)
 	var roster := _recruitable_soldier_order()
 	var three_columns := roster.size() > 12
 	for i in roster.size():
 		var type_id: String = str(roster[i])
 		var cfg: Dictionary = GameConfig.SOLDIERS[type_id]
 		var combat: Dictionary = cfg["combat"]
+		var recruit_cost := _soldier_recruit_cost(type_id)
+		var base_recruit_cost := int(cfg["recruit_cost"]["gold"])
 		var item := _recruit_item_rect(i, panel)
-		var compact_row := item.size.y < 48.0
+		var compact_row := item.size.y / ui_scale < 48.0
 		draw_rect(item, Color(0.065, 0.10, 0.13, 0.90))
-		draw_rect(item, Color(cfg["color"]).lightened(0.08), false, 1.5)
-		_draw_recruit_icon(type_id, item.position + Vector2(22.0, item.size.y * 0.5))
-		var title_text := str(cfg["name"]) if three_columns else "%s　$%d" % [cfg["name"], int(cfg["recruit_cost"]["gold"])]
-		var detail_text := "$%d　已有 %d　HP %d" % [int(cfg["recruit_cost"]["gold"]), _count_soldier_type(type_id), int(combat["hp"])] if three_columns else "已有 %d　HP %d　傷害 %d　射程 %d" % [_count_soldier_type(type_id), int(combat["hp"]), int(combat["attack"]), int(combat["range"])]
-		_draw_text(title_text, item.position + Vector2(43.0, 16.0 if compact_row else 21.0), 11 if three_columns else (12 if compact_row else 14), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_LEFT, item.size.x - 128.0)
+		draw_rect(item, Color(cfg["color"]).lightened(0.08), false, 1.5 * ui_scale)
+		var icon_center := item.position + Vector2(22.0 * ui_scale, item.size.y * 0.5)
+		if touch_compact:
+			draw_set_transform(icon_center, 0.0, Vector2.ONE * ui_scale)
+			_draw_recruit_icon(type_id, Vector2.ZERO)
+			draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+		else:
+			_draw_recruit_icon(type_id, icon_center)
+		var price_marker := "$%d" % recruit_cost
+		if recruit_cost < base_recruit_cost:
+			price_marker += "↓"
+		var title_text := str(cfg["name"]) if three_columns else "%s　%s" % [cfg["name"], price_marker]
+		var detail_text := "%s　已有 %d　HP %d" % [price_marker, _count_soldier_type(type_id), int(combat["hp"])] if three_columns else "已有 %d　HP %d　傷害 %d　射程 %d" % [_count_soldier_type(type_id), int(combat["hp"]), int(combat["attack"]), int(combat["range"])]
+		_draw_text(title_text, item.position + Vector2(43.0, 16.0 if compact_row else 21.0) * ui_scale, roundi(float(11 if three_columns else (12 if compact_row else 14)) * ui_scale), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_LEFT, item.size.x - 128.0 * ui_scale)
 		# 三欄終局名單把價格放到第二行最前面，長英文名稱也不會蓋住金額。
-		_draw_text(detail_text, item.position + Vector2(43.0, 33.0 if compact_row else 43.0), 9 if compact_row or three_columns else 11, Color("AFC7D6"), HORIZONTAL_ALIGNMENT_LEFT, item.size.x - 126.0)
-		_draw_button(_recruit_buy_rect(i, panel), "招募", HEAL_GREEN if int(player["money"]) >= int(cfg["recruit_cost"]["gold"]) else Color("56636B"))
+		_draw_text(detail_text, item.position + Vector2(43.0, 33.0 if compact_row else 43.0) * ui_scale, roundi(float(9 if compact_row or three_columns else 11) * ui_scale), Color("AFC7D6"), HORIZONTAL_ALIGNMENT_LEFT, item.size.x - 126.0 * ui_scale)
+		_draw_button(_recruit_buy_rect(i, panel), "招募", HEAL_GREEN if int(player["money"]) >= recruit_cost else Color("56636B"), roundi(12.0 * ui_scale), 2.0 * ui_scale)
 
 
 func _draw_recruit_icon(type_id: String, center: Vector2) -> void:
@@ -9498,9 +11489,13 @@ func _draw_pause_menu() -> void:
 	draw_rect(Rect2(Vector2.ZERO, screen_size), Color(0.0, 0.0, 0.0, 0.58))
 	var center := screen_size * 0.5
 	var panel := _pause_panel_rect()
+	var ui_scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
 	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0)
-	_draw_text("遊戲暫停", center + Vector2(0, -287 if _is_touch_scheme() else -218), 28, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 300)
+	draw_rect(panel, PANEL_EDGE, false, 3.0 * ui_scale)
+	if _is_touch_scheme():
+		_draw_text("遊戲暫停", Vector2(panel.get_center().x, panel.position.y + 31.0 * ui_scale), roundi(22.0 * ui_scale), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 24.0 * ui_scale)
+	else:
+		_draw_text("遊戲暫停", center + Vector2(0, -218), 28, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 300)
 	var action_labels := {
 		"resume": "繼續遊戲", "save": "儲存遊戲", "load": "讀取遊戲",
 		"summon_chaos": "召喚混沌 Boss", "summon_aionis": "召喚艾歐尼斯", "restart": "重新開始",
@@ -9510,14 +11505,16 @@ func _draw_pause_menu() -> void:
 		var action := str(actions[index])
 		var label := str(action_labels[action])
 		var color := Color("8B4B45") if action == "restart" else (Color("7B6224") if action == "summon_aionis" else (Color("6D3FA0") if action == "summon_chaos" else Color("466B76")))
-		_draw_button(_pause_button_rect(index), label, color)
-	_draw_button(_pause_language_rect(), "English" if language != "en" else "中文", Color("5B6F8F"))
-	_draw_text("音量 %d%%" % int(master_volume * 100.0), center + Vector2(0, 162 if _is_touch_scheme() else 207), 15, Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, 130)
-	_draw_button(_pause_volume_rect("down"), "−", Color("466B76"))
-	_draw_button(_pause_volume_rect("up"), "+", Color("466B76"))
-	_draw_button(_pause_volume_rect("mute"), "靜音" if not sound_muted else "取消靜音", Color("5A6870"))
+		_draw_button(_pause_button_rect(index), label, color, roundi(14.0 * ui_scale), 2.0 * ui_scale)
+	_draw_button(_pause_language_rect(), "English" if language != "en" else "中文", Color("5B6F8F"), roundi(14.0 * ui_scale), 2.0 * ui_scale)
+	var volume_label_position := Vector2(panel.get_center().x, panel.position.y + 270.0 * ui_scale) if _is_touch_scheme() else center + Vector2(0, 207)
+	_draw_text("音量 %d%%" % int(master_volume * 100.0), volume_label_position, roundi(15.0 * ui_scale), Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, 150.0 * ui_scale)
+	_draw_button(_pause_volume_rect("down"), "−", Color("466B76"), roundi(16.0 * ui_scale), 2.0 * ui_scale)
+	_draw_button(_pause_volume_rect("up"), "+", Color("466B76"), roundi(16.0 * ui_scale), 2.0 * ui_scale)
+	_draw_button(_pause_volume_rect("mute"), "靜音" if not sound_muted else "取消靜音", Color("5A6870"), roundi(14.0 * ui_scale), 2.0 * ui_scale)
 	var footer := "點擊按鈕操作" if _is_touch_scheme() else "Esc 返回　F 全螢幕"
-	_draw_text(footer, center + Vector2(0, 268 if _is_touch_scheme() else 255), 12, Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, 260)
+	var footer_position := Vector2(panel.get_center().x, panel.end.y - 10.0 * ui_scale) if _is_touch_scheme() else center + Vector2(0, 255)
+	_draw_text(footer, footer_position, roundi(12.0 * ui_scale), Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 24.0 * ui_scale if _is_touch_scheme() else 260.0)
 
 
 func _draw_death_overlay() -> void:
@@ -9547,6 +11544,15 @@ func _count_soldier_type(type_id: String) -> int:
 	return count
 
 
+func _format_integer(value: int) -> String:
+	var digits := str(absi(value))
+	var grouped := ""
+	while digits.length() > 3:
+		grouped = "," + digits.right(3) + grouped
+		digits = digits.left(digits.length() - 3)
+	return ("-" if value < 0 else "") + digits + grouped
+
+
 func _draw_text(text: String, baseline: Vector2, size: int, color: Color, alignment: HorizontalAlignment = HORIZONTAL_ALIGNMENT_LEFT, width: float = -1.0) -> void:
 	var draw_position := baseline
 	if width > 0.0:
@@ -9557,10 +11563,10 @@ func _draw_text(text: String, baseline: Vector2, size: int, color: Color, alignm
 	draw_string(ui_font, draw_position, _localized(text), alignment, width, size, color)
 
 
-func _draw_button(rect: Rect2, label: String, color: Color) -> void:
+func _draw_button(rect: Rect2, label: String, color: Color, text_size: int = 15, border_width: float = 2.0) -> void:
 	draw_rect(rect, color.darkened(0.55), true)
-	draw_rect(rect, color, false, 2.0)
-	_draw_text(label, rect.position + Vector2(rect.size.x * 0.5, rect.size.y * 0.67), 15, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x)
+	draw_rect(rect, color, false, border_width)
+	_draw_text(label, rect.position + Vector2(rect.size.x * 0.5, rect.size.y * 0.67), text_size, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x)
 
 
 func _draw_bar(position: Vector2, size: Vector2, ratio: float, fill_color: Color, background: Color) -> void:
@@ -10650,6 +12656,7 @@ func _run_self_test() -> void:
 	_test_assert(next_entity_id >= expected_next_entity_id, "save_preserves_entity_id_sequence")
 	_test_assert(drops.size() == 1 and int(drops[0]["gold"]) == 77, "save_preserves_uncollected_drops")
 	_test_assert(soldier_command == "駐守" and command_castle_id == "saved_garrison_castle", "save_preserves_garrison_command_target")
+	_test_assert(str(Dictionary(Dictionary(castles["saved_garrison_castle"]).get("nation", {})).get("id", "")) == NationCatalog.PLAYER_NATION_ID, "save_preserves_player_castle_nation_and_flag")
 	var loaded_technology_types: Array[String] = []
 	var loaded_rocket: Variant = null
 	for loaded_recruit in soldiers:
@@ -10732,8 +12739,9 @@ func _run_self_test() -> void:
 	player["class_id"] = "archer"
 	soldier_research = SoldierUpgradeCatalog.create_empty_research()
 	var research_before_full_upgrade := soldier_research.duplicate(true)
+	var soldiers_before_full_upgrade := soldiers.duplicate(true)
 	_apply_full_hero_upgrade()
-	_test_assert(int(player["level"]) == HERO_LEVEL_CAP and soldier_research == research_before_full_upgrade, "full_upgrade_never_upgrades_soldiers")
+	_test_assert(int(player["level"]) == HERO_LEVEL_CAP and soldier_research == research_before_full_upgrade and soldiers == soldiers_before_full_upgrade, "full_upgrade_never_upgrades_soldiers")
 	player["money"] = 100000
 	var base_attack_cost := SoldierUpgradeCatalog.next_rank_cost("archer", "attack_or_healing", soldier_research)
 	var upgrade_purchase_ok := _purchase_soldier_upgrade("archer", "attack_or_healing")
@@ -10744,6 +12752,137 @@ func _run_self_test() -> void:
 	_test_assert(recruited_archer != null and Dictionary(recruited_archer).has("upgrade_snapshot") and float(Dictionary(Dictionary(recruited_archer)["upgrade_snapshot"])["base_effects"]["attack_or_healing_bonus"]) > 0.0, "future_recruits_receive_permanent_upgrade_snapshot")
 	var legacy_research := SoldierUpgradeCatalog.sanitize_research({})
 	_test_assert(SoldierUpgradeCatalog.research_is_valid(legacy_research), "legacy_save_migrates_to_valid_empty_soldier_research")
+	var catalog_test := SoldierUpgradeCatalog.catalog_self_test()
+	var runtime_test := SoldierUpgradeRuntime.self_test()
+	_test_assert(bool(catalog_test.get("ok", false)) and int(catalog_test.get("soldier_types", 0)) == 16 and int(catalog_test.get("base_upgrades", 0)) == 8 and int(catalog_test.get("special_abilities", 0)) == 57, "soldier_upgrade_catalog_has_16_types_8_base_and_57_specials")
+	_test_assert(bool(runtime_test.get("ok", false)) and int(runtime_test.get("catalog_ids", 0)) == 57, "soldier_upgrade_runtime_covers_all_57_specials")
+	var catalog_price_effects_ok := true
+	for special_id_value in SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER:
+		var special_id := str(special_id_value)
+		var definition := SoldierUpgradeCatalog.definition_for(special_id)
+		if int(definition.get("base_price", 0)) <= 0 or SoldierUpgradeCatalog.localized_effect_text(special_id, 1, "zh_TW").is_empty() or SoldierUpgradeCatalog.localized_effect_text(special_id, 1, "en").is_empty():
+			catalog_price_effects_ok = false
+			break
+	_test_assert(catalog_price_effects_ok, "all_57_specials_expose_positive_prices_and_bilingual_effects")
+
+	# Existing soldiers retain their immutable research snapshot. Only recruits
+	# created after a purchase inherit the new permanent rank.
+	soldiers.clear()
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	player["level"] = 20
+	player["money"] = 1000000
+	var old_archer_id := _spawn_soldier("archer", Vector2(1850.0, 1850.0))
+	var old_archer: Variant = _find_soldier_by_id(old_archer_id)
+	var old_attack_bonus := float(Dictionary(Dictionary(old_archer)["upgrade_snapshot"])["base_effects"].get("attack_or_healing_bonus", 0.0))
+	_purchase_soldier_upgrade("archer", "attack_or_healing")
+	var new_archer_id := _spawn_soldier("archer", Vector2(1900.0, 1850.0))
+	var new_archer: Variant = _find_soldier_by_id(new_archer_id)
+	var old_bonus_after_purchase := float(Dictionary(Dictionary(old_archer)["upgrade_snapshot"])["base_effects"].get("attack_or_healing_bonus", 0.0))
+	var new_attack_bonus := float(Dictionary(Dictionary(new_archer)["upgrade_snapshot"])["base_effects"].get("attack_or_healing_bonus", 0.0))
+	_test_assert(is_zero_approx(old_attack_bonus) and is_zero_approx(old_bonus_after_purchase) and new_attack_bonus > 0.0, "soldier_upgrade_snapshot_changes_only_future_recruits")
+
+	var research_roundtrip_path := "/tmp/infinite_legion_research_roundtrip.json"
+	GameSaveManager.delete_save(research_roundtrip_path)
+	var research_roundtrip_saved := GameSaveManager.save_game({"soldier_research": soldier_research}, research_roundtrip_path)
+	var research_roundtrip_loaded := GameSaveManager.load_game(research_roundtrip_path)
+	_test_assert(research_roundtrip_saved and SoldierUpgradeCatalog.research_is_valid(research_roundtrip_loaded.get("soldier_research", {})), "soldier_research_json_roundtrip_accepts_integral_float_ranks")
+	GameSaveManager.delete_save(research_roundtrip_path)
+
+	# Full schema-8 roundtrip preserves the research wallet and each historical
+	# soldier snapshot. A newly recruited unit after loading receives current
+	# research, while the pre-purchase unit remains unchanged.
+	var full_research_roundtrip_path := "/tmp/infinite_legion_research_full_roundtrip.json"
+	GameSaveManager.delete_save(full_research_roundtrip_path)
+	var full_research_saved := _save_game(false, full_research_roundtrip_path)
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	soldiers.clear()
+	var full_research_loaded := _load_game(full_research_roundtrip_path)
+	var roundtrip_old_archer: Variant = _find_soldier_by_id(old_archer_id)
+	var roundtrip_new_archer: Variant = _find_soldier_by_id(new_archer_id)
+	var post_load_archer_id := _spawn_soldier("archer", Vector2(1940.0, 1850.0))
+	var post_load_archer: Variant = _find_soldier_by_id(post_load_archer_id)
+	var roundtrip_snapshots_ok := (
+		full_research_saved
+		and full_research_loaded
+		and SoldierUpgradeCatalog.current_rank("archer", "attack_or_healing", soldier_research) == 1
+		and roundtrip_old_archer != null
+		and roundtrip_new_archer != null
+		and post_load_archer != null
+		and is_zero_approx(float(Dictionary(Dictionary(roundtrip_old_archer)["upgrade_snapshot"])["base_effects"].get("attack_or_healing_bonus", 0.0)))
+		and float(Dictionary(Dictionary(roundtrip_new_archer)["upgrade_snapshot"])["base_effects"].get("attack_or_healing_bonus", 0.0)) > 0.0
+		and float(Dictionary(Dictionary(post_load_archer)["upgrade_snapshot"])["base_effects"].get("attack_or_healing_bonus", 0.0)) > 0.0
+	)
+	_test_assert(roundtrip_snapshots_ok, "save_load_preserves_research_and_historical_future_recruit_snapshots")
+	GameSaveManager.delete_save(full_research_roundtrip_path)
+
+	# Schema-7 stored special effects only in `active_specials`. Verify that a real
+	# save/load migrates that array to the combat lookup map without consulting the
+	# current research tree.
+	var schema7_snapshot_path := "/tmp/infinite_legion_schema7_snapshot.json"
+	GameSaveManager.delete_save(schema7_snapshot_path)
+	var schema7_snapshot_save := GameSaveManager.load_game(test_path)
+	schema7_snapshot_save["schema"] = 7
+	var schema7_soldiers: Array = schema7_snapshot_save.get("soldiers", [])
+	var schema7_soldier: Dictionary = Dictionary(schema7_soldiers[0]).duplicate(true)
+	var schema7_soldier_id := int(schema7_soldier["id"])
+	schema7_soldier["type"] = "swordsman"
+	schema7_soldier["attack"] = 8.0
+	schema7_soldier["upgrade_snapshot"] = {
+		"type": "swordsman",
+		"base_effects": {},
+		"active_specials": [{
+			"id": "burning_sword", "rank": 1,
+			"effect": {"duration": 3.0, "total_burn_ratio": 0.24, "source_target_proc_cooldown": 0.6},
+		}],
+	}
+	schema7_soldier.erase("special_runtime")
+	schema7_soldier.erase("upgrade_cooldowns")
+	schema7_soldier.erase("upgrade_counters")
+	schema7_soldiers[0] = schema7_soldier
+	schema7_snapshot_save["soldiers"] = schema7_soldiers
+	var schema7_file_saved := GameSaveManager.save_game(schema7_snapshot_save, schema7_snapshot_path)
+	var schema7_loaded := _load_game(schema7_snapshot_path)
+	var migrated_schema7_soldier: Variant = _find_soldier_by_id(schema7_soldier_id)
+	var schema7_map_ok := false
+	var schema7_combat_ok := false
+	if migrated_schema7_soldier != null:
+		var migrated_schema7_snapshot: Dictionary = Dictionary(migrated_schema7_soldier["upgrade_snapshot"])
+		var migrated_schema7_specials: Dictionary = Dictionary(migrated_schema7_snapshot.get("special_effects", {}))
+		schema7_map_ok = migrated_schema7_specials.has("burning_sword")
+		enemies.clear()
+		var legacy_target_position := Vector2(migrated_schema7_soldier["pos"]) + Vector2(36.0, 0.0)
+		var legacy_target_id := _spawn_enemy("heavy", legacy_target_position, 40, legacy_target_position)
+		var legacy_target_index := _enemy_index_by_id(legacy_target_id)
+		_resolve_soldier_enemy_hit(legacy_target_index, 8.0, migrated_schema7_soldier["pos"], "melee", schema7_soldier_id, migrated_schema7_specials)
+		var legacy_target: Variant = _find_enemy_by_id(legacy_target_id)
+		schema7_combat_ok = legacy_target != null and float(legacy_target.get("soldier_burn_ttl", 0.0)) > 0.0
+	_test_assert(schema7_file_saved, "schema7_active_special_fixture_saves")
+	_test_assert(schema7_loaded, "schema7_active_special_fixture_loads")
+	_test_assert(schema7_map_ok, "schema7_active_special_snapshot_builds_lookup_map")
+	_test_assert(schema7_combat_ok, "schema7_active_special_snapshot_remains_combat_effective")
+	GameSaveManager.delete_save(schema7_snapshot_path)
+	_test_assert(_load_game(test_path), "schema7_snapshot_test_restores_canonical_save")
+	var malformed_snapshot_path := "/tmp/infinite_legion_malformed_snapshot.json"
+	GameSaveManager.delete_save(malformed_snapshot_path)
+	var malformed_snapshot_save := GameSaveManager.load_game(test_path)
+	malformed_snapshot_save["soldiers"][0]["upgrade_snapshot"] = "corrupt"
+	GameSaveManager.save_game(malformed_snapshot_save, malformed_snapshot_path)
+	var snapshot_rejection_money := int(player["money"])
+	_test_assert(not _load_game(malformed_snapshot_path) and int(player["money"]) == snapshot_rejection_money, "schema8_rejects_malformed_soldier_upgrade_snapshot_without_mutation")
+	GameSaveManager.delete_save(malformed_snapshot_path)
+
+	var cheat_money_before := int(player["money"])
+	_on_cheat_code_submitted("  GOLD   coins ")
+	_test_assert(int(player["money"]) == cheat_money_before + 100000, "gold_coins_cheat_adds_exactly_100000")
+	var change_money := int(player["money"])
+	var change_level := int(player["level"])
+	var change_soldier_count := soldiers.size()
+	var change_research := soldier_research.duplicate(true)
+	_on_cheat_code_submitted("change")
+	class_select_pointer_guard_until_msec = -10000
+	_change_player_class("mage")
+	_test_assert(str(player["class_id"]) == "mage" and int(player["money"]) == change_money and int(player["level"]) == change_level and soldiers.size() == change_soldier_count and soldier_research == change_research, "change_cheat_preserves_money_level_soldiers_and_research")
+
 	var player_nation := NationCatalog.player_metadata()
 	var foreign_nation := NationCatalog.metadata_for_castle(world_seed, "nation_test_foreign", Vector2(20000.0, 20000.0))
 	_test_assert(NationCatalog.is_valid_metadata(player_nation) and NationCatalog.are_hostile(player_nation, foreign_nation), "nation_metadata_defines_player_flag_and_hostility")
@@ -10755,6 +12894,349 @@ func _run_self_test() -> void:
 	var annex_defender := {"destroyed": true, "nation": player_nation, "max_hp": 1000.0, "hp": 0.0, "wall_max_hp": 400.0, "wall_hp": 0.0}
 	_apply_nation_siege(annex_attacker, annex_defender, 2.0)
 	_test_assert(not bool(annex_defender["destroyed"]) and str(Dictionary(annex_defender["nation"])["id"]) == str(foreign_nation["id"]), "hostile_nation_annexes_defeated_castle")
+	var json_shaped_nation := foreign_nation.duplicate(true)
+	json_shaped_nation["version"] = float(json_shaped_nation["version"])
+	json_shaped_nation["capital_chunk_x"] = float(json_shaped_nation["capital_chunk_x"])
+	json_shaped_nation["capital_chunk_y"] = float(json_shaped_nation["capital_chunk_y"])
+	var missing_nation_coordinate := json_shaped_nation.duplicate(true)
+	missing_nation_coordinate.erase("capital_chunk_x")
+	_test_assert(NationCatalog.is_valid_metadata(json_shaped_nation) and not NationCatalog.is_valid_metadata(missing_nation_coordinate), "nation_validator_accepts_integral_json_numbers_and_requires_all_fields")
+
+	# AI-to-AI ownership must survive a real JSON save. The current owner is not
+	# required to match the geographic nation stored in `original_nation`.
+	var nation_roundtrip_path := "/tmp/infinite_legion_nation_roundtrip.json"
+	GameSaveManager.delete_save(nation_roundtrip_path)
+	var nation_roundtrip_save := GameSaveManager.load_game(test_path)
+	var nation_castles: Dictionary = Dictionary(nation_roundtrip_save.get("castles", {}))
+	var nation_castle: Dictionary = Dictionary(nation_castles["saved_garrison_castle"]).duplicate(true)
+	var geographic_nation := NationCatalog.metadata_for_castle(int(nation_roundtrip_save.get("world_seed", world_seed)), str(nation_castle["id"]), nation_castle["pos"])
+	var annex_owner_nation := geographic_nation
+	for owner_search_index in range(1, 40):
+		var owner_candidate := NationCatalog.metadata_for_castle(int(nation_roundtrip_save.get("world_seed", world_seed)), "annex_owner_%d" % owner_search_index, Vector2(nation_castle["pos"]) + Vector2(float(owner_search_index) * NationCatalog.CHUNK_SIZE * 13.0, NationCatalog.CHUNK_SIZE * 7.0))
+		if str(owner_candidate["id"]) != str(geographic_nation["id"]):
+			annex_owner_nation = owner_candidate
+			break
+	nation_castle["owned"] = false
+	nation_castle["original_nation"] = geographic_nation
+	nation_castle["nation"] = NationCatalog.conquest_metadata(annex_owner_nation)
+	nation_castles["saved_garrison_castle"] = nation_castle
+	nation_roundtrip_save["castles"] = nation_castles
+	var nation_file_saved := GameSaveManager.save_game(nation_roundtrip_save, nation_roundtrip_path)
+	var nation_file_loaded := _load_game(nation_roundtrip_path)
+	var loaded_annex_castle: Dictionary = Dictionary(castles.get("saved_garrison_castle", {}))
+	var ai_annex_persisted := (
+		nation_file_saved
+		and nation_file_loaded
+		and str(annex_owner_nation["id"]) != str(geographic_nation["id"])
+		and str(Dictionary(loaded_annex_castle.get("nation", {})).get("id", "")) == str(annex_owner_nation["id"])
+		and str(Dictionary(loaded_annex_castle.get("original_nation", {})).get("id", "")) == str(geographic_nation["id"])
+	)
+	_test_assert(ai_annex_persisted, "save_load_preserves_ai_annexed_castle_nation")
+	GameSaveManager.delete_save(nation_roundtrip_path)
+	_test_assert(_load_game(test_path), "nation_roundtrip_test_restores_canonical_save")
+
+	# Touch layout includes a dedicated, non-overlapping troop-upgrade button and
+	# all in-panel actions meet the minimum 44 px touch target.
+	var stored_screen_size := screen_size
+	var stored_input_scheme := input_scheme
+	var stored_touch_ui_coordinate_scale := touch_ui_coordinate_scale
+	touch_ui_coordinate_scale = 1.0
+	screen_size = Vector2(844.0, 390.0)
+	_set_input_scheme(InputScheme.TOUCH)
+	mode = GameMode.PLAYING
+	active_panel = ""
+	var touch_utility := _touch_utility_rects()
+	var touch_upgrade_rect := Rect2(touch_utility["upgrades"])
+	var left_stick_bounds := Rect2(_touch_move_center() - Vector2.ONE * TOUCH_STICK_RADIUS, Vector2.ONE * TOUCH_STICK_RADIUS * 2.0)
+	var right_stick_bounds := Rect2(_touch_aim_center() - Vector2.ONE * TOUCH_STICK_RADIUS, Vector2.ONE * TOUCH_STICK_RADIUS * 2.0)
+	var touch_upgrade_geometry_ok := touch_upgrade_rect.size.x >= 44.0 and touch_upgrade_rect.size.y >= 44.0 and not touch_upgrade_rect.intersects(left_stick_bounds) and not touch_upgrade_rect.intersects(right_stick_bounds) and not touch_upgrade_rect.intersects(_touch_special_rect())
+	_handle_touch_action_at(touch_upgrade_rect.get_center())
+	var touch_upgrade_opened := active_panel == "soldier_upgrades"
+	var touch_upgrade_panel := _soldier_upgrade_panel_rect()
+	var touch_upgrade_controls := _soldier_upgrade_control_rects(touch_upgrade_panel)
+	var touch_targets_large := true
+	for control_value in touch_upgrade_controls.values():
+		var control_rect := Rect2(control_value)
+		if control_rect.size.x < 44.0 or control_rect.size.y < 44.0:
+			touch_targets_large = false
+			break
+	var close_does_not_overlap_next := not Rect2(touch_upgrade_controls["type_next"]).intersects(_touch_panel_close_rect())
+	soldier_upgrade_type_index = SoldierUpgradeCatalog.SOLDIER_ORDER.find("archer")
+	soldier_upgrade_category = "base"
+	soldier_upgrade_page = 0
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	player["money"] = 1000000
+	var touch_rank_before := SoldierUpgradeCatalog.current_rank("archer", "recruit_discount", soldier_research)
+	_handle_ui_click(_soldier_upgrade_row_rect(0, touch_upgrade_panel).get_center())
+	var touch_rank_after := SoldierUpgradeCatalog.current_rank("archer", "recruit_discount", soldier_research)
+	_handle_ui_click(Rect2(touch_upgrade_controls["special_tab"]).get_center())
+	var touch_special_tab_works := soldier_upgrade_category == "special"
+	_handle_touch_action_at(_touch_panel_close_rect().get_center())
+	var web_touch_scale := 720.0 / 390.0
+	touch_ui_coordinate_scale = web_touch_scale
+	screen_size = Vector2(844.0 * web_touch_scale, 720.0)
+	active_panel = ""
+	var web_screen_bounds := Rect2(Vector2.ZERO, screen_size)
+	var web_stick_radius := TOUCH_STICK_RADIUS * web_touch_scale
+	var web_move_bounds := Rect2(_touch_move_center() - Vector2.ONE * web_stick_radius, Vector2.ONE * web_stick_radius * 2.0)
+	var web_attack_bounds := Rect2(_touch_aim_center() - Vector2.ONE * web_stick_radius, Vector2.ONE * web_stick_radius * 2.0)
+	var web_special_bounds := _touch_special_rect()
+	var web_touch_utility := _touch_utility_rects()
+	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds]
+	var web_virtual_layout_ok := web_touch_utility.size() == 10
+	for web_utility_value in web_touch_utility.values():
+		web_virtual_rects.append(Rect2(web_utility_value))
+	for web_control_index in web_virtual_rects.size():
+		var web_control_rect := web_virtual_rects[web_control_index]
+		var web_control_css_size := web_control_rect.size / web_touch_scale
+		if web_control_css_size.x < 44.0 or web_control_css_size.y < 44.0 or not web_screen_bounds.encloses(web_control_rect):
+			web_virtual_layout_ok = false
+			break
+		for web_previous_index in web_control_index:
+			if web_control_rect.intersects(web_virtual_rects[web_previous_index]):
+				web_virtual_layout_ok = false
+				break
+		if not web_virtual_layout_ok:
+			break
+	_test_assert(web_virtual_layout_ok, "web_touch_ten_utilities_dual_sticks_and_special_are_large_visible_and_disjoint")
+
+	var web_panel_targets_ok := true
+	var web_layout_unlock_before := all_soldiers_unlocked
+	all_soldiers_unlocked = true
+	active_panel = "recruit"
+	var web_recruit_panel := _recruit_panel_rect()
+	for web_recruit_index in _recruitable_soldier_order().size():
+		var web_recruit_buy := _recruit_buy_rect(web_recruit_index, web_recruit_panel)
+		var web_recruit_css_size := web_recruit_buy.size / web_touch_scale
+		if web_recruit_css_size.x < 44.0 or web_recruit_css_size.y < 44.0 or not web_screen_bounds.encloses(web_recruit_buy):
+			web_panel_targets_ok = false
+			break
+	for web_panel_name in ["skills", "recruit", "map", "command"]:
+		active_panel = str(web_panel_name)
+		var web_close_rect := _touch_panel_close_rect()
+		var web_close_css_size := web_close_rect.size / web_touch_scale
+		if web_close_css_size.x < 44.0 or web_close_css_size.y < 44.0 or not web_screen_bounds.encloses(web_close_rect):
+			web_panel_targets_ok = false
+			break
+	active_panel = ""
+	mode = GameMode.PAUSED
+	var web_pause_panel := _pause_panel_rect()
+	for web_pause_index in _pause_actions().size():
+		var web_pause_action := _pause_button_rect(web_pause_index)
+		var web_pause_action_css_size := web_pause_action.size / web_touch_scale
+		if web_pause_action_css_size.x < 44.0 or web_pause_action_css_size.y < 44.0 or not web_pause_panel.encloses(web_pause_action) or not web_screen_bounds.encloses(web_pause_action):
+			web_panel_targets_ok = false
+			break
+	var web_pause_language := _pause_language_rect()
+	var web_pause_language_css_size := web_pause_language.size / web_touch_scale
+	if web_pause_language_css_size.x < 44.0 or web_pause_language_css_size.y < 44.0 or not web_pause_panel.encloses(web_pause_language) or not web_screen_bounds.encloses(web_pause_language):
+		web_panel_targets_ok = false
+	for web_volume_action in ["down", "mute", "up"]:
+		var web_pause_volume := _pause_volume_rect(str(web_volume_action))
+		var web_pause_volume_css_size := web_pause_volume.size / web_touch_scale
+		if web_pause_volume_css_size.x < 44.0 or web_pause_volume_css_size.y < 44.0 or not web_pause_panel.encloses(web_pause_volume) or not web_screen_bounds.encloses(web_pause_volume):
+			web_panel_targets_ok = false
+			break
+	_test_assert(web_panel_targets_ok, "web_touch_recruit_close_and_pause_targets_are_at_least_44_css_pixels")
+	mode = GameMode.PLAYING
+	active_panel = ""
+	all_soldiers_unlocked = web_layout_unlock_before
+	var web_upgrade_rect := Rect2(_touch_utility_rects()["upgrades"])
+	var web_upgrade_css_size := web_upgrade_rect.size / web_touch_scale
+	var web_upgrade_css_center := web_upgrade_rect.get_center() / web_touch_scale
+	_handle_touch_action_at(web_upgrade_rect.get_center())
+	var web_panel := _soldier_upgrade_panel_rect()
+	var web_controls := _soldier_upgrade_control_rects(web_panel)
+	var web_stretch_targets_ok := active_panel == "soldier_upgrades" and web_upgrade_css_size.x >= 44.0 and web_upgrade_css_size.y >= 44.0 and web_upgrade_css_center.distance_to(Vector2(480.0, 108.0)) < 1.0
+	for web_control_value in web_controls.values():
+		var web_control_css_size := Rect2(web_control_value).size / web_touch_scale
+		if web_control_css_size.x < 44.0 or web_control_css_size.y < 44.0:
+			web_stretch_targets_ok = false
+			break
+	web_stretch_targets_ok = web_stretch_targets_ok and not Rect2(web_controls["type_next"]).intersects(_touch_panel_close_rect())
+	_handle_touch_action_at(_touch_panel_close_rect().get_center())
+	_test_assert(touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_button_panel_purchase_and_close")
+	screen_size = stored_screen_size
+	touch_ui_coordinate_scale = stored_touch_ui_coordinate_scale
+	_set_input_scheme(stored_input_scheme)
+
+	# Representative real-combat coverage for status payloads, split/echo
+	# generation guards, bounded persistent effects, shields and summons.
+	enemies.clear()
+	soldiers.clear()
+	projectiles.clear()
+	upgrade_effects.clear()
+	var status_enemy_id := _spawn_enemy("heavy", Vector2(2200.0, 2200.0), 18, Vector2(2200.0, 2200.0))
+	var status_enemy_index := _enemy_index_by_id(status_enemy_id)
+	var status_snapshot := {"base_effects": {}, "special_effects": {
+		"burning_ammo": {"total_burn_ratio": 0.30, "duration": 3.0},
+		"toxic_payload": {"total_poison_ratio": 0.30, "duration": 5.0, "max_stacks": 3},
+		"frost_arrow": {"slow_ratio": 0.25, "duration": 2.0},
+		"corrosion": {"armor_reduction": 5.0, "duration": 4.0, "max_stacks": 2},
+		"void_mark": {"soldier_damage_taken_bonus": 0.06, "duration": 4.0},
+		"focus_mark": {"other_ally_damage_bonus": 0.07, "effect_duration": 4.0},
+		"lifesteal": {"lifesteal_ratio": 0.05, "max_hp_heal_cap_per_second_ratio": 0.06},
+	}}
+	var status_soldier_id := _spawn_soldier("archer", Vector2(2120.0, 2200.0))
+	var status_soldier: Variant = _find_soldier_by_id(status_soldier_id)
+	status_soldier["upgrade_snapshot"] = status_snapshot
+	status_soldier["special_runtime"] = SoldierUpgradeRuntime.create_state(status_snapshot, float(status_soldier["max_hp"]))
+	status_soldier["hp"] = float(status_soldier["max_hp"]) * 0.5
+	var status_hp_before := float(status_soldier["hp"])
+	_resolve_soldier_enemy_hit(status_enemy_index, 80.0, status_soldier["pos"], "projectile", status_soldier_id, Dictionary(status_snapshot["special_effects"]))
+	var status_enemy: Variant = _find_enemy_by_id(status_enemy_id)
+	_test_assert(status_enemy != null and float(status_enemy.get("soldier_burn_ttl", 0.0)) > 0.0 and not Dictionary(status_enemy.get("soldier_poison_sources", {})).is_empty() and float(status_enemy.get("armor_break", 0.0)) > 0.0 and float(status_enemy.get("slow", 0.0)) > 0.0 and float(status_soldier["hp"]) > status_hp_before, "soldier_projectile_applies_dot_control_armor_break_marks_and_lifesteal")
+
+	projectiles.clear()
+	upgrade_effects.clear()
+	var split_snapshot := {"base_effects": {}, "special_effects": {
+		"split_shot": {"extra_projectiles": 2, "spread_degrees": 14.0, "damage_ratio": 0.20},
+		"temporal_echo": {"every_attacks": 1, "echo_delay": 0.35, "echo_damage_ratio": 0.50},
+	}}
+	status_soldier["upgrade_snapshot"] = split_snapshot
+	status_soldier["special_runtime"] = SoldierUpgradeRuntime.create_state(split_snapshot, float(status_soldier["max_hp"]))
+	var split_context := _begin_soldier_attack(status_soldier, {"hp": 100.0, "max_hp": 100.0}, status_enemy_id, Vector2(2200.0, 2200.0))
+	_spawn_projectile({"team": "friendly", "kind": "ally_arrow", "source_kind": "archer", "source_id": status_soldier_id, "target_id": status_enemy_id, "pos": Vector2(2120.0, 2200.0), "vel": Vector2.RIGHT * 720.0, "damage": 25.0, "range": 500.0, "radius": 4.0, "pierce": 1, "aoe": 0.0, "color": Color("A9D8FF"), "soldier_attack_context": split_context})
+	_test_assert(projectiles.size() == 3 and _upgrade_effect_count("temporal_echo") == 1 and not bool(projectiles[1].get("allow_special_generation", true)) and not bool(projectiles[2].get("allow_special_generation", true)), "split_shot_and_temporal_echo_are_bounded_and_non_recursive")
+
+	upgrade_effects.clear()
+	for mine_index in 30:
+		_add_upgrade_runtime_effect({"kind": "mine", "source_id": mine_index, "pos": Vector2(float(mine_index), 0.0), "ttl": 5.0, "team_cap": 24})
+	var mine_cap_ok := _upgrade_effect_count("mine") == MAX_UPGRADE_MINES_PER_TEAM
+	upgrade_effects.clear()
+	for lingering_index in 20:
+		_add_upgrade_runtime_effect({"kind": "lingering", "source_id": lingering_index, "pos": Vector2(float(lingering_index), 0.0), "ttl": 5.0, "team_cap": 16})
+	var lingering_cap_ok := _upgrade_effect_count("lingering") == MAX_UPGRADE_LINGERING_PER_TEAM
+	upgrade_effects.clear()
+	for summon_index in 8:
+		var summon_kind: String = ["guardian", "auto_turret", "repair_drone"][summon_index % 3]
+		_add_upgrade_runtime_effect({"kind": summon_kind, "source_id": summon_index, "pos": Vector2(float(summon_index), 0.0), "ttl": 5.0, "team_cap": 5})
+	_test_assert(mine_cap_ok and lingering_cap_ok and _upgrade_summon_count() == MAX_UPGRADE_SUMMONS_PER_TEAM, "persistent_upgrade_effect_caps_are_enforced")
+
+	projectiles.clear()
+	upgrade_effects.clear()
+	var mine_enemy_id := _spawn_enemy("heavy", Vector2(2400.0, 2400.0), 18, Vector2(2400.0, 2400.0))
+	var mine_enemy_before := float(Dictionary(_find_enemy_by_id(mine_enemy_id))["hp"])
+	_add_upgrade_runtime_effect({"kind": "mine", "source_id": status_soldier_id, "source_kind": "archer", "pos": Vector2(2400.0, 2400.0), "ttl": 2.0, "warmup": 0.0, "scan": 0.0, "radius": 90.0, "damage": 120.0, "color": FIRE_ORANGE})
+	_update_upgrade_effects(0.11)
+	var mine_enemy_after: Variant = _find_enemy_by_id(mine_enemy_id)
+	_test_assert(mine_enemy_after != null and float(mine_enemy_after["hp"]) < mine_enemy_before and _upgrade_effect_count("mine") == 0, "armed_mine_detects_enemy_and_explodes")
+
+	var shield_test_soldier := {"id": 99001, "type": "swordsman", "pos": Vector2(2600.0, 2600.0), "hp": 100.0, "max_hp": 100.0, "defense": 0.0, "radius": 12.0, "invuln": 0.0, "upgrade_snapshot": {"base_effects": {}, "special_effects": {}}, "special_runtime": SoldierUpgradeRuntime.create_state({}, 100.0), "support_shield": 40.0, "support_shield_ttl": 4.0}
+	soldiers.append(shield_test_soldier)
+	_damage_soldier(shield_test_soldier, 25.0, shield_test_soldier["pos"] + Vector2.LEFT, "projectile")
+	_test_assert(is_equal_approx(float(shield_test_soldier["hp"]), 100.0) and float(shield_test_soldier["support_shield"]) < 40.0, "holy_and_overheal_support_shields_absorb_damage")
+
+	var summon_enemy_id := _spawn_enemy("heavy", Vector2(2800.0, 2800.0), 18, Vector2(2800.0, 2800.0))
+	var summon_enemy_before := float(Dictionary(_find_enemy_by_id(summon_enemy_id))["hp"])
+	upgrade_effects.clear()
+	status_soldier["pos"] = Vector2(2760.0, 2800.0)
+	_add_upgrade_runtime_effect({"kind": "guardian", "source_id": status_soldier_id, "source_kind": "archer", "pos": Vector2(2760.0, 2800.0), "ttl": 2.0, "warmup": 0.0, "shot_cd": 0.0, "owner_attack": 100.0, "effect": {"attack_ratio": 0.8, "attack_range": 280.0, "attack_interval": 1.0}, "color": Color("9BD7FF")})
+	_update_upgrade_effects(0.11)
+	var summon_enemy_after: Variant = _find_enemy_by_id(summon_enemy_id)
+	_test_assert(summon_enemy_after != null and float(summon_enemy_after["hp"]) < summon_enemy_before, "guardian_summon_has_real_combat_attack")
+
+	upgrade_effects.clear()
+	var repair_target := {"id": 99002, "type": "tank", "domain": "ground", "pos": Vector2(2810.0, 2800.0), "hp": 200.0, "max_hp": 400.0}
+	soldiers.append(repair_target)
+	_add_upgrade_runtime_effect({"kind": "repair_drone", "source_id": status_soldier_id, "source_kind": "archer", "pos": Vector2(2790.0, 2800.0), "ttl": 2.0, "warmup": 0.0, "owner_attack": 100.0, "effect": {"max_hp_heal_per_second": 0.10, "healing_range": 360.0}, "color": HEAL_GREEN})
+	_update_upgrade_effects(1.0)
+	_test_assert(float(repair_target["hp"]) > 200.0, "repair_drone_restores_damaged_vehicle_health")
+
+	var saved_cleanse_boss: Variant = python_boss
+	var cleanse_controller: Variant = PythonBossControllerScript.new()
+	cleanse_controller.initialize(GameConfig.PYTHON_BOSS_CONFIG, 0, 10, 73191)
+	python_boss = cleanse_controller
+	var cleanse_snapshot := {"base_effects": {}, "special_effects": {"cleanse": {"cooldown": 10.0}}}
+	status_soldier["upgrade_snapshot"] = cleanse_snapshot
+	status_soldier["upgrade_cooldowns"] = {}
+	status_soldier["burn_ttl"] = 2.0
+	status_soldier["slow_ttl"] = 2.0
+	status_soldier["paralysis_ttl"] = 2.0
+	cleanse_controller.debug_set_unit_status("soldier", status_soldier_id, {"poison_stacks": 2, "poison_ttl": 5.0, "pool_slow": 0.40, "pool_slow_ttl": 3.0, "off_balance": 0.4})
+	_update_soldier_passive_upgrades(status_soldier, 0.0)
+	var cleansed_boss_status: Dictionary = cleanse_controller.get_unit_status("soldier", status_soldier_id)
+	_test_assert(cleansed_boss_status.is_empty() and is_zero_approx(float(status_soldier.get("burn_ttl", 0.0))) and is_zero_approx(float(status_soldier.get("slow_ttl", 0.0))) and is_zero_approx(float(status_soldier.get("paralysis_ttl", 0.0))) and float(Dictionary(status_soldier.get("upgrade_cooldowns", {})).get("cleanse", 0.0)) > 0.0, "cleanse_removes_real_python_boss_and_local_statuses")
+	python_boss = saved_cleanse_boss
+
+	var saved_chaos_projectiles := chaos_runtime_projectiles.duplicate(true)
+	var saved_aionis_projectiles := aionis_runtime_projectiles.duplicate(true)
+	chaos_runtime_projectiles.clear()
+	aionis_runtime_projectiles.clear()
+	var flare_snapshot := {"base_effects": {}, "special_effects": {"air_flares": {"cooldown": 14.0}}}
+	status_soldier["upgrade_snapshot"] = flare_snapshot
+	status_soldier["upgrade_cooldowns"] = {}
+	chaos_runtime_projectiles.append({"kind": "homing_missile", "pos": Vector2(status_soldier["pos"]) + Vector2(80.0, 0.0), "homing": true, "ttl": 4.5})
+	_update_soldier_passive_upgrades(status_soldier, 0.0)
+	var chaos_flare_ok := chaos_runtime_projectiles.is_empty() and float(Dictionary(status_soldier.get("upgrade_cooldowns", {})).get("air_flares", 0.0)) > 0.0
+	status_soldier["upgrade_cooldowns"] = {}
+	aionis_runtime_projectiles.append({"kind": "aionis_reflected_shot", "pos": Vector2(status_soldier["pos"]) + Vector2(90.0, 0.0), "homing": true, "ttl": 3.2})
+	_update_soldier_passive_upgrades(status_soldier, 0.0)
+	var aionis_flare_ok := aionis_runtime_projectiles.is_empty() and float(Dictionary(status_soldier.get("upgrade_cooldowns", {})).get("air_flares", 0.0)) > 0.0
+	_test_assert(chaos_flare_ok and aionis_flare_ok, "air_flares_intercepts_real_chaos_and_aionis_homing_projectiles")
+	chaos_runtime_projectiles.append_array(saved_chaos_projectiles)
+	aionis_runtime_projectiles.append_array(saved_aionis_projectiles)
+
+	var boss_upgrade_paths := _self_test_soldier_boss_execution_and_lifesteal()
+	_test_assert(bool(boss_upgrade_paths.get("python", false)) and bool(boss_upgrade_paths.get("chaos", false)) and bool(boss_upgrade_paths.get("aionis", false)), "execution_and_lifesteal_cover_all_three_boss_paths")
+
+	enemies.clear()
+	var lethal_primary_id := _spawn_enemy("grunt", Vector2(3200.0, 3200.0), 1, Vector2(3200.0, 3200.0))
+	var chain_target_id := _spawn_enemy("heavy", Vector2(3260.0, 3200.0), 1, Vector2(3260.0, 3200.0))
+	var ricochet_target_id := _spawn_enemy("heavy", Vector2(3320.0, 3200.0), 1, Vector2(3320.0, 3200.0))
+	var lethal_primary: Variant = _find_enemy_by_id(lethal_primary_id)
+	lethal_primary["hp"] = 1.0
+	var chain_hp_before := float(Dictionary(_find_enemy_by_id(chain_target_id))["hp"])
+	var ricochet_hp_before := float(Dictionary(_find_enemy_by_id(ricochet_target_id))["hp"])
+	var lethal_followups := {"chain_lightning": {"jumps": 1, "jump_range": 180.0, "jump_damage_ratio": 0.50}, "ricochet": {"extra_targets": 1, "ricochet_range": 180.0, "ricochet_damage_ratio": 0.50}}
+	_resolve_soldier_enemy_hit(_enemy_index_by_id(lethal_primary_id), 120.0, Vector2(3200.0, 3200.0), "projectile", status_soldier_id, lethal_followups, 0.0, true)
+	_test_assert(_find_enemy_by_id(lethal_primary_id) == null and float(Dictionary(_find_enemy_by_id(chain_target_id))["hp"]) < chain_hp_before and float(Dictionary(_find_enemy_by_id(ricochet_target_id))["hp"]) < ricochet_hp_before, "chain_and_ricochet_continue_after_lethal_primary_hit")
+
+	enemies.clear()
+	var expiry_enemy_id := _spawn_enemy("heavy", Vector2(3500.0, 3500.0), 1, Vector2(3500.0, 3500.0))
+	var expiry_enemy: Variant = _find_enemy_by_id(expiry_enemy_id)
+	expiry_enemy["slow"] = 0.01
+	expiry_enemy["slow_factor"] = 0.55
+	expiry_enemy["armor_break"] = 0.01
+	expiry_enemy["armor_reduction"] = 18.0
+	expiry_enemy["soldier_corrosion_stacks"] = 3
+	_update_enemies(0.02)
+	var expiry_reset_ok := is_zero_approx(float(expiry_enemy.get("slow_factor", -1.0))) and is_zero_approx(float(expiry_enemy.get("armor_reduction", -1.0))) and int(expiry_enemy.get("soldier_corrosion_stacks", -1)) == 0
+	upgrade_effects.clear()
+	expiry_enemy["defense"] = 15.0
+	expiry_enemy["hp"] = 100.0
+	var lingering_projectile := {"allow_special_generation": true, "upgrade_impact_triggered": false, "source_id": status_soldier_id, "source_kind": "archer", "damage": 100.0, "armor_penetration": 7.0, "radius": 4.0, "color": Color.WHITE, "soldier_specials": {"lingering_projectile": {"first_hit_ratio": 0.70, "linger_duration": 2.0, "tick_interval": 0.5, "tick_damage_ratio": 0.12, "max_per_unit": 2, "team_cap": 16}}}
+	_trigger_soldier_projectile_impact_effects(lingering_projectile, Vector2(expiry_enemy["pos"]), expiry_enemy_id)
+	_apply_lingering_first_hit_damage(lingering_projectile)
+	var lingering_effect: Dictionary = upgrade_effects[0]
+	var lingering_hp_before := float(expiry_enemy["hp"])
+	_update_single_upgrade_effect(lingering_effect, 0.01)
+	var lingering_tick_damage := lingering_hp_before - float(expiry_enemy["hp"])
+	var expected_lingering_tick := _calculate_damage(12.0, 15.0 - 7.0)
+	var lingering_ok := is_equal_approx(float(lingering_projectile["damage"]), 70.0) and is_equal_approx(float(lingering_effect.get("armor_penetration", -1.0)), 7.0) and is_equal_approx(lingering_tick_damage, expected_lingering_tick) and not is_equal_approx(lingering_tick_damage, _calculate_damage(12.0, 15.0))
+	var gravity_fine := {"pull_distance": 70.0, "pull_duration": 2.5, "pull_elapsed": 0.0}
+	var gravity_coarse := gravity_fine.duplicate(true)
+	var fine_total := 0.0
+	for _gravity_tick in 25:
+		fine_total += _gravity_pull_step(gravity_fine, 0.1)
+	var coarse_total := 0.0
+	for _gravity_tick in 5:
+		coarse_total += _gravity_pull_step(gravity_coarse, 0.5)
+	_test_assert(expiry_reset_ok and lingering_ok and is_equal_approx(fine_total, 70.0) and is_equal_approx(coarse_total, 70.0), "expiration_lingering_and_gravity_numeric_semantics")
+
+	upgrade_effects.clear()
+	var guardian_snapshot := {"base_effects": {}, "special_effects": {"guardian": {"ttl": 14.0, "hp_ratio": 1.60, "attack_ratio": 0.45, "attack_range": 280.0, "attack_interval": 1.10, "max_per_owner": 2, "team_summon_cap": 5}}}
+	status_soldier["upgrade_snapshot"] = guardian_snapshot
+	status_soldier["upgrade_cooldowns"] = {}
+	_try_spawn_soldier_upgrade_summon(status_soldier, "guardian")
+	var guardian_effect: Dictionary = upgrade_effects[0]
+	var guardian_expected_hp := float(status_soldier["max_hp"]) * 1.60
+	var guardian_spawn_ok := is_equal_approx(float(guardian_effect.get("hp", 0.0)), guardian_expected_hp) and is_equal_approx(float(guardian_effect.get("max_hp", 0.0)), guardian_expected_hp)
+	_damage_guardians_in_area(Vector2(guardian_effect["pos"]), 30.0, 25.0)
+	var guardian_damage_ok := is_equal_approx(float(guardian_effect["hp"]), guardian_expected_hp - 25.0)
+	_damage_guardian(guardian_effect, guardian_expected_hp * 2.0, Vector2(guardian_effect["pos"]))
+	var guardian_death_ok := bool(guardian_effect.get("defeated", false)) and is_zero_approx(float(guardian_effect.get("hp", 1.0))) and is_zero_approx(float(guardian_effect.get("ttl", 1.0)))
+	_test_assert(guardian_spawn_ok and guardian_damage_ok and guardian_death_ok and bool(boss_upgrade_paths.get("priest_marks", false)), "guardian_health_damage_death_and_priest_marks_all_bosses")
 
 	_test_assert(GameLocalization.translate("開始遠征", "en") == "Start Expedition" and GameLocalization.translate("腐沼蟒皇・薩迦", "en") == "Corrupt Python Emperor · Saga" and GameLocalization.translate("實戰比較：重型大砲 112 傷害 ＞ 普通大砲 72 傷害", "en") == "Live-fire comparison: Heavy Cannon 112 damage > Standard Cannon 72 damage" and GameLocalization.translate("測試場景不會覆寫玩家存檔。", "en") == "Test showcases never overwrite your player save.", "english_localization_core_terms")
 	var technology_name_translations := {
@@ -10831,6 +13313,130 @@ func _run_self_test() -> void:
 	touch_special.position = _touch_special_rect().get_center()
 	_input(touch_special)
 	_test_assert(float(player["special_cd"]) > 0.0, "touch_special_button_casts_skill")
+
+	var touch_flow_screen_before := screen_size
+	var touch_flow_scale_before := touch_ui_coordinate_scale
+	var touch_flow_scheme_before := input_scheme
+	var touch_flow_tutorial_before := tutorial_visible
+	var touch_flow_command_before := soldier_command
+	var touch_flow_command_point_before := command_point
+	var touch_flow_command_target_before := command_target_id
+	var touch_flow_command_castle_before := command_castle_id
+	touch_ui_coordinate_scale = web_touch_scale
+	screen_size = Vector2(844.0 * web_touch_scale, 720.0)
+	_set_input_scheme(InputScheme.TOUCH)
+	_reset_touch_inputs()
+	mode = GameMode.PLAYING
+	active_panel = ""
+	tutorial_visible = false
+
+	player["attack_cd"] = 0.0
+	player["dash_timer"] = 0.0
+	var touch_attack_press := InputEventScreenTouch.new()
+	touch_attack_press.index = 51
+	touch_attack_press.pressed = true
+	touch_attack_press.position = _touch_aim_center() + Vector2.UP * TOUCH_STICK_RADIUS * web_touch_scale
+	_input(touch_attack_press)
+	var touch_attack_pressed_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var touch_attack_pressed_input := Dictionary(Dictionary(touch_attack_pressed_state_value).get("input", {})) if touch_attack_pressed_state_value is Dictionary else {}
+	var touch_attack_pressed_controls := Dictionary(touch_attack_pressed_input.get("virtual_controls", {}))
+	var touch_attack_pressed_control := Dictionary(touch_attack_pressed_controls.get("attack", {}))
+	var touch_attack_render_pressed_ok := bool(touch_attack_pressed_input.get("attack_held", false)) and bool(touch_attack_pressed_control.get("held", false)) and int(touch_attack_pressed_control.get("pointer", -1)) == 51 and Dictionary(touch_attack_pressed_controls.get("utility", {})).size() == 10
+	var touch_attack_aim_ok := attack_held and touch_aim_pointer == 51 and touch_aim_vector.is_equal_approx(Vector2.UP)
+	_update_player(0.02)
+	var touch_attack_executed := float(player["attack_cd"]) > 0.0 and Vector2(player["facing"]).dot(Vector2.UP) > 0.99
+	var touch_attack_release := InputEventScreenTouch.new()
+	touch_attack_release.index = 51
+	touch_attack_release.pressed = false
+	touch_attack_release.position = touch_attack_press.position
+	_input(touch_attack_release)
+	var touch_attack_released_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var touch_attack_released_input := Dictionary(Dictionary(touch_attack_released_state_value).get("input", {})) if touch_attack_released_state_value is Dictionary else {}
+	var touch_attack_released_control := Dictionary(Dictionary(touch_attack_released_input.get("virtual_controls", {})).get("attack", {}))
+	player["attack_cd"] = 0.0
+	_update_player(0.02)
+	var touch_attack_stopped := not attack_held and touch_aim_pointer < 0 and not bool(touch_attack_released_input.get("attack_held", true)) and not bool(touch_attack_released_control.get("held", true)) and is_zero_approx(float(player["attack_cd"]))
+	_test_assert(touch_attack_render_pressed_ok and touch_attack_aim_ok and touch_attack_executed and touch_attack_stopped, "touch_attack_stick_holds_aims_attacks_and_stops_on_release")
+
+	var touch_command_entry := InputEventScreenTouch.new()
+	touch_command_entry.index = 52
+	touch_command_entry.pressed = true
+	touch_command_entry.position = Rect2(_touch_utility_rects()["command"]).get_center()
+	_input(touch_command_entry)
+	var touch_command_opened := active_panel == "command"
+	var touch_command_panel := _command_panel_rect()
+	var touch_command_choice := InputEventScreenTouch.new()
+	touch_command_choice.index = 53
+	touch_command_choice.pressed = true
+	touch_command_choice.position = _command_button_rect(1, touch_command_panel).get_center()
+	_input(touch_command_choice)
+	_test_assert(touch_command_opened and soldier_command == "防守" and active_panel.is_empty(), "touch_command_utility_opens_and_selects_order")
+
+	var touch_recruit_position_before: Vector2 = Vector2(player["pos"])
+	var touch_recruit_money_before := int(player["money"])
+	var touch_recruit_count_before := soldiers.size()
+	player["pos"] = Vector2(999999.0, 999999.0)
+	var touch_recruit_far_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var touch_recruit_far_input := Dictionary(Dictionary(touch_recruit_far_state_value).get("input", {})) if touch_recruit_far_state_value is Dictionary else {}
+	var touch_recruit_far_utility := Dictionary(Dictionary(touch_recruit_far_input.get("virtual_controls", {})).get("utility", {}))
+	var touch_recruit_far_disabled := not bool(Dictionary(touch_recruit_far_utility.get("recruit", {})).get("enabled", true))
+	player["pos"] = HOUSE_POS
+	player["money"] = 100000
+	active_panel = ""
+	last_recruit_purchase_msec = -10000
+	last_recruit_purchase_type = ""
+	var touch_recruit_entry := InputEventScreenTouch.new()
+	touch_recruit_entry.index = 54
+	touch_recruit_entry.pressed = true
+	touch_recruit_entry.position = Rect2(_touch_utility_rects()["recruit"]).get_center()
+	_input(touch_recruit_entry)
+	var touch_recruit_opened := active_panel == "recruit"
+	var touch_recruit_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var touch_recruit_state_input := Dictionary(Dictionary(touch_recruit_state_value).get("input", {})) if touch_recruit_state_value is Dictionary else {}
+	var touch_recruit_state_controls := Dictionary(touch_recruit_state_input.get("virtual_controls", {}))
+	var touch_recruit_enabled_state := bool(Dictionary(Dictionary(touch_recruit_state_controls.get("utility", {})).get("recruit", {})).get("enabled", false)) and Array(touch_recruit_state_controls.get("recruit_buy", [])).size() == _recruitable_soldier_order().size()
+	var touch_recruit_type := str(_recruitable_soldier_order()[0])
+	var touch_recruit_type_before := _count_soldier_type(touch_recruit_type)
+	var touch_recruit_cost := _soldier_recruit_cost(touch_recruit_type)
+	var touch_recruit_buy := InputEventScreenTouch.new()
+	touch_recruit_buy.index = 55
+	touch_recruit_buy.pressed = true
+	touch_recruit_buy.position = _recruit_buy_rect(0, _recruit_panel_rect()).get_center()
+	_input(touch_recruit_buy)
+	var touch_recruit_bought := _count_soldier_type(touch_recruit_type) == touch_recruit_type_before + 1 and int(player["money"]) == 100000 - touch_recruit_cost
+	_test_assert(touch_recruit_far_disabled and touch_recruit_opened and touch_recruit_enabled_state and touch_recruit_bought, "touch_recruit_utility_reports_availability_opens_and_buys")
+	if soldiers.size() > touch_recruit_count_before:
+		soldiers.resize(touch_recruit_count_before)
+	player["pos"] = touch_recruit_position_before
+	player["money"] = touch_recruit_money_before
+	active_panel = ""
+
+	var touch_pause_entry := InputEventScreenTouch.new()
+	touch_pause_entry.index = 56
+	touch_pause_entry.pressed = true
+	touch_pause_entry.position = Rect2(_touch_utility_rects()["pause"]).get_center()
+	_input(touch_pause_entry)
+	var touch_pause_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var touch_pause_state := Dictionary(touch_pause_state_value) if touch_pause_state_value is Dictionary else {}
+	var touch_pause_input := Dictionary(touch_pause_state.get("input", {}))
+	var touch_pause_controls_state := Dictionary(touch_pause_input.get("virtual_controls", {}))
+	var touch_pause_opened := mode == GameMode.PAUSED and str(touch_pause_state.get("mode", "")) == "paused" and Array(touch_pause_controls_state.get("pause_actions", [])).size() == _pause_actions().size()
+	var touch_resume := InputEventScreenTouch.new()
+	touch_resume.index = 57
+	touch_resume.pressed = true
+	touch_resume.position = _pause_button_rect(_pause_actions().find("resume")).get_center()
+	_input(touch_resume)
+	_test_assert(touch_pause_opened and mode == GameMode.PLAYING, "touch_pause_utility_opens_menu_and_resume_returns_to_play")
+
+	soldier_command = touch_flow_command_before
+	command_point = touch_flow_command_point_before
+	command_target_id = touch_flow_command_target_before
+	command_castle_id = touch_flow_command_castle_before
+	tutorial_visible = touch_flow_tutorial_before
+	screen_size = touch_flow_screen_before
+	touch_ui_coordinate_scale = touch_flow_scale_before
+	_set_input_scheme(touch_flow_scheme_before)
+	_reset_touch_inputs()
 	active_panel = "map"
 	var touch_close := InputEventScreenTouch.new()
 	touch_close.index = 43
@@ -10877,7 +13483,8 @@ func _run_self_test() -> void:
 	_input(touch_guide)
 	_test_assert(tutorial_visible, "touch_guide_button_reopens_tutorial")
 	mode = GameMode.PAUSED
-	_test_assert(_pause_button_rect(0).size.y >= 64.0 and _pause_language_rect().size.y >= 60.0, "touch_pause_targets_are_enlarged")
+	var touch_pause_css_scale := maxf(1.0, touch_ui_coordinate_scale)
+	_test_assert(_pause_button_rect(0).size.y / touch_pause_css_scale >= 44.0 and _pause_language_rect().size.y / touch_pause_css_scale >= 44.0, "touch_pause_targets_are_enlarged")
 	mode = GameMode.PLAYING
 	GameSaveManager.delete_save(invalid_path)
 	GameSaveManager.delete_save(test_path)
@@ -10915,6 +13522,123 @@ func _test_assert(condition: bool, label: String) -> void:
 	else:
 		_self_test_failed += 1
 		push_error("[FAIL] " + label)
+
+
+func _self_test_soldier_boss_execution_and_lifesteal() -> Dictionary:
+	var saved_enemies := enemies.duplicate(true)
+	var saved_python_boss: Variant = python_boss
+	var saved_chaos_boss: Variant = chaos_boss
+	var saved_aionis_boss: Variant = aionis_boss
+	var saved_final_boss_defeated := final_boss_defeated
+	var saved_timeless_gate_unlocked := timeless_gate_unlocked
+	var saved_aionis_boss_defeated := aionis_boss_defeated
+	var saved_aionis_hazards := aionis_runtime_hazards.duplicate(true)
+	var saved_boss_debuffs := soldier_boss_debuffs.duplicate(true)
+	var test_id := 99103
+	var snapshot := {"base_effects": {}, "special_effects": {
+		"execution_protocol": {"target_hp_threshold": 0.35, "damage_bonus_ratio": 0.50},
+		"lifesteal": {"lifesteal_ratio": 0.20, "max_hp_heal_cap_per_second_ratio": 0.20},
+	}}
+	var test_soldier := {
+		"id": test_id, "type": "swordsman", "pos": Vector2.ZERO,
+		"hp": 50.0, "max_hp": 100.0, "upgrade_snapshot": snapshot,
+		"special_runtime": SoldierUpgradeRuntime.create_state(snapshot, 100.0),
+		"lifesteal_window": -1, "lifesteal_used": 0.0,
+	}
+	soldiers.append(test_soldier)
+	var priest_id := 99104
+	var priest_snapshot := {"base_effects": {}, "special_effects": {"void_mark": {"duration": 4.0, "soldier_damage_taken_bonus": 0.06}, "focus_mark": {"effect_duration": 4.0, "other_ally_damage_bonus": 0.08, "boss_multiplier": 0.5}}}
+	var test_priest := {"id": priest_id, "type": "priest", "pos": Vector2.ZERO, "hp": 100.0, "max_hp": 100.0, "support_range": 520.0, "upgrade_snapshot": priest_snapshot, "upgrade_cooldowns": {}, "special_runtime": SoldierUpgradeRuntime.create_state(priest_snapshot, 100.0)}
+	soldiers.append(test_priest)
+	var results := {"python": false, "chaos": false, "aionis": false, "priest_marks": false, "priest_python": false, "priest_chaos": false, "priest_aionis": false}
+	var all_priest_marks := true
+	enemies.clear()
+	aionis_runtime_hazards.clear()
+	soldier_boss_debuffs = {}
+
+	var python_controller: Variant = PythonBossControllerScript.new()
+	python_controller.initialize(GameConfig.PYTHON_BOSS_CONFIG, 0, 10, 73192)
+	python_controller.debug_set_hp_ratio(0.20)
+	python_controller.force_engage()
+	python_boss = python_controller
+	chaos_boss = null
+	aionis_boss = null
+	final_boss_defeated = false
+	timeless_gate_unlocked = false
+	aionis_boss_defeated = false
+	var python_proxy := _active_boss_target_proxy()
+	test_priest["pos"] = Vector2(python_proxy["pos"])
+	test_priest["upgrade_cooldowns"] = {}
+	soldier_boss_debuffs = {}
+	var python_priest_cast := _try_priest_combat_mark(test_priest)
+	var python_priest_mark := python_priest_cast and float(soldier_boss_debuffs.get("void_ttl", 0.0)) > 0.0 and float(soldier_boss_debuffs.get("focus_ttl", 0.0)) > 0.0
+	results["priest_python"] = python_priest_mark
+	all_priest_marks = all_priest_marks and python_priest_mark
+	var python_context := _begin_soldier_attack(test_soldier, python_proxy, BOSS_ENTITY_ID, Vector2(python_proxy["pos"]))
+	var python_hit := _receive_active_boss_hit("upgrade_path_python", "swordsman", test_id, 240.0 * float(python_context["damage_multiplier"]), Vector2(python_proxy["pos"]), "melee")
+	results["python"] = bool(python_context.get("execution_triggered", false)) and bool(python_hit.get("accepted", false)) and float(test_soldier["hp"]) > 50.0
+
+	var chaos_controller: Variant = ChaosBossControllerScript.new()
+	chaos_controller.initialize(GameConfig.CHAOS_BOSS_CONFIG, 60, 73193)
+	chaos_controller.debug_set_hp_ratio(0.20)
+	chaos_controller.force_engage(Vector2(GameConfig.CHAOS_BOSS_CONFIG["home_position"]) + Vector2(300.0, 0.0))
+	python_boss = null
+	chaos_boss = chaos_controller
+	test_soldier["hp"] = 50.0
+	test_soldier["lifesteal_window"] = -1
+	test_soldier["lifesteal_used"] = 0.0
+	test_soldier["special_runtime"] = SoldierUpgradeRuntime.create_state(snapshot, 100.0)
+	var chaos_proxy := _active_boss_target_proxy()
+	test_priest["pos"] = Vector2(chaos_proxy["pos"])
+	test_priest["upgrade_cooldowns"] = {}
+	soldier_boss_debuffs = {}
+	var chaos_priest_cast := _try_priest_combat_mark(test_priest)
+	var chaos_priest_mark := chaos_priest_cast and float(soldier_boss_debuffs.get("void_ttl", 0.0)) > 0.0 and float(soldier_boss_debuffs.get("focus_ttl", 0.0)) > 0.0
+	results["priest_chaos"] = chaos_priest_mark
+	all_priest_marks = all_priest_marks and chaos_priest_mark
+	var chaos_context := _begin_soldier_attack(test_soldier, chaos_proxy, BOSS_ENTITY_ID, Vector2(chaos_proxy["pos"]))
+	var chaos_hit := _receive_active_boss_hit("upgrade_path_chaos", "swordsman", test_id, 240.0 * float(chaos_context["damage_multiplier"]), Vector2(chaos_proxy["pos"]), "melee")
+	results["chaos"] = bool(chaos_context.get("execution_triggered", false)) and bool(chaos_hit.get("accepted", false)) and float(test_soldier["hp"]) > 50.0
+
+	var aionis_controller: Variant = AionisBossControllerScript.new()
+	aionis_controller.initialize(GameConfig.AIONIS_BOSS_CONFIG, 80, 73194)
+	aionis_controller.debug_set_hp_ratio(0.18)
+	aionis_controller.force_engage(Vector2(GameConfig.AIONIS_BOSS_CONFIG["home_position"]) + Vector2(340.0, 0.0))
+	chaos_boss = null
+	aionis_boss = aionis_controller
+	timeless_gate_unlocked = true
+	test_soldier["hp"] = 50.0
+	test_soldier["lifesteal_window"] = -1
+	test_soldier["lifesteal_used"] = 0.0
+	test_soldier["special_runtime"] = SoldierUpgradeRuntime.create_state(snapshot, 100.0)
+	var aionis_proxy := _active_boss_target_proxy()
+	test_priest["pos"] = Vector2(aionis_proxy["pos"])
+	test_priest["upgrade_cooldowns"] = {}
+	soldier_boss_debuffs = {}
+	var aionis_priest_cast := _try_priest_combat_mark(test_priest)
+	var aionis_priest_mark := aionis_priest_cast and float(soldier_boss_debuffs.get("void_ttl", 0.0)) > 0.0 and float(soldier_boss_debuffs.get("focus_ttl", 0.0)) > 0.0
+	results["priest_aionis"] = aionis_priest_mark
+	all_priest_marks = all_priest_marks and aionis_priest_mark
+	var aionis_context := _begin_soldier_attack(test_soldier, aionis_proxy, BOSS_ENTITY_ID, Vector2(aionis_proxy["pos"]))
+	var aionis_hit := _receive_active_boss_hit("upgrade_path_aionis", "swordsman", test_id, 240.0 * float(aionis_context["damage_multiplier"]), Vector2(aionis_proxy["pos"]), "melee")
+	results["aionis"] = bool(aionis_context.get("execution_triggered", false)) and bool(aionis_hit.get("accepted", false)) and float(test_soldier["hp"]) > 50.0
+	results["priest_marks"] = all_priest_marks
+
+	for soldier_index in range(soldiers.size() - 1, -1, -1):
+		if int(soldiers[soldier_index].get("id", -1)) in [test_id, priest_id]:
+			soldiers.remove_at(soldier_index)
+	python_boss = saved_python_boss
+	chaos_boss = saved_chaos_boss
+	aionis_boss = saved_aionis_boss
+	final_boss_defeated = saved_final_boss_defeated
+	timeless_gate_unlocked = saved_timeless_gate_unlocked
+	aionis_boss_defeated = saved_aionis_boss_defeated
+	aionis_runtime_hazards.clear()
+	aionis_runtime_hazards.append_array(saved_aionis_hazards)
+	soldier_boss_debuffs = saved_boss_debuffs
+	enemies.clear()
+	enemies.append_array(saved_enemies)
+	return results
 
 
 func _self_test_chaos_boss_skills() -> Dictionary:
@@ -11512,6 +14236,16 @@ func _run_visual_smoke() -> void:
 	for i in 18:
 		var particle_angle := TAU * float(i) / 18.0
 		_spawn_particle(Vector2(showcase_castle["pos"]) + Vector2(-82, 25), Vector2.from_angle(particle_angle) * 92.0, FIRE_ORANGE, 0.8, 4.0, 1)
+	_set_input_scheme(InputScheme.TOUCH)
+	tutorial_visible = false
+	touch_move_pointer = 71
+	touch_aim_pointer = 72
+	touch_move_vector = Vector2(-0.72, -0.69)
+	touch_aim_vector = Vector2(0.78, -0.63)
+	queue_redraw()
+	var touch_controls_ok: bool = await _capture_visual_frame("/tmp/infinite-legion-touch-virtual-controls.png")
+	_reset_touch_inputs()
+	_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
 	queue_redraw()
 	var battle_ok: bool = await _capture_visual_frame("/tmp/infinite-legion-battle.png")
 
@@ -11978,7 +14712,7 @@ func _run_visual_smoke() -> void:
 	queue_redraw()
 	var command_panel_english_ok: bool = await _capture_visual_frame("/tmp/infinite-legion-command-panel-en.png")
 	language = "zh_TW"
-	var all_visual_ok := class_ok and touch_class_ok and battle_ok and sparse_lairs_ok and map_tiers_ok and castle_20_ok and castle_30_ok and castle_35_ok and castle_40_ok and castle_40_breached_ok and friendly_gate_ok and city_garrison_ok and siege_order_ok and castle_45_ok and castle_50_ok and prediction_ai_ok and terrain_rules_ok and saga_lair_ok and boss_ok and boss_damage_ok and recruit_field_ok and recruit_ok and recruit_english_ok and command_panel_ok and command_panel_english_ok
+	var all_visual_ok := class_ok and touch_class_ok and touch_controls_ok and battle_ok and sparse_lairs_ok and map_tiers_ok and castle_20_ok and castle_30_ok and castle_35_ok and castle_40_ok and castle_40_breached_ok and friendly_gate_ok and city_garrison_ok and siege_order_ok and castle_45_ok and castle_50_ok and prediction_ai_ok and terrain_rules_ok and saga_lair_ok and boss_ok and boss_damage_ok and recruit_field_ok and recruit_ok and recruit_english_ok and command_panel_ok and command_panel_english_ok
 	if all_visual_ok:
 		print("VISUAL_SMOKE_PASS")
 	else:

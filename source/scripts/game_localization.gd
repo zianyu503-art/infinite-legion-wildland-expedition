@@ -23,6 +23,7 @@ const EXACT_EN: Dictionary = {
 	"軍令鈕循環切換跟隨、防守、攻擊與撤退": "Orders cycle through Follow, Defend, Attack and Retreat",
 	"軍令鈕可選跟隨、防守、攻擊、撤退、駐守與攻城": "Orders offer Follow, Defend, Attack, Retreat, Garrison and Siege",
 	"裝置接上鍵盤或滑鼠後會自動切換": "Keyboard or mouse input switches controls automatically",
+	"兵強→特殊：購買後重新招募，戰鬥時自動觸發": "Troops → Special: buy, recruit again, then abilities trigger automatically",
 	"隱藏通知（N）": "Hide Notices (N)",
 	"顯示通知（N）": "Show Notices (N)",
 	"通知關": "Notices Off",

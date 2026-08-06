@@ -1976,6 +1976,45 @@ func get_unit_status(kind: String, id: int) -> Dictionary:
 	return _status_for(_unit_key(kind, id)).duplicate(true)
 
 
+func cleanse_unit_status(kind: String, id: int) -> Dictionary:
+	var key := _unit_key(kind, id)
+	var status := _status_for(key)
+	if status.is_empty():
+		return {"cleansed": false, "removed": []}
+	var removed: Array[String] = []
+	if int(status.get("poison_stacks", 0)) > 0 or float(status.get("poison_ttl", 0.0)) > 0.0:
+		status["poison_stacks"] = 0
+		status["poison_ttl"] = 0.0
+		status["poison_tick"] = 1.0
+		removed.append("poison")
+	if float(status.get("pool_slow_ttl", 0.0)) > 0.0 or float(status.get("pool_slow", 0.0)) > 0.0:
+		status["pool_slow_ttl"] = 0.0
+		status["pool_slow"] = 0.0
+		removed.append("slow")
+	if float(status.get("off_balance", 0.0)) > 0.0:
+		status["off_balance"] = 0.0
+		removed.append("off_balance")
+	if (
+		int(status.get("poison_stacks", 0)) <= 0
+		and float(status.get("control_immunity", 0.0)) <= 0.0
+		and float(status.get("off_balance", 0.0)) <= 0.0
+		and float(status.get("pool_slow_ttl", 0.0)) <= 0.0
+		and float(status.get("constricted", 0.0)) <= 0.0
+	):
+		_unit_statuses.erase(key)
+	else:
+		_unit_statuses[key] = status
+	return {"cleansed": not removed.is_empty(), "removed": removed}
+
+
+func debug_set_unit_status(kind: String, id: int, status: Dictionary) -> void:
+	var key := _unit_key(kind, id)
+	if status.is_empty():
+		_unit_statuses.erase(key)
+	else:
+		_unit_statuses[key] = status.duplicate(true)
+
+
 func render_snapshot() -> Dictionary:
 	var globs: Array[Dictionary] = []
 	for glob in _glob_slots:

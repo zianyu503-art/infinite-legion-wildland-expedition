@@ -142,22 +142,69 @@ static func normalized_or_generated(saved: Variant, world_seed: int, castle_id: 
 	return normalized
 
 
+static func normalized_owner_or_generated(saved: Variant, world_seed: int, castle_id: String, position: Variant) -> Dictionary:
+	## A castle's current owner is allowed to differ from the nation generated for
+	## its location after an annexation. Keep that valid owner identity while
+	## canonicalizing display metadata; fall back to the geographic nation only
+	## when the saved owner is malformed.
+	var generated := metadata_for_castle(world_seed, castle_id, position)
+	if not is_valid_metadata(saved):
+		return generated
+	var stored: Dictionary = Dictionary(saved)
+	var nation_id := str(stored["id"])
+	var canonical: Dictionary
+	if nation_id == PLAYER_NATION_ID:
+		canonical = player_metadata()
+	else:
+		var index_text := nation_id.trim_prefix("nation_")
+		if not index_text.is_valid_int():
+			return generated
+		var nation_index := int(index_text)
+		if nation_index < 0 or nation_index >= _NATION_LIBRARY.size():
+			return generated
+		var nation: Dictionary = _NATION_LIBRARY[nation_index]
+		canonical = {
+			"version": VERSION,
+			"id": nation_id,
+			"name_zh": nation["name_zh"],
+			"name_en": nation["name_en"],
+			"color_hex": nation["color_hex"],
+			"capital_chunk_x": int(stored["capital_chunk_x"]),
+			"capital_chunk_y": int(stored["capital_chunk_y"]),
+		}
+	if bool(stored.get("conquered", false)):
+		canonical["conquered"] = true
+	return canonical
+
+
 static func is_valid_metadata(value: Variant) -> bool:
 	if not (value is Dictionary):
 		return false
 	var v := Dictionary(value)
-	if int(v.get("version", -1)) != VERSION:
+	for required_key in ["version", "id", "name_zh", "name_en", "color_hex", "capital_chunk_x", "capital_chunk_y"]:
+		if not v.has(required_key):
+			return false
+	if not _is_integral_number(v["version"]) or int(v["version"]) != VERSION:
 		return false
 	var nation_id := str(v.get("id", ""))
 	if nation_id.is_empty():
 		return false
-	if nation_id != PLAYER_NATION_ID and not nation_id.begins_with("nation_"):
-		return false
+	if nation_id != PLAYER_NATION_ID:
+		if not nation_id.begins_with("nation_"):
+			return false
+		var index_text := nation_id.trim_prefix("nation_")
+		if not index_text.is_valid_int():
+			return false
+		var nation_index := int(index_text)
+		if nation_index < 0 or nation_index >= _NATION_LIBRARY.size():
+			return false
 	if not _is_non_empty_string(v.get("name_zh", "")) or not _is_non_empty_string(v.get("name_en", "")):
 		return false
 	if not _is_valid_hex_color(v.get("color_hex", "")):
 		return false
-	if not (v.get("capital_chunk_x", 0) is int) or not (v.get("capital_chunk_y", 0) is int):
+	if not _is_integral_number(v["capital_chunk_x"]) or not _is_integral_number(v["capital_chunk_y"]):
+		return false
+	if v.has("conquered") and not (v["conquered"] is bool):
 		return false
 	return true
 
@@ -264,6 +311,13 @@ static func _is_non_empty_string(value: Variant) -> bool:
 		return false
 	var text := String(value).strip_edges()
 	return not text.is_empty()
+
+
+static func _is_integral_number(value: Variant) -> bool:
+	if typeof(value) not in [TYPE_INT, TYPE_FLOAT]:
+		return false
+	var number := float(value)
+	return is_finite(number) and is_equal_approx(number, roundf(number))
 
 
 static func _is_valid_hex_color(value: Variant) -> bool:
