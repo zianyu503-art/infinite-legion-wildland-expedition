@@ -36,6 +36,46 @@ function intersects(a, b) {
   );
 }
 
+function assertCampaignArenaVisuals(state, { expectHero = false } = {}) {
+  const arena = state.arena;
+  assert.ok(arena?.visuals, "arena must expose its actual visual draw contract");
+  const visuals = arena.visuals;
+  assert.equal(visuals.profile, "campaign");
+  assert.equal(visuals.soldier_renderer_id, "campaign_soldier_v1");
+  assert.equal(visuals.hero_renderer_id, "campaign_hero_v1");
+  assert.equal(visuals.map_renderer_id, "campaign_wildland_v1");
+  assert.equal(visuals.map_source, "WorldGenerator");
+  assert.equal(visuals.map_style, "campaign_wildland");
+  assert.ok(Number.isInteger(visuals.world_seed));
+  assert.ok(visuals.chunk_keys.length > 0 && visuals.biome_ids.length > 0);
+  assert.ok(visuals.decoration_count > 0 && visuals.obstacle_count > 0);
+  assert.ok(visuals.rendered_chunk_keys.length > 0 && visuals.rendered_biome_ids.length > 0);
+  assert.ok(visuals.rendered_decoration_count + visuals.rendered_obstacle_count > 0);
+  assert.ok(visuals.rendered_unit_count > 0 && visuals.rendered_unit_types.length > 0);
+  const coverage = visuals.coverage;
+  assert.ok(coverage?.complete, "arena map chunks must cover every reachable camera view");
+  assert.equal(coverage.mode, arena.mode);
+  assert.ok(coverage.minimum_camera_zoom >= 0.2 && coverage.minimum_camera_zoom <= 1.0);
+  assert.ok(coverage.viewport.width > 0 && coverage.viewport.height > 0);
+  assert.equal(coverage.edge_probes_covered, coverage.edge_probe_count);
+  assert.equal(coverage.edge_probe_count, arena.mode === "challenge" ? 4 : 1);
+  const required = coverage.required_bounds;
+  const generated = coverage.generated_bounds;
+  const coverageEpsilon = 0.6;
+  assert.ok(generated.x <= required.x + coverageEpsilon);
+  assert.ok(generated.y <= required.y + coverageEpsilon);
+  assert.ok(generated.x + generated.width >= required.x + required.width - coverageEpsilon);
+  assert.ok(generated.y + generated.height >= required.y + required.height - coverageEpsilon);
+  assert.equal(arena.battlefield.profile, "campaign_wildland");
+  assert.equal(arena.battlefield.source, "WorldGenerator");
+  assert.equal(arena.battlefield.seed, visuals.world_seed);
+  assert.equal(arena.battlefield.blocking_tree_count, visuals.blocking_tree_count);
+  assert.ok(arena.units.every((unit) => unit.config_source === "GameConfig.SOLDIERS" && unit.visual_profile === "campaign"));
+  const sampledTypes = new Set(arena.units.map((unit) => unit.type));
+  assert.ok(visuals.rendered_unit_types.every((type) => sampledTypes.has(type)));
+  assert.equal(visuals.hero_rendered, expectHero);
+}
+
 function queryUrl(params) {
   const url = new URL(baseUrl);
   for (const [key, value] of Object.entries({ codex_test: "1", ...params })) {
@@ -117,6 +157,11 @@ async function runCase(name, options, test) {
   page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
   page.on("requestfailed", (request) => {
     const failure = request.failure();
+    const pathname = new URL(request.url()).pathname;
+    // Chromium can cancel a redundant engine/pack fetch after Godot has already
+    // installed and started the game. A real engine load failure still times
+    // out every state assertion below, so this does not hide load bugs.
+    if (failure?.errorText === "net::ERR_ABORTED" && (pathname.endsWith(".pck") || pathname.endsWith(".wasm"))) return;
     errors.push(`requestfailed: ${request.url()} ${failure?.errorText || ""}`);
   });
   try {
@@ -124,7 +169,7 @@ async function runCase(name, options, test) {
     await page.waitForFunction(() => typeof window.render_game_to_text === "function", null, { timeout: 30000 });
     await test(page);
     await page.screenshot({ path: path.join(artifactDir, `${name}.png`) });
-		assert.deepEqual(errors, [], `${name} emitted browser errors`);
+    assert.deepEqual(errors, [], `${name} emitted browser errors`);
 		results.push({ name, passed: true });
 		console.log(`[PASS] ${name}`);
 	} catch (error) {
@@ -260,8 +305,9 @@ await runCase(
       return option && option.rank === rankBefore + 1;
     });
     await tapLogical(page, state, state.arena.layout.primary);
-    state = await waitForState(page, (value) => value.arena?.phase === "battle");
+    state = await waitForState(page, (value) => value.arena?.phase === "battle" && value.arena?.visuals?.rendered_unit_count > 0);
     assert.equal(state.arena.no_player, true);
+    assertCampaignArenaVisuals(state);
     assert.equal(state.arena.units.some((unit) => unit.target_kind === "hero"), false);
     assert.ok(state.arena.units.some((unit) => unit.specials.includes(selectedUpgrade.id)), "upgraded soldier should carry the selected special into battle");
     state = await waitForAdvancedState(page, (value) => value.arena.active_vfx_ids.includes(selectedUpgrade.id) || value.arena.phase === "result");
@@ -276,13 +322,13 @@ await runCase(
     params: { arena_scene: "battle", arena_mode: "spectator", lang: "zh_TW" },
   },
   async (page) => {
-    await waitForState(page, (state) => state.mode === "arena" && state.arena && state.arena.phase === "battle");
-    let state = await readState(page);
+    let state = await waitForState(page, (value) => value.mode === "arena" && value.arena?.phase === "battle" && value.arena?.visuals?.rendered_unit_count > 0);
     assert.equal(state.arena.no_player, true);
     assert.equal(state.arena.hero, null);
     assert.equal(state.player, null);
     assert.ok(state.arena.teams.blue.total > 0 && state.arena.teams.red.total > 0);
     assert.equal(state.arena.units.some((unit) => unit.target_kind === "hero"), false);
+    assertCampaignArenaVisuals(state);
     state = await waitForAdvancedState(page, (value) => (
       value.arena.projectile_count > 0 ||
       value.arena.effect_count > 0 ||
@@ -305,14 +351,14 @@ await runCase(
     params: { arena_scene: "battle", arena_mode: "challenge", touch: "1", lang: "en" },
   },
   async (page) => {
-    await waitForState(page, (state) => state.mode === "arena" && state.arena && state.arena.phase === "battle");
-    const state = await readState(page);
+    const state = await waitForState(page, (value) => value.mode === "arena" && value.arena?.phase === "battle" && value.arena?.visuals?.rendered_unit_count > 0 && value.arena?.visuals?.hero_rendered === true);
     assert.equal(state.language, "en");
     assert.equal(state.arena.no_player, false);
     assert.ok(state.arena.hero && state.arena.hero.hp > 0);
     assert.equal(state.input.scheme, "touch");
     assert.equal(state.arena.layout.controls_visible, true);
     assert.ok(state.arena.layout.move_stick.width >= 44 && state.arena.layout.aim_stick.width >= 44);
+    assertCampaignArenaVisuals(state, { expectHero: true });
     const heroBefore = state.arena.hero.x;
     await tapLogical(page, state, state.arena.layout.aim_stick);
     const movedState = await waitForAdvancedState(page, (value) => value.arena.projectile_count > 0 || value.arena.effect_count > 0 || value.arena.hero.x !== heroBefore);
@@ -340,6 +386,8 @@ await runCase(
     await page.evaluate(() => window.advanceTime(500));
     const resumed = await readState(page);
     assert.ok(resumed.arena.battle_time > state.arena.battle_time, "arena battle must resume after rotating back to landscape");
+    const rendered = await waitForState(page, (value) => value.arena?.visuals?.rendered_unit_count > 0 && value.arena?.visuals?.hero_rendered === true);
+    assertCampaignArenaVisuals(rendered, { expectHero: true });
   },
 );
 

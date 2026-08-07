@@ -12,6 +12,8 @@ signal sound_requested(event_name: String, volume: float, pitch: float)
 
 const GameConfig = preload("res://scripts/game_config.gd")
 const ArenaControllerScript = preload("res://scripts/arena_controller.gd")
+const WorldGenerator = preload("res://scripts/world_generator.gd")
+const CampaignVisualRenderer = preload("res://scripts/campaign_visual_renderer.gd")
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
 const SoldierUpgradeVfxCatalog = preload("res://scripts/soldier_upgrade_vfx_catalog.gd")
 const UI_FONT_PATH := "res://assets/fonts/NotoSansTC-Regular.otf"
@@ -26,6 +28,9 @@ const PANEL := Color(0.025, 0.045, 0.060, 0.97)
 const PANEL_EDGE := Color(0.30, 0.48, 0.62, 0.92)
 const TEXT := Color("EAF6FF")
 const MUTED := Color("9CB4C2")
+const MIN_BATTLE_CAMERA_ZOOM := 0.20
+const CAMPAIGN_MAP_DRAW_MARGIN := 180.0
+const CAMPAIGN_COVERAGE_EPSILON := 0.5
 
 var controller: ArenaController
 var language := "zh_TW"
@@ -36,6 +41,12 @@ var count_pages := {"blue": 0, "red": 0}
 var game_time := 0.0
 var camera_position := Vector2.ZERO
 var camera_zoom := 1.0
+var campaign_world_seed := 20260731
+var campaign_map_anchor := Vector2(480.0, 480.0)
+var campaign_world_generator: WorldGenerator
+var campaign_chunks: Dictionary = {}
+var campaign_map_summary: Dictionary = {}
+var _last_draw_trace: Dictionary = {}
 
 var move_pointer := -1
 var aim_pointer := -1
@@ -53,7 +64,17 @@ func _ready() -> void:
 	set_process(false)
 	var loaded_font: Resource = load(UI_FONT_PATH)
 	_font = loaded_font as Font if loaded_font is Font else ThemeDB.fallback_font
+	configure_campaign_world(campaign_world_seed, campaign_map_anchor)
 	visible = false
+
+
+func configure_campaign_world(seed: int, anchor: Vector2) -> void:
+	campaign_world_seed = seed
+	campaign_map_anchor = anchor
+	campaign_world_generator = WorldGenerator.new(campaign_world_seed)
+	campaign_chunks.clear()
+	campaign_map_summary.clear()
+	_last_draw_trace.clear()
 
 
 func open(requested_language: String, requested_touch_mode: bool, requested_scale: float = 1.0) -> void:
@@ -72,6 +93,9 @@ func open(requested_language: String, requested_touch_mode: bool, requested_scal
 	_reset_transient_input()
 	_sound_cooldown = 0.0
 	_last_winner = ""
+	campaign_chunks.clear()
+	campaign_map_summary.clear()
+	_last_draw_trace.clear()
 	visible = true
 	queue_redraw()
 
@@ -152,7 +176,8 @@ func handle_input(event: InputEvent) -> bool:
 				language_toggle_requested.emit()
 				return true
 			if key_event.keycode == KEY_R and controller.phase in ["battle", "result"]:
-				controller.restart_battle()
+				if controller.restart_battle():
+					_prepare_campaign_battlefield()
 				_last_winner = ""
 				sound_requested.emit("ui", 0.45, 1.0)
 				return true
@@ -226,7 +251,53 @@ func render_state() -> Dictionary:
 	state["camera"] = {"x": snappedf(camera_position.x, 0.1), "y": snappedf(camera_position.y, 0.1), "zoom": snappedf(camera_zoom, 0.001)}
 	state["selection_flow"] = ["types", "counts", "upgrades", "battle"]
 	state["layout"] = _layout_state()
+	state["visuals"] = visual_contract()
 	return state
+
+
+func visual_contract() -> Dictionary:
+	var result := {
+		"profile": CampaignVisualRenderer.PROFILE_ID,
+		"soldier_renderer_id": CampaignVisualRenderer.SOLDIER_RENDERER_ID,
+		"hero_renderer_id": CampaignVisualRenderer.HERO_RENDERER_ID,
+		"map_renderer_id": CampaignVisualRenderer.MAP_RENDERER_ID,
+		"map_source": "WorldGenerator",
+		"map_style": "campaign_wildland",
+		"world_seed": campaign_world_seed,
+		"map_anchor": {"x": snappedf(campaign_map_anchor.x, 0.1), "y": snappedf(campaign_map_anchor.y, 0.1)},
+		"chunk_keys": Array(campaign_map_summary.get("chunk_keys", [])).duplicate(),
+		"biome_ids": Array(campaign_map_summary.get("biome_ids", [])).duplicate(),
+		"decoration_count": int(campaign_map_summary.get("decoration_count", 0)),
+		"obstacle_count": int(campaign_map_summary.get("obstacle_count", 0)),
+		"blocking_tree_count": int(campaign_map_summary.get("blocking_tree_count", 0)),
+		"rendered_unit_count": int(_last_draw_trace.get("rendered_unit_count", 0)),
+		"rendered_unit_types": Array(_last_draw_trace.get("rendered_unit_types", [])).duplicate(),
+		"rendered_chunk_keys": Array(_last_draw_trace.get("rendered_chunk_keys", [])).duplicate(),
+		"rendered_biome_ids": Array(_last_draw_trace.get("rendered_biome_ids", [])).duplicate(),
+		"rendered_decoration_count": int(_last_draw_trace.get("rendered_decoration_count", 0)),
+		"rendered_obstacle_count": int(_last_draw_trace.get("rendered_obstacle_count", 0)),
+		"hero_rendered": bool(_last_draw_trace.get("hero_rendered", false)),
+		"coverage": campaign_coverage_contract(),
+	}
+	return result
+
+
+func campaign_coverage_contract() -> Dictionary:
+	var required_bounds: Rect2 = campaign_map_summary.get("coverage_required_bounds", Rect2())
+	var generated_bounds: Rect2 = campaign_map_summary.get("coverage_generated_bounds", Rect2())
+	var viewport: Vector2 = campaign_map_summary.get("coverage_viewport", Vector2.ZERO)
+	return {
+		"complete": bool(campaign_map_summary.get("coverage_complete", false)),
+		"mode": str(campaign_map_summary.get("coverage_mode", "")),
+		"minimum_camera_zoom": snappedf(float(campaign_map_summary.get("coverage_minimum_zoom", MIN_BATTLE_CAMERA_ZOOM)), 0.001),
+		"viewport": {"width": snappedf(viewport.x, 0.1), "height": snappedf(viewport.y, 0.1)},
+		"ui_scale": snappedf(float(campaign_map_summary.get("coverage_ui_scale", ui_scale)), 0.001),
+		"draw_margin": CAMPAIGN_MAP_DRAW_MARGIN,
+		"edge_probe_count": int(campaign_map_summary.get("coverage_edge_probe_count", 0)),
+		"edge_probes_covered": int(campaign_map_summary.get("coverage_edge_probes_covered", 0)),
+		"required_bounds": _rect_state(required_bounds),
+		"generated_bounds": _rect_state(generated_bounds),
+	}
 
 
 func force_test_scene(scene: String, requested_mode: String = "spectator", requested_language: String = "zh_TW", requested_touch: bool = false) -> bool:
@@ -261,7 +332,7 @@ func force_test_scene(scene: String, requested_mode: String = "spectator", reque
 				controller.adjust_upgrade(str(ability_id_value), 1, team, type_id)
 	if scene == "upgrades":
 		return true
-	return controller.start_battle(_hero_template())
+	return _start_battle_with_campaign_map()
 
 
 func _reset_transient_input() -> void:
@@ -386,7 +457,7 @@ func _activate_at(position: Vector2) -> bool:
 				controller.set_upgrade_page(controller.upgrade_page + 1, _upgrade_page_size())
 				return true
 			if _footer_primary_rect().has_point(position):
-				return controller.start_battle(_hero_template())
+				return _start_battle_with_campaign_map()
 	queue_redraw()
 	return false
 
@@ -415,7 +486,8 @@ func _activate_battle_at(position: Vector2) -> bool:
 		_reset_transient_input()
 		return true
 	if Rect2(controls["restart"]).has_point(position):
-		controller.restart_battle()
+		if controller.restart_battle():
+			_prepare_campaign_battlefield()
 		_last_winner = ""
 		_reset_transient_input()
 		return true
@@ -437,6 +509,172 @@ func _hero_template() -> Dictionary:
 		"attack_rate": float(normal.get("attack_speed", 1.6)),
 		"radius": 17.0,
 	}
+
+
+func _start_battle_with_campaign_map() -> bool:
+	if not controller.start_battle(_hero_template()):
+		return false
+	_prepare_campaign_battlefield()
+	return true
+
+
+func _battle_screen_center() -> Vector2:
+	return size * 0.5 + Vector2(0.0, 18.0 * ui_scale)
+
+
+func _spectator_camera_zoom() -> float:
+	var arena := controller.arena_rect
+	var usable := Vector2(maxf(100.0, size.x - 40.0 * ui_scale), maxf(100.0, size.y - 84.0 * ui_scale))
+	return clampf(minf(usable.x / arena.size.x, usable.y / arena.size.y), MIN_BATTLE_CAMERA_ZOOM, 1.0)
+
+
+func _coverage_camera_zoom() -> float:
+	return 1.0 if controller.mode == "challenge" else _spectator_camera_zoom()
+
+
+func _coverage_camera_centers() -> Array[Vector2]:
+	var arena := controller.arena_rect
+	if controller.mode != "challenge":
+		return [arena.get_center()]
+	return [
+		arena.position,
+		Vector2(arena.end.x, arena.position.y),
+		arena.end,
+		Vector2(arena.position.x, arena.end.y),
+	]
+
+
+func _camera_visible_local_bounds(camera_center: Vector2, zoom: float) -> Rect2:
+	var safe_zoom := maxf(MIN_BATTLE_CAMERA_ZOOM, zoom)
+	var screen_center := _battle_screen_center()
+	var top_left := camera_center - screen_center / safe_zoom
+	var bottom_right := camera_center + (size - screen_center) / safe_zoom
+	return Rect2(top_left, bottom_right - top_left).grow(CAMPAIGN_MAP_DRAW_MARGIN)
+
+
+func _merge_coverage_bounds(first: Rect2, second: Rect2) -> Rect2:
+	var minimum := Vector2(minf(first.position.x, second.position.x), minf(first.position.y, second.position.y))
+	var maximum := Vector2(maxf(first.end.x, second.end.x), maxf(first.end.y, second.end.y))
+	return Rect2(minimum, maximum - minimum)
+
+
+func _required_campaign_local_bounds() -> Rect2:
+	var centers := _coverage_camera_centers()
+	var zoom := _coverage_camera_zoom()
+	var required := _camera_visible_local_bounds(centers[0], zoom)
+	for index in range(1, centers.size()):
+		required = _merge_coverage_bounds(required, _camera_visible_local_bounds(centers[index], zoom))
+	return required
+
+
+func _rect_encloses_with_epsilon(outer: Rect2, inner: Rect2) -> bool:
+	return (
+		outer.position.x <= inner.position.x + CAMPAIGN_COVERAGE_EPSILON
+		and outer.position.y <= inner.position.y + CAMPAIGN_COVERAGE_EPSILON
+		and outer.end.x >= inner.end.x - CAMPAIGN_COVERAGE_EPSILON
+		and outer.end.y >= inner.end.y - CAMPAIGN_COVERAGE_EPSILON
+	)
+
+
+func _coverage_probe_summary(generated_local_bounds: Rect2) -> Dictionary:
+	var centers := _coverage_camera_centers()
+	var zoom := _coverage_camera_zoom()
+	var covered := 0
+	for camera_center in centers:
+		if _rect_encloses_with_epsilon(generated_local_bounds, _camera_visible_local_bounds(camera_center, zoom)):
+			covered += 1
+	return {"count": centers.size(), "covered": covered}
+
+
+func _campaign_coverage_is_current() -> bool:
+	if campaign_map_summary.is_empty() or not bool(campaign_map_summary.get("coverage_complete", false)):
+		return false
+	var recorded_viewport: Vector2 = campaign_map_summary.get("coverage_viewport", Vector2.ZERO)
+	var recorded_arena: Rect2 = campaign_map_summary.get("coverage_arena_rect", Rect2())
+	return (
+		recorded_viewport.is_equal_approx(size)
+		and is_equal_approx(float(campaign_map_summary.get("coverage_ui_scale", 0.0)), ui_scale)
+		and str(campaign_map_summary.get("coverage_mode", "")) == controller.mode
+		and recorded_arena.position.is_equal_approx(controller.arena_rect.position)
+		and recorded_arena.size.is_equal_approx(controller.arena_rect.size)
+		and is_equal_approx(float(campaign_map_summary.get("coverage_minimum_zoom", 0.0)), _coverage_camera_zoom())
+	)
+
+
+func _prepare_campaign_battlefield() -> void:
+	if campaign_world_generator == null:
+		configure_campaign_world(campaign_world_seed, campaign_map_anchor)
+	campaign_chunks.clear()
+	_last_draw_trace.clear()
+	var required_local_bounds := _required_campaign_local_bounds()
+	var campaign_bounds := Rect2(required_local_bounds.position + campaign_map_anchor, required_local_bounds.size)
+	var min_chunk := campaign_world_generator.world_to_chunk(campaign_bounds.position)
+	var max_chunk := campaign_world_generator.world_to_chunk(campaign_bounds.end)
+	var generated_world_bounds := Rect2(
+		Vector2(min_chunk) * WorldGenerator.CHUNK_SIZE,
+		Vector2(max_chunk - min_chunk + Vector2i.ONE) * WorldGenerator.CHUNK_SIZE
+	)
+	var generated_local_bounds := Rect2(generated_world_bounds.position - campaign_map_anchor, generated_world_bounds.size)
+	var coverage_probes := _coverage_probe_summary(generated_local_bounds)
+	var coverage_complete := (
+		_rect_encloses_with_epsilon(generated_local_bounds, required_local_bounds)
+		and int(coverage_probes["covered"]) == int(coverage_probes["count"])
+	)
+	var chunk_keys: Array[String] = []
+	var biome_ids: Array[String] = []
+	var decoration_count := 0
+	var obstacle_count := 0
+	var blocking_tree_count := 0
+	var arena_obstacles: Array[Dictionary] = []
+	for chunk_y in range(min_chunk.y, max_chunk.y + 1):
+		for chunk_x in range(min_chunk.x, max_chunk.x + 1):
+			var coord := Vector2i(chunk_x, chunk_y)
+			var chunk := campaign_world_generator.generate_chunk(coord)
+			var key := str(chunk["key"])
+			campaign_chunks[key] = chunk
+			chunk_keys.append(key)
+			var biome_id := str(Dictionary(chunk.get("biome", {})).get("id", ""))
+			if not biome_id.is_empty() and biome_id not in biome_ids:
+				biome_ids.append(biome_id)
+			decoration_count += Array(chunk.get("decorations", [])).size()
+			obstacle_count += Array(chunk.get("obstacles", [])).size()
+			for obstacle_value in Array(chunk.get("obstacles", [])):
+				var obstacle := Dictionary(obstacle_value)
+				var arena_position := Vector2(obstacle.get("position", Vector2.ZERO)) - campaign_map_anchor
+				if not controller.arena_rect.grow(90.0).has_point(arena_position):
+					continue
+				var arena_obstacle := {
+					"type": str(obstacle.get("type", "")),
+					"position": arena_position,
+					"radius": float(obstacle.get("radius", 0.0)),
+				}
+				arena_obstacles.append(arena_obstacle)
+				if str(arena_obstacle["type"]) == "tree":
+					blocking_tree_count += 1
+	chunk_keys.sort()
+	biome_ids.sort()
+	campaign_map_summary = {
+		"chunk_keys": chunk_keys,
+		"biome_ids": biome_ids,
+		"decoration_count": decoration_count,
+		"obstacle_count": obstacle_count,
+		"blocking_tree_count": blocking_tree_count,
+		"coverage_complete": coverage_complete,
+		"coverage_mode": controller.mode,
+		"coverage_minimum_zoom": _coverage_camera_zoom(),
+		"coverage_viewport": size,
+		"coverage_ui_scale": ui_scale,
+		"coverage_arena_rect": controller.arena_rect,
+		"coverage_required_bounds": required_local_bounds,
+		"coverage_generated_bounds": generated_local_bounds,
+		"coverage_edge_probe_count": int(coverage_probes["count"]),
+		"coverage_edge_probes_covered": int(coverage_probes["covered"]),
+	}
+	controller.set_battlefield_obstacles(arena_obstacles, {
+		"profile": "campaign_wildland",
+		"source": "WorldGenerator",
+		"seed": campaign_world_seed,
+	})
 
 
 # -----------------------------------------------------------------------------
@@ -488,10 +726,7 @@ func _team_tab_rects() -> Dictionary:
 
 
 func _all_soldier_types() -> Array[String]:
-	var result: Array[String] = []
-	result.append_array(GameConfig.SOLDIER_ORDER)
-	result.append_array(GameConfig.CHAOS_UNLOCK_SOLDIER_ORDER)
-	return result
+	return CampaignVisualRenderer.supported_soldier_types()
 
 
 func _type_rects() -> Dictionary:
@@ -829,19 +1064,18 @@ func _update_battle_camera() -> void:
 	var arena := controller.arena_rect
 	if controller.mode == "spectator" or controller.hero.is_empty():
 		camera_position = arena.get_center()
-		var usable := Vector2(maxf(100.0, size.x - 40.0 * ui_scale), maxf(100.0, size.y - 84.0 * ui_scale))
-		camera_zoom = clampf(minf(usable.x / arena.size.x, usable.y / arena.size.y), 0.20, 1.0)
+		camera_zoom = _spectator_camera_zoom()
 	else:
 		camera_position = Vector2(controller.hero.get("pos", arena.get_center()))
 		camera_zoom = 1.0
 
 
 func _world_to_view(world_position: Vector2) -> Vector2:
-	return (world_position - camera_position) * camera_zoom + size * 0.5 + Vector2(0.0, 18.0 * ui_scale)
+	return (world_position - camera_position) * camera_zoom + _battle_screen_center()
 
 
 func _view_to_world(view_position: Vector2) -> Vector2:
-	return (view_position - size * 0.5 - Vector2(0.0, 18.0 * ui_scale)) / maxf(0.001, camera_zoom) + camera_position
+	return (view_position - _battle_screen_center()) / maxf(0.001, camera_zoom) + camera_position
 
 
 func _battle_visual_scale() -> float:
@@ -851,21 +1085,46 @@ func _battle_visual_scale() -> float:
 
 
 func _draw_battle() -> void:
-	draw_rect(Rect2(Vector2.ZERO, size), Color("101B18"))
+	draw_rect(Rect2(Vector2.ZERO, size), Color("527B4A"))
 	_update_battle_camera()
+	if campaign_chunks.is_empty() or not _campaign_coverage_is_current():
+		_prepare_campaign_battlefield()
+	_last_draw_trace = {
+		"rendered_unit_count": 0,
+		"rendered_unit_types": [],
+		"rendered_chunk_keys": [],
+		"rendered_biome_ids": [],
+		"rendered_decoration_count": 0,
+		"rendered_obstacle_count": 0,
+		"hero_rendered": false,
+	}
+	var map_camera_position := campaign_map_anchor + camera_position
+	var screen_center := _battle_screen_center()
+	var chunk_keys: Array = campaign_chunks.keys()
+	chunk_keys.sort()
+	for key_value in chunk_keys:
+		var draw_result := CampaignVisualRenderer.draw_wildland_chunk(
+			self, Dictionary(campaign_chunks[key_value]), map_camera_position, screen_center,
+			camera_zoom, Rect2(Vector2.ZERO, size)
+		)
+		if not bool(draw_result.get("visible", false)):
+			continue
+		var rendered_keys: Array = _last_draw_trace["rendered_chunk_keys"]
+		rendered_keys.append(str(draw_result.get("key", "")))
+		_last_draw_trace["rendered_chunk_keys"] = rendered_keys
+		var rendered_biomes: Array = _last_draw_trace["rendered_biome_ids"]
+		var biome_id := str(draw_result.get("biome", ""))
+		if not biome_id.is_empty() and biome_id not in rendered_biomes:
+			rendered_biomes.append(biome_id)
+		_last_draw_trace["rendered_biome_ids"] = rendered_biomes
+		_last_draw_trace["rendered_decoration_count"] = int(_last_draw_trace["rendered_decoration_count"]) + int(draw_result.get("decorations_drawn", 0))
+		_last_draw_trace["rendered_obstacle_count"] = int(_last_draw_trace["rendered_obstacle_count"]) + int(draw_result.get("obstacles_drawn", 0))
 	var arena := controller.arena_rect
 	var top_left := _world_to_view(arena.position)
 	var arena_size := arena.size * camera_zoom
 	var arena_view := Rect2(top_left, arena_size)
-	draw_rect(arena_view, Color("233F32"))
-	for x_line in range(1, 12):
-		var x := arena_view.position.x + arena_view.size.x * float(x_line) / 12.0
-		draw_line(Vector2(x, arena_view.position.y), Vector2(x, arena_view.end.y), Color(0.62, 0.78, 0.56, 0.08), 1.0)
-	for y_line in range(1, 8):
-		var y := arena_view.position.y + arena_view.size.y * float(y_line) / 8.0
-		draw_line(Vector2(arena_view.position.x, y), Vector2(arena_view.end.x, y), Color(0.62, 0.78, 0.56, 0.08), 1.0)
-	draw_line(_world_to_view(Vector2(arena.get_center().x, arena.position.y)), _world_to_view(Vector2(arena.get_center().x, arena.end.y)), Color(1.0, 0.92, 0.58, 0.34), 3.0)
-	draw_rect(arena_view, Color("D8C27A"), false, maxf(3.0, 5.0 * camera_zoom))
+	draw_rect(arena_view, Color(1.0, 0.94, 0.68, 0.025))
+	draw_rect(arena_view, Color(0.92, 0.82, 0.49, 0.42), false, maxf(1.5, 3.0 * camera_zoom))
 	for effect in controller.effects:
 		_draw_arena_effect(effect)
 	for projectile in controller.projectiles:
@@ -889,34 +1148,24 @@ func _draw_arena_unit(unit: Dictionary) -> void:
 	var team := str(unit["team"])
 	var team_color := BLUE if team == "blue" else RED
 	var visual_scale := _battle_visual_scale()
-	var radius := maxf(7.5 * visual_scale, float(unit["radius"]) * camera_zoom)
-	var facing := Vector2(unit.get("aim_dir", Vector2.RIGHT)).normalized()
-	if facing.length_squared() < 0.01:
-		facing = Vector2.RIGHT if team == "blue" else Vector2.LEFT
-	var body_color := Color(GameConfig.SOLDIERS[type_id]["color"])
-	draw_circle(position, radius + 2.0 * visual_scale, Color(team_color, 0.22))
-	draw_arc(position, radius + 2.0 * visual_scale, 0.0, TAU, 22, team_color, 1.6 * visual_scale)
-	if type_id in ["cannon", "tank", "rocket", "gatling"]:
-		var rect := Rect2(position - Vector2(radius * 1.20, radius * 0.72), Vector2(radius * 2.4, radius * 1.44))
-		draw_rect(rect, body_color)
-		draw_rect(rect, team_color, false, 1.6 * visual_scale)
-		draw_line(position, position + facing * (radius + 5.0 * visual_scale), Color("E3EEF1"), maxf(2.2 * visual_scale, radius * 0.30))
-	elif type_id in ["helicopter", "bomber", "ufo"]:
-		var side := Vector2(-facing.y, facing.x)
-		var points := PackedVector2Array([position + facing * radius * 1.35, position + side * radius, position - facing * radius, position - side * radius])
-		draw_colored_polygon(points, body_color)
-		draw_polyline(PackedVector2Array([points[0], points[1], points[2], points[3], points[0]]), team_color, 1.6 * visual_scale, true)
-		draw_circle(position, radius * 0.38, Color("B9FAFF"))
-	else:
-		var side := Vector2(-facing.y, facing.x)
-		var points := PackedVector2Array([position + facing * radius, position + side * radius * 0.84, position - facing * radius * 0.80, position - side * radius * 0.84])
-		draw_colored_polygon(points, body_color)
-		draw_polyline(PackedVector2Array([points[0], points[1], points[2], points[3], points[0]]), team_color, 1.6 * visual_scale, true)
-		draw_line(position, position + facing * (radius + 2.5 * visual_scale), TEXT, 1.4 * visual_scale)
-	_draw_unit_upgrade_orbits(unit, position, radius)
-	_draw_unit_statuses(unit, position, radius)
+	var sprite_scale := maxf(camera_zoom, 0.46 if controller.mode == "spectator" else camera_zoom)
+	var body_position := position
+	if str(unit.get("domain", "ground")) == "air":
+		body_position -= Vector2(0.0, 14.0 + sin(game_time * 3.4 + int(unit.get("id", 0))) * 2.5) * sprite_scale
+	var radius := float(unit["radius"]) * sprite_scale
+	draw_circle(body_position, radius + 3.0 * sprite_scale, Color(team_color, 0.14))
+	var rendered := CampaignVisualRenderer.draw_soldier(self, unit, position, game_time, team, sprite_scale, true)
+	if rendered:
+		_last_draw_trace["rendered_unit_count"] = int(_last_draw_trace.get("rendered_unit_count", 0)) + 1
+		var rendered_types: Array = _last_draw_trace.get("rendered_unit_types", [])
+		if type_id not in rendered_types:
+			rendered_types.append(type_id)
+		_last_draw_trace["rendered_unit_types"] = rendered_types
+	draw_arc(body_position, radius + 3.0 * sprite_scale, 0.0, TAU, 22, team_color, maxf(1.2, 1.8 * sprite_scale))
+	_draw_unit_upgrade_orbits(unit, body_position, radius)
+	_draw_unit_statuses(unit, body_position, radius)
 	if float(unit["hp"]) < float(unit["max_hp"]):
-		_draw_bar(Rect2(position + Vector2(-radius - 2.0 * visual_scale, -radius - 5.0 * visual_scale), Vector2((radius + 2.0 * visual_scale) * 2.0, 2.4 * visual_scale)), float(unit["hp"]) / maxf(1.0, float(unit["max_hp"])), team_color)
+		_draw_bar(Rect2(body_position + Vector2(-radius - 2.0 * visual_scale, -radius - 5.0 * visual_scale), Vector2((radius + 2.0 * visual_scale) * 2.0, 2.4 * visual_scale)), float(unit["hp"]) / maxf(1.0, float(unit["max_hp"])), team_color)
 
 
 func _draw_unit_upgrade_orbits(unit: Dictionary, position: Vector2, radius: float) -> void:
@@ -982,7 +1231,11 @@ func _draw_arena_projectile(projectile: Dictionary) -> void:
 	var side := Vector2(-velocity.y, velocity.x)
 	var team_color := BLUE if str(projectile.get("team", "blue")) == "blue" else RED
 	var ids: Array = Array(projectile.get("vfx_layers", projectile.get("ability_ids", [])))
-	draw_line(position - velocity * 8.0 * visual_scale, position, Color(team_color, 0.65), 1.8 * visual_scale)
+	if bool(projectile.get("delayed_impact", false)):
+		_draw_campaign_bomb_drop(projectile, position, visual_scale)
+	else:
+		draw_line(position - velocity * 8.0 * visual_scale, position, Color(team_color, 0.65), 1.8 * visual_scale)
+		_draw_campaign_projectile_core(projectile, position, velocity, visual_scale)
 	var visible_count := mini(4, ids.size())
 	var first_index := posmod(floori(game_time * 4.0) + int(projectile.get("id", 0)), maxi(1, ids.size()))
 	for index in visible_count:
@@ -1022,10 +1275,76 @@ func _draw_arena_projectile(projectile: Dictionary) -> void:
 		_draw_ability_glyph(ability_id, glyph_position, 2.2 * visual_scale, 0.90)
 	if not ids.is_empty():
 		_draw_ability_glyph(str(ids[first_index]), position, 3.0 * visual_scale, 0.98)
-	else:
-		var projectile_kind := str(projectile.get("kind", ""))
-		var base_color := Color("BCEBFF") if projectile_kind == "mage_orb" else (Color("E8D39A") if projectile_kind == "arrow" else TEXT)
-		draw_circle(position, 2.4 * visual_scale, base_color)
+
+
+func _draw_campaign_bomb_drop(projectile: Dictionary, impact_position: Vector2, scale: float) -> void:
+	var initial_ttl := maxf(0.01, float(projectile.get("initial_ttl", projectile.get("ttl", 0.55))))
+	var progress := clampf(1.0 - float(projectile.get("ttl", 0.0)) / initial_ttl, 0.0, 1.0)
+	var drop_height := float(projectile.get("drop_height", 92.0)) * maxf(camera_zoom, 0.35)
+	var bomb_position := impact_position + Vector2(0.0, -drop_height * (1.0 - progress))
+	var warning_radius := clampf(float(projectile.get("aoe", 80.0)) * camera_zoom, 12.0 * scale, 120.0 * scale)
+	draw_circle(impact_position, warning_radius, Color(1.0, 0.20, 0.10, 0.045 + progress * 0.06))
+	draw_arc(impact_position, warning_radius, 0.0, TAU, 40, Color(1.0, 0.35, 0.18, 0.55 + progress * 0.35), 2.2 * scale)
+	draw_circle(impact_position, (10.0 + progress * 7.0) * scale, Color(1.0, 0.18, 0.08, 0.12))
+	var body := PackedVector2Array([
+		bomb_position + Vector2(-7.0, -13.0) * scale,
+		bomb_position + Vector2(7.0, -13.0) * scale,
+		bomb_position + Vector2(10.0, 8.0) * scale,
+		bomb_position + Vector2(0.0, 15.0) * scale,
+		bomb_position + Vector2(-10.0, 8.0) * scale,
+	])
+	draw_colored_polygon(body, Color("30373D"))
+	draw_polyline(PackedVector2Array([body[0], body[1], body[2], body[3], body[4], body[0]]), Color("14191D"), 1.8 * scale, true)
+	draw_line(bomb_position + Vector2(-7.0, -10.0) * scale, bomb_position + Vector2(-13.0, -18.0) * scale, Color("6F7A80"), 2.5 * scale)
+	draw_line(bomb_position + Vector2(7.0, -10.0) * scale, bomb_position + Vector2(13.0, -18.0) * scale, Color("6F7A80"), 2.5 * scale)
+
+
+func _draw_campaign_projectile_core(projectile: Dictionary, position: Vector2, direction: Vector2, scale: float) -> void:
+	var kind := str(projectile.get("kind", "soldier_projectile"))
+	var color := Color(projectile.get("color", TEXT))
+	match kind:
+		"arrow", "ally_arrow", "hero_arrow":
+			draw_line(position - direction * 12.0 * scale, position + direction * 6.0 * scale, color, 3.0 * scale)
+			var side := Vector2(-direction.y, direction.x)
+			var tip := position + direction * 8.0 * scale
+			draw_colored_polygon(PackedVector2Array([tip + direction * 5.0 * scale, tip - direction * 4.0 * scale + side * 3.0 * scale, tip - direction * 4.0 * scale - side * 3.0 * scale]), Color("EAF6FF"))
+		"rolling_rock":
+			var radius := float(projectile.get("radius", 11.0)) * scale
+			draw_circle(position, radius, color)
+			draw_arc(position, radius * 0.65, game_time * 8.0, game_time * 8.0 + PI, 8, Color("D6DEE3"), 1.4 * scale)
+		"cannonball":
+			draw_circle(position, 12.0 * scale, Color("343A40"))
+			draw_circle(position - direction * 6.0 * scale, 4.0 * scale, Color("A7B2BE"))
+		"musket_ball":
+			draw_line(position - direction * 19.0 * scale, position + direction * 5.0 * scale, Color("FFE9B0"), 4.0 * scale)
+			draw_circle(position + direction * 6.0 * scale, 3.0 * scale, Color.WHITE)
+		"rifle_round", "gatling_round":
+			draw_line(position - direction * 15.0 * scale, position + direction * 5.0 * scale, color, 2.4 * scale)
+			draw_circle(position + direction * 5.0 * scale, 2.0 * scale, Color.WHITE)
+		"tank_shell":
+			draw_circle(position, 10.0 * scale, Color("3B4037"))
+			draw_circle(position + direction * 4.0 * scale, 4.0 * scale, Color("C8A55A"))
+		"rocket":
+			var side := Vector2(-direction.y, direction.x)
+			var points := PackedVector2Array([
+				position - direction * 13.0 * scale - side * 6.0 * scale,
+				position + direction * 10.0 * scale - side * 6.0 * scale,
+				position + direction * 17.0 * scale,
+				position + direction * 10.0 * scale + side * 6.0 * scale,
+				position - direction * 13.0 * scale + side * 6.0 * scale,
+			])
+			draw_colored_polygon(points, Color("D85A36"))
+			draw_polyline(PackedVector2Array([points[0], points[1], points[2], points[3], points[4], points[0]]), Color("59281F"), 1.5 * scale, true)
+			draw_circle(position - direction * 13.0 * scale, (6.0 + sin(game_time * 18.0) * 1.5) * scale, Color("FF7A38"))
+			draw_circle(position - direction * 17.0 * scale, 3.5 * scale, GOLD)
+		"bomb":
+			draw_circle(position, 11.0 * scale, Color("30373D"))
+			draw_arc(position, 11.0 * scale, 0.0, TAU, 18, Color("FF6B42"), 2.0 * scale)
+		"ally_magic", "ufo_beam", "hero_magic":
+			draw_circle(position, float(projectile.get("radius", 7.0)) * scale + sin(game_time * 11.0) * 1.3 * scale, color)
+			draw_circle(position, 2.8 * scale, Color("F5FAFF"))
+		_:
+			draw_circle(position, maxf(2.4, float(projectile.get("radius", 3.0))) * scale, color)
 
 
 func _draw_arena_effect(effect: Dictionary) -> void:
@@ -1043,6 +1362,7 @@ func _draw_arena_effect(effect: Dictionary) -> void:
 		"repair_drone": _draw_repair_drone_effect(position, color, pulse)
 		"grave": _draw_grave_effect(effect, position, color, pulse)
 		"meteor": _draw_meteor_effect(effect, position, radius, color, pulse)
+		"ufo_beam": _draw_ufo_beam_effect(effect, position, radius, pulse)
 		"damage_area": _draw_damage_area_effect(ability_id, position, radius, color, pulse)
 		"delayed_area": _draw_delayed_area_effect(ability_id, position, radius, color, pulse)
 		"delayed_target": _draw_delayed_target_effect(effect, ability_id, position, color, pulse)
@@ -1053,6 +1373,28 @@ func _draw_arena_effect(effect: Dictionary) -> void:
 		draw_line(position, end, Color(color, 0.82), 1.8 * visual_scale)
 	if known:
 		_draw_ability_glyph(ability_id, position, clampf(radius * 0.24, 3.0 * visual_scale, 9.0 * visual_scale), 0.94)
+
+
+func _draw_ufo_beam_effect(effect: Dictionary, position: Vector2, radius: float, pulse: float) -> void:
+	var s := _battle_visual_scale()
+	var warmup := maxf(0.0, float(effect.get("warmup", 0.0)))
+	var beam_height := clampf(300.0 * camera_zoom, 90.0 * s, 260.0 * s)
+	if warmup > 0.0:
+		var warmup_ratio := clampf(warmup / maxf(0.01, float(effect.get("initial_warmup", 0.75))), 0.0, 1.0)
+		draw_circle(position, radius, Color(0.25, 1.0, 0.92, 0.07 + (1.0 - warmup_ratio) * 0.08))
+		draw_arc(position, radius, 0.0, TAU, 40, Color("75FFF0"), 2.5 * s)
+		draw_arc(position, radius * (0.28 + warmup_ratio * 0.72), 0.0, TAU, 32, Color("D5FFFA"), 2.8 * s)
+		draw_line(position + Vector2(0.0, -beam_height), position, Color(0.65, 1.0, 0.96, 0.25), 4.0 * s)
+		return
+	var top_left := position + Vector2(-radius * 0.44, -beam_height)
+	var top_right := position + Vector2(radius * 0.44, -beam_height)
+	var beam_points := PackedVector2Array([top_left, top_right, position + Vector2(radius, 0.0), position - Vector2(radius, 0.0)])
+	draw_colored_polygon(beam_points, Color(0.30, 1.0, 0.92, 0.20))
+	draw_line(top_left, position - Vector2(radius, 0.0), Color(0.65, 1.0, 0.96, 0.78), 3.0 * s)
+	draw_line(top_right, position + Vector2(radius, 0.0), Color(0.65, 1.0, 0.96, 0.78), 3.0 * s)
+	draw_circle(position, radius, Color(0.28, 1.0, 0.90, 0.20))
+	draw_arc(position, radius, 0.0, TAU, 44, Color("D5FFFA"), 4.0 * s)
+	draw_circle(position, (14.0 + pulse * 5.0) * s, Color("E8FFFC"))
 
 
 func _draw_mine_effect(effect: Dictionary, position: Vector2, radius: float, color: Color, pulse: float) -> void:
@@ -1192,31 +1534,12 @@ func _draw_visual_burst(ability_id: String, position: Vector2, radius: float, co
 
 func _draw_arena_hero(hero: Dictionary) -> void:
 	var position := _world_to_view(Vector2(hero["pos"]))
-	var facing := Vector2(hero.get("aim_dir", Vector2.RIGHT)).normalized()
-	var side := Vector2(-facing.y, facing.x)
 	var visual_scale := _battle_visual_scale()
-	var radius := maxf(8.0 * visual_scale, float(hero.get("radius", 17.0)) * camera_zoom)
-	var color := Color(GameConfig.HERO_CLASSES[hero_class]["color"])
+	var sprite_scale := maxf(0.7, camera_zoom)
+	var radius := float(hero.get("radius", 17.0)) * sprite_scale
 	draw_circle(position, radius + 3.5 * visual_scale, Color(BLUE, 0.22))
+	_last_draw_trace["hero_rendered"] = CampaignVisualRenderer.draw_hero(self, hero, position, game_time, "blue", sprite_scale, true)
 	draw_arc(position, radius + 3.5 * visual_scale, 0.0, TAU, 24, BLUE, 1.8 * visual_scale)
-	var points := PackedVector2Array([position + facing * radius * 1.15, position + side * radius, position - facing * radius, position - side * radius])
-	draw_colored_polygon(points, color)
-	draw_polyline(PackedVector2Array([points[0], points[1], points[2], points[3], points[0]]), TEXT, 1.5 * visual_scale, true)
-	match hero_class:
-		"warrior":
-			draw_line(position, position + facing * (radius + 6.0 * visual_scale), Color("F5F1E6"), 2.3 * visual_scale)
-			var shield_center := position - side * radius * 0.72
-			draw_circle(shield_center, radius * 0.45, Color("9AABB5"))
-			draw_arc(shield_center, radius * 0.45, 0.0, TAU, 16, GOLD, 1.4 * visual_scale)
-		"mage":
-			var orb := position + facing * (radius + 5.0 * visual_scale)
-			draw_line(position, orb, Color("8B5A2B"), 1.7 * visual_scale)
-			draw_circle(orb, (3.0 + sin(game_time * 7.0)) * visual_scale, Color("A78BFA"))
-			draw_arc(orb, 5.0 * visual_scale, game_time, game_time + 5.0, 14, Color("E9DCFF"), 1.2 * visual_scale)
-		_:
-			var bow_center := position + facing * radius * 0.72
-			draw_arc(bow_center, radius * 0.72, facing.angle() - 1.1, facing.angle() + 1.1, 14, Color("A66E36"), 1.5 * visual_scale)
-			draw_line(position, position + facing * (radius + 5.0 * visual_scale), Color("E8D39A"), 1.3 * visual_scale)
 	_draw_bar(Rect2(position + Vector2(-18.0 * visual_scale, -radius - 7.0 * visual_scale), Vector2(36.0 * visual_scale, 3.0 * visual_scale)), float(hero["hp"]) / maxf(1.0, float(hero["max_hp"])), BLUE)
 
 
@@ -1267,8 +1590,14 @@ func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color
 
 func _draw_unit_badge(type_id: String, center: Vector2, radius: float, team: String) -> void:
 	var team_color := BLUE if team == "blue" else RED
-	draw_circle(center, radius + 3.0, Color(team_color, 0.26))
-	draw_circle(center, radius, Color(GameConfig.SOLDIERS[type_id]["color"]))
+	draw_circle(center, radius + 3.0, Color(team_color, 0.18))
+	var combat: Dictionary = Dictionary(GameConfig.SOLDIERS[type_id]).get("combat", {})
+	var badge_unit := {
+		"id": type_id.hash(), "type": type_id, "radius": CampaignVisualRenderer.radius_for(type_id),
+		"domain": str(combat.get("domain", "ground")), "aim_dir": Vector2.RIGHT if team == "blue" else Vector2.LEFT,
+		"flash": 0.0,
+	}
+	CampaignVisualRenderer.draw_soldier(self, badge_unit, center + Vector2(0.0, radius * 0.08), game_time, team, radius / 48.0, false)
 	draw_arc(center, radius, 0.0, TAU, 18, team_color, 2.0)
 
 

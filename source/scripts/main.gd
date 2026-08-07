@@ -5,6 +5,7 @@ extends Node2D
 
 const GameConfig = preload("res://scripts/game_config.gd")
 const WorldGenerator = preload("res://scripts/world_generator.gd")
+const CampaignVisualRenderer = preload("res://scripts/campaign_visual_renderer.gd")
 const GameAudioManager = preload("res://scripts/audio_manager.gd")
 const GameSaveManager = preload("res://scripts/save_manager.gd")
 const GameLocalization = preload("res://scripts/game_localization.gd")
@@ -332,6 +333,7 @@ func _enter_arena() -> void:
 	_reset_touch_inputs()
 	if arena_view != null:
 		arena_view.size = screen_size
+		arena_view.configure_campaign_world(world_seed, Vector2(player.get("pos", HOUSE_POS)))
 		arena_view.open(language, _is_touch_scheme(), touch_ui_coordinate_scale)
 	audio.play("ui", 0.55)
 	queue_redraw()
@@ -1144,6 +1146,7 @@ func _web_force_arena_showcase_for_test(arguments: Array) -> bool:
 	mode = GameMode.ARENA
 	arena_view.position = Vector2.ZERO
 	arena_view.size = screen_size
+	arena_view.configure_campaign_world(world_seed, Vector2(player.get("pos", HOUSE_POS)))
 	var success := arena_view.force_test_scene(scene, arena_mode, language, requested_touch)
 	_web_manual_time_hold = 0.0
 	queue_redraw()
@@ -1490,7 +1493,9 @@ func _arena_text_state() -> Variant:
 				"id": int(unit.get("id", -1)), "type": str(unit.get("type", "")), "team": str(unit.get("team", "")),
 				"x": snappedf(position.x, 0.1), "y": snappedf(position.y, 0.1),
 				"hp": snappedf(float(unit.get("hp", 0.0)), 0.1), "max_hp": snappedf(float(unit.get("max_hp", 0.0)), 0.1),
+				"radius": snappedf(float(unit.get("radius", 0.0)), 0.1), "domain": str(unit.get("domain", "ground")),
 				"state": str(unit.get("state", "")), "target_kind": str(unit.get("target_kind", "")), "specials": unit_specials,
+				"config_source": "GameConfig.SOLDIERS", "visual_profile": CampaignVisualRenderer.PROFILE_ID,
 			})
 	var sampled_projectiles: Array[Dictionary] = []
 	for projectile in arena.projectiles:
@@ -1501,7 +1506,8 @@ func _arena_text_state() -> Variant:
 			var position := Vector2(projectile.get("pos", Vector2.ZERO))
 			sampled_projectiles.append({
 				"team": str(projectile.get("team", "")), "x": snappedf(position.x, 0.1), "y": snappedf(position.y, 0.1),
-				"target_kind": str(projectile.get("target_kind", "")), "ability_ids": ids.duplicate(),
+				"target_kind": str(projectile.get("target_kind", "")), "kind": str(projectile.get("kind", "")),
+				"ability_ids": ids.duplicate(),
 			})
 	var sampled_effects: Array[Dictionary] = []
 	for effect in arena.effects:
@@ -1553,6 +1559,7 @@ func _arena_text_state() -> Variant:
 		"unit_count": arena.units.size(), "projectile_count": arena.projectiles.size(), "effect_count": arena.effects.size(),
 		"units": sampled_units, "projectiles": sampled_projectiles, "effects": sampled_effects, "active_vfx_ids": sorted_vfx_ids,
 		"layout": Dictionary(view_state.get("layout", {})), "camera": Dictionary(view_state.get("camera", {})),
+		"visuals": Dictionary(view_state.get("visuals", {})), "battlefield": Dictionary(raw.get("battlefield", {})),
 	}
 
 
@@ -5012,19 +5019,7 @@ func _is_recruit_anchor_valid() -> bool:
 
 
 func _soldier_radius(type_id: String) -> float:
-	if type_id == "archer": return 9.0
-	if type_id in ["healer", "mage"]: return 10.0
-	if type_id == "heavy": return 15.0
-	if type_id == "musketeer": return 11.0
-	if type_id == "rifleman": return 12.0
-	if type_id == "cannon": return 19.0
-	if type_id == "tank": return 29.0
-	if type_id == "rocket": return 22.0
-	if type_id == "gatling": return 18.0
-	if type_id == "helicopter": return 30.0
-	if type_id == "bomber": return 35.0
-	if type_id == "ufo": return 38.0
-	return 11.0
+	return CampaignVisualRenderer.radius_for(type_id)
 
 
 func _find_recruit_spawn_position(type_id: String) -> Vector2:
@@ -9512,13 +9507,10 @@ func _draw_class_select() -> void:
 func _draw_world() -> void:
 	draw_rect(Rect2(Vector2.ZERO, screen_size), Color("527B4A"))
 	for chunk in active_chunks.values():
-		var origin_world := Vector2(chunk["chunk"].x * WorldGenerator.CHUNK_SIZE, chunk["chunk"].y * WorldGenerator.CHUNK_SIZE)
-		var origin_screen := _world_to_screen(origin_world)
-		var color_data: Dictionary = chunk["grass_color"]
-		var grass_color := Color(float(color_data["r"]), float(color_data["g"]), float(color_data["b"]), 1.0)
-		grass_color = grass_color.lerp(Color("607D52"), 0.22)
-		draw_rect(Rect2(origin_screen - Vector2.ONE, Vector2(WorldGenerator.CHUNK_SIZE + 2.0, WorldGenerator.CHUNK_SIZE + 2.0)), grass_color)
-		_draw_chunk_decorations(chunk)
+		CampaignVisualRenderer.draw_wildland_chunk(
+			self, Dictionary(chunk), camera_pos, screen_size * 0.5 + camera_shake_offset,
+			1.0, Rect2(Vector2.ZERO, screen_size)
+		)
 	_draw_aionis_arena_environment()
 	_draw_chaos_arena_environment()
 	_draw_python_nest_environment()
@@ -10318,6 +10310,9 @@ func _draw_aionis_boss() -> void:
 
 
 func _draw_character_icon(class_id: String, center: Vector2, scale: float, rotation: float = 0.0, flash: bool = false) -> void:
+	var shared_hero := {"class_id": class_id, "aim_dir": Vector2.from_angle(rotation), "flash": 1.0 if flash else 0.0}
+	if CampaignVisualRenderer.draw_hero(self, shared_hero, center, game_time, "blue", scale, true):
+		return
 	var main_color := Color("EAF6FF") if flash else Color(GameConfig.HERO_CLASSES[class_id]["color"])
 	_draw_ellipse_shadow(center + Vector2(5, 9) * scale, Vector2(17, 7) * scale)
 	match class_id:
@@ -10422,6 +10417,20 @@ func _draw_soldier(soldier: Dictionary) -> void:
 	var r := float(soldier["radius"])
 	var airborne := _soldier_is_air(soldier)
 	var p := ground_p - Vector2(0.0, 14.0 + sin(game_time * 3.4 + int(soldier["id"])) * 2.5) if airborne else ground_p
+	# Campaign and Arena deliberately enter the same base renderer. The legacy
+	# branch below remains only as a defensive fallback for an unknown future
+	# troop id; every current campaign troop returns true here.
+	if CampaignVisualRenderer.draw_soldier(self, soldier, ground_p, game_time, "blue", 1.0, true):
+		_draw_soldier_upgrade_overlays(soldier, p, r)
+		var shared_charge_seconds := _soldier_charge_seconds(type_id)
+		if float(soldier["charge"]) > 0.0 and shared_charge_seconds > 0.0:
+			var shared_charge_ratio := 1.0 - float(soldier["charge"]) / shared_charge_seconds
+			_draw_bar(p + Vector2(-r - 5.0, -r - 20.0), Vector2((r + 5.0) * 2.0, 5.0), shared_charge_ratio, GOLD, Color("18242A"))
+		if float(soldier["hp"]) < float(soldier["max_hp"]):
+			_draw_bar(p + Vector2(-r - 4, -r - 11), Vector2((r + 4) * 2, 4), float(soldier["hp"]) / float(soldier["max_hp"]), HEAL_GREEN, Color("18242A"))
+		if type_id in ["cannon", "musketeer", "rifleman", "tank", "rocket", "gatling", "helicopter", "bomber", "ufo"]:
+			_draw_text(str(GameConfig.SOLDIERS[type_id]["name"]), p + Vector2(0, r + 18.0), 10, Color("C9EDFF"), HORIZONTAL_ALIGNMENT_CENTER, 104.0)
+		return
 	if airborne:
 		_draw_ellipse_shadow(ground_p + Vector2(16, 25), Vector2(r * 1.2, r * 0.48))
 	else:
@@ -13778,6 +13787,8 @@ func _run_self_test() -> void:
 	# Arena setup is a strict three-confirmation flow and owns disposable team
 	# research. It must never mutate the campaign wallet or permanent upgrades.
 	var arena_controller_test := ArenaControllerScript.self_test()
+	if not bool(arena_controller_test.get("passed", false)):
+		print("ARENA_SELF_TEST_ERRORS=", JSON.stringify(arena_controller_test.get("errors", [])))
 	_test_assert(bool(arena_controller_test.get("passed", false)) and int(arena_controller_test.get("special_behaviors", 0)) == 57, "arena_controller_flow_ai_and_all_57_behavior_contracts")
 	var campaign_money_before_arena := int(player.get("money", 0))
 	var campaign_research_before_arena := JSON.stringify(soldier_research)
@@ -13858,6 +13869,26 @@ func _run_self_test() -> void:
 		arena_compatibility_mouse.position = arena_type_point
 		_input(arena_compatibility_mouse)
 		_test_assert(selected_after_touch and "ufo" in arena_view.controller.selected_types_for(arena_view.controller.active_team) and arena_view.touch_mode, "arena_touch_compatibility_mouse_cannot_double_toggle_or_hide_virtual_controls")
+		arena_view.configure_campaign_world(world_seed, HOUSE_POS)
+		var campaign_arena_ready := arena_view.force_test_scene("battle", "spectator", "zh_TW", false)
+		var campaign_visual_contract := arena_view.visual_contract()
+		var shared_soldier_types := CampaignVisualRenderer.supported_soldier_types()
+		var shared_type_contract_ok := shared_soldier_types.size() == GameConfig.SOLDIERS.size()
+		for shared_type_value in shared_soldier_types:
+			var shared_type := str(shared_type_value)
+			shared_type_contract_ok = shared_type_contract_ok and GameConfig.SOLDIERS.has(shared_type) and is_equal_approx(CampaignVisualRenderer.radius_for(shared_type), ArenaControllerScript.soldier_radius(shared_type))
+		var deterministic_arena_map_ok := not arena_view.campaign_chunks.is_empty()
+		var expected_arena_generator := WorldGenerator.new(world_seed)
+		for arena_chunk_value in arena_view.campaign_chunks.values():
+			var arena_chunk: Dictionary = Dictionary(arena_chunk_value)
+			var expected_arena_chunk := expected_arena_generator.generate_chunk(Vector2i(arena_chunk["chunk"]))
+			if arena_chunk.get("grass_color", {}) != expected_arena_chunk.get("grass_color", {}) or arena_chunk.get("biome", {}) != expected_arena_chunk.get("biome", {}) or arena_chunk.get("decorations", []) != expected_arena_chunk.get("decorations", []) or arena_chunk.get("obstacles", []) != expected_arena_chunk.get("obstacles", []):
+				deterministic_arena_map_ok = false
+				break
+		_test_assert(campaign_arena_ready and shared_type_contract_ok and str(campaign_visual_contract.get("profile", "")) == CampaignVisualRenderer.PROFILE_ID and str(campaign_visual_contract.get("soldier_renderer_id", "")) == CampaignVisualRenderer.SOLDIER_RENDERER_ID and str(campaign_visual_contract.get("map_renderer_id", "")) == CampaignVisualRenderer.MAP_RENDERER_ID, "arena_and_campaign_share_all_soldier_and_visual_renderers")
+		_test_assert(deterministic_arena_map_ok and str(campaign_visual_contract.get("map_source", "")) == "WorldGenerator" and not Array(campaign_visual_contract.get("chunk_keys", [])).is_empty() and int(campaign_visual_contract.get("decoration_count", 0)) > 0 and int(campaign_visual_contract.get("obstacle_count", 0)) > 0, "arena_map_uses_same_seeded_campaign_wildland_chunks")
+		var arena_battlefield_state := Dictionary(arena_view.controller.render_state().get("battlefield", {}))
+		_test_assert(str(arena_battlefield_state.get("profile", "")) == "campaign_wildland" and str(arena_battlefield_state.get("source", "")) == "WorldGenerator" and int(arena_battlefield_state.get("blocking_tree_count", 0)) == int(campaign_visual_contract.get("blocking_tree_count", 0)), "arena_campaign_map_trees_use_campaign_collision_rule")
 		mode = mode_before_arena_input_test
 		arena_view.close()
 		arena_view.size = screen_size

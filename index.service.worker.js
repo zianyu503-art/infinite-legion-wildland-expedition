@@ -4,7 +4,7 @@
 // Incrementing CACHE_VERSION will kick off the install event and force
 // previously cached resources to be updated from the network.
 /** @type {string} */
-const CACHE_VERSION = '1786105453|6321115';
+const CACHE_VERSION = '1786110263|15056915';
 /** @type {string} */
 const CACHE_PREFIX = 'Infinite Legion:-sw-cache-';
 const CACHE_NAME = CACHE_PREFIX + CACHE_VERSION;

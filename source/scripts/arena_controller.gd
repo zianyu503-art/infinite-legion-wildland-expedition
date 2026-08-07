@@ -8,6 +8,7 @@ extends RefCounted
 ## call update(), and draw the public units/projectiles/effects arrays.
 
 const GameConfig = preload("res://scripts/game_config.gd")
+const CampaignVisualRenderer = preload("res://scripts/campaign_visual_renderer.gd")
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
 const SoldierUpgradeRuntime = preload("res://scripts/soldier_upgrade_runtime.gd")
 const SoldierUpgradeVfxCatalog = preload("res://scripts/soldier_upgrade_vfx_catalog.gd")
@@ -82,6 +83,11 @@ var projectiles: Array[Dictionary] = []
 var effects: Array[Dictionary] = []
 var hero: Dictionary = {}
 var arena_rect := DEFAULT_ARENA_RECT
+## Campaign wilderness records supplied by ArenaView. The same rule as the
+## campaign applies here: trees block ground movement; rocks and bushes are
+## readable scenery but remain passable.
+var battlefield_obstacles: Array[Dictionary] = []
+var battlefield_profile: Dictionary = {}
 var winner := ""
 var battle_time := 0.0
 
@@ -114,6 +120,8 @@ func reset_setup() -> void:
 	}
 	upgrade_type_indices = {"blue": 0, "red": 0}
 	_clear_battle()
+	battlefield_obstacles.clear()
+	battlefield_profile.clear()
 
 
 func choose_mode(value: String) -> bool:
@@ -380,26 +388,42 @@ func render_state() -> Dictionary:
 		"effects": effects,
 		"hero": hero,
 		"no_player": hero.is_empty(),
+		"battlefield": {
+			"profile": str(battlefield_profile.get("profile", "")),
+			"source": str(battlefield_profile.get("source", "")),
+			"seed": int(battlefield_profile.get("seed", 0)),
+			"obstacle_count": battlefield_obstacles.size(),
+			"blocking_tree_count": _blocking_tree_count(),
+		},
 		"winner": winner,
 		"battle_time": battle_time,
 	}
 
 
+func set_battlefield_obstacles(obstacles: Array[Dictionary], profile: Dictionary = {}) -> void:
+	battlefield_obstacles.clear()
+	for obstacle_value in obstacles:
+		var obstacle := Dictionary(obstacle_value)
+		if typeof(obstacle.get("position")) != TYPE_VECTOR2:
+			continue
+		var radius := maxf(0.0, float(obstacle.get("radius", 0.0)))
+		if radius <= 0.0:
+			continue
+		battlefield_obstacles.append({
+			"type": str(obstacle.get("type", "")),
+			"position": Vector2(obstacle["position"]),
+			"radius": radius,
+		})
+	battlefield_profile = profile.duplicate(true)
+	for unit in units:
+		if float(unit.get("hp", 0.0)) > 0.0 and str(unit.get("domain", "ground")) != "air":
+			unit["pos"] = _nearest_open_battlefield_position(Vector2(unit["pos"]), float(unit["radius"]))
+	if not hero.is_empty() and float(hero.get("hp", 0.0)) > 0.0:
+		hero["pos"] = _nearest_open_battlefield_position(Vector2(hero["pos"]), float(hero["radius"]))
+
+
 static func soldier_radius(type_id: String) -> float:
-	match type_id:
-		"archer": return 9.0
-		"healer", "mage": return 10.0
-		"heavy": return 15.0
-		"musketeer": return 11.0
-		"rifleman": return 12.0
-		"cannon": return 19.0
-		"tank": return 29.0
-		"rocket": return 22.0
-		"gatling": return 18.0
-		"helicopter": return 30.0
-		"bomber": return 35.0
-		"ufo": return 38.0
-		_: return 11.0
+	return CampaignVisualRenderer.radius_for(type_id)
 
 
 func _resolved_team(team: String) -> String:
@@ -526,12 +550,13 @@ func _create_unit(type_id: String, team: String, position: Vector2) -> Dictionar
 		"max_hp": maximum_hp,
 		"attack": maxf(1.0, float(combat.get("attack", 10.0)) * (1.0 + output_bonus)),
 		"defense": maxf(0.0, float(combat.get("armor", 0.0)) + float(base_effects.get("armor_bonus", 0.0))),
-		"speed": maxf(1.0, float(combat.get("movement_speed", 100.0)) * (1.0 + speed_bonus)),
+		# Campaign soldiers use the same 1.35 world-movement multiplier at level 1.
+		"speed": maxf(1.0, float(combat.get("movement_speed", 100.0)) * 1.35 * (1.0 + speed_bonus)),
 		"range": attack_range,
 		"attack_rate": maxf(0.05, float(combat.get("attack_speed", 1.0)) * (1.0 + rate_bonus)),
 		"radius": soldier_radius(type_id),
 		"domain": domain,
-		"altitude": 28.0 if domain == "air" else 0.0,
+		"altitude": 38.0 if domain == "air" else 0.0,
 		"cooldown": 0.15 + float(entity_id % 7) * 0.035,
 		"state": "idle",
 		"target_id": -1,
@@ -624,6 +649,63 @@ func _clamp_to_arena(position: Vector2, radius: float) -> Vector2:
 	return Vector2(clampf(position.x, minimum.x, maximum.x), clampf(position.y, minimum.y, maximum.y))
 
 
+func _blocking_tree_count() -> int:
+	var total := 0
+	for obstacle in battlefield_obstacles:
+		if str(obstacle.get("type", "")) == "tree":
+			total += 1
+	return total
+
+
+func _position_hits_battlefield_tree(position: Vector2, radius: float) -> bool:
+	for obstacle in battlefield_obstacles:
+		if str(obstacle.get("type", "")) != "tree":
+			continue
+		if position.distance_to(Vector2(obstacle["position"])) < radius + float(obstacle["radius"]):
+			return true
+	return false
+
+
+func _move_with_battlefield_collision(position: Vector2, motion: Vector2, radius: float, domain: String = "ground") -> Vector2:
+	var result := _clamp_to_arena(position, radius)
+	if domain == "air" or battlefield_obstacles.is_empty():
+		return _clamp_to_arena(position + motion, radius)
+	# Forced movement can be much longer than a normal frame. Substeps keep
+	# dashes, knockback, and gravity pulls from tunnelling through a tree.
+	var maximum_step := maxf(4.0, radius * 0.5)
+	var step_count := maxi(1, ceili(motion.length() / maximum_step))
+	var step_motion := motion / float(step_count)
+	for _step in step_count:
+		var before := result
+		var try_x := _clamp_to_arena(result + Vector2(step_motion.x, 0.0), radius)
+		if not _position_hits_battlefield_tree(try_x, radius):
+			result.x = try_x.x
+		var try_y := _clamp_to_arena(result + Vector2(0.0, step_motion.y), radius)
+		if not _position_hits_battlefield_tree(try_y, radius):
+			result.y = try_y.y
+		if result.is_equal_approx(before):
+			break
+	return result
+
+
+func _nearest_open_battlefield_position(position: Vector2, radius: float) -> Vector2:
+	var clamped := _clamp_to_arena(position, radius)
+	if not _position_hits_battlefield_tree(clamped, radius):
+		return clamped
+	# Search far enough to escape even a dense cluster, while remaining
+	# deterministic for replay and web tests.
+	var ring_step := maxf(18.0, radius * 1.25)
+	var ring_count := maxi(8, ceili(arena_rect.size.length() / ring_step))
+	for ring in range(1, ring_count + 1):
+		var distance := float(ring) * ring_step
+		for step in 16:
+			var angle := TAU * float(step) / 16.0
+			var candidate := _clamp_to_arena(clamped + Vector2.from_angle(angle) * distance, radius)
+			if not _position_hits_battlefield_tree(candidate, radius):
+				return candidate
+	return clamped
+
+
 func _step_battle(delta: float, hero_input: Dictionary) -> void:
 	battle_time += delta
 	_tick_team_shared_cooldowns(delta)
@@ -654,7 +736,7 @@ func _update_hero(delta: float, input: Dictionary) -> void:
 	var velocity: Vector2 = movement * float(hero["speed"])
 	hero["vel"] = velocity
 	if velocity.length_squared() > 0.001:
-		hero["pos"] = _clamp_to_arena(Vector2(hero["pos"]) + velocity * delta, float(hero["radius"]))
+		hero["pos"] = _move_with_battlefield_collision(Vector2(hero["pos"]), velocity * delta, float(hero["radius"]), "ground")
 	var aim_value: Variant = input.get("aim", input.get("aim_dir", Vector2.ZERO))
 	var aim: Vector2 = aim_value if aim_value is Vector2 else Vector2.ZERO
 	if aim.length_squared() > 0.001:
@@ -688,7 +770,10 @@ func _perform_hero_melee(target: Dictionary) -> void:
 	var offset := Vector2(target["pos"]) - Vector2(hero["pos"])
 	var knockback := maxf(0.0, float(Dictionary(normal.get("effects", {})).get("knockback", 18.0)))
 	if offset.length_squared() > 0.001 and float(target.get("hp", 0.0)) > 0.0:
-		target["pos"] = _clamp_to_arena(Vector2(target["pos"]) + offset.normalized() * knockback, float(target["radius"]))
+		target["pos"] = _move_with_battlefield_collision(
+			Vector2(target["pos"]), offset.normalized() * knockback,
+			float(target["radius"]), str(target.get("domain", "ground"))
+		)
 	hero["last_attack_kind"] = "melee"
 	_add_visual_effect(visual_id, Vector2(hero["pos"]) + Vector2(hero["aim_dir"]) * 38.0, "blue", "hero_melee", 0.32)
 
@@ -786,7 +871,7 @@ func _update_unit(unit: Dictionary, delta: float) -> void:
 	var speed_factor := _unit_movement_factor(unit)
 	var velocity := direction * float(unit["speed"]) * speed_factor * arrival
 	var before := position
-	unit["pos"] = _clamp_to_arena(position + velocity * delta, float(unit["radius"]))
+	unit["pos"] = _move_with_battlefield_collision(position, velocity * delta, float(unit["radius"]), str(unit.get("domain", "ground")))
 	unit["vel"] = velocity
 	unit["state"] = "move"
 	_record_runtime_movement_in_place(unit, before.distance_to(Vector2(unit["pos"])))
@@ -953,12 +1038,36 @@ func _attack_context_ids(context: Dictionary) -> Array[String]:
 	return result
 
 
+func _campaign_projectile_profile(type_id: String) -> Dictionary:
+	match type_id:
+		"archer": return {"kind": "ally_arrow", "source_kind": "archer", "color": Color("A9D8FF"), "radius": 4.0, "speed": 720.0, "offset": 14.0, "range": 500.0, "aoe": 0.0, "pierce": 1, "falloff": 1.0, "armor_penetration": 0.0}
+		"roller": return {"kind": "rolling_rock", "source_kind": "roller", "color": Color("A7B2BE"), "radius": 11.0, "speed": 520.0, "offset": 17.0, "range": 460.0, "aoe": 0.0, "pierce": 5, "falloff": 0.82, "armor_penetration": 0.0}
+		"mage": return {"kind": "ally_magic", "source_kind": "mage", "color": Color("A78BFA"), "radius": 7.0, "speed": 500.0, "offset": 14.0, "range": 410.0, "aoe": 64.0, "pierce": 1, "falloff": 1.0, "armor_penetration": 0.0}
+		"cannon": return {"kind": "cannonball", "source_kind": "cannon", "color": Color("303A42"), "radius": 13.0, "speed": 430.0, "offset": 24.0, "range": 800.0, "aoe": float(GameConfig.SOLDIERS["cannon"]["combat"]["aoe_radius"]), "pierce": 1, "falloff": 1.0, "armor_penetration": 0.0}
+		"musketeer": return {"kind": "musket_ball", "source_kind": "musketeer", "color": Color("FFE9B0"), "radius": 4.0, "speed": 1280.0, "offset": 23.0, "range": 690.0, "aoe": 0.0, "pierce": 1, "falloff": 1.0, "armor_penetration": 22.0}
+		"rifleman": return {"kind": "rifle_round", "source_kind": "rifleman", "color": Color("FFE36B"), "radius": 3.0, "speed": 1540.0, "offset": 22.0, "range": 570.0, "aoe": 0.0, "pierce": 1, "falloff": 1.0, "armor_penetration": 8.0}
+		"tank": return {"kind": "tank_shell", "source_kind": "tank", "color": Color("3B4037"), "radius": 12.0, "speed": 540.0, "offset": 38.0, "range": 760.0, "aoe": float(GameConfig.SOLDIERS["tank"]["combat"]["aoe_radius"]), "pierce": 1, "falloff": 1.0, "armor_penetration": 16.0}
+		"rocket": return {"kind": "rocket", "source_kind": "rocket", "color": Color("D85A36"), "radius": 11.0, "speed": 440.0, "offset": 32.0, "range": 860.0, "aoe": float(GameConfig.SOLDIERS["rocket"]["combat"]["aoe_radius"]), "pierce": 1, "falloff": 1.0, "armor_penetration": 12.0}
+		"gatling", "helicopter": return {"kind": "gatling_round", "source_kind": type_id, "color": Color("83E8FF"), "radius": 3.2, "speed": 1580.0, "offset": 30.0, "range": 650.0, "aoe": 0.0, "pierce": 1, "falloff": 1.0, "armor_penetration": 7.0}
+		"bomber": return {"kind": "bomb", "source_kind": "bomber", "color": Color("385D77"), "radius": 12.0, "speed": 0.0, "offset": 0.0, "range": 1.0, "aoe": float(GameConfig.SOLDIERS["bomber"]["combat"]["aoe_radius"]), "pierce": 1, "falloff": 1.0, "armor_penetration": 0.0}
+		"ufo": return {"kind": "ufo_beam", "source_kind": "ufo", "color": Color("75E8FF"), "radius": 7.0, "speed": 0.0, "offset": 0.0, "range": 1.0, "aoe": float(GameConfig.SOLDIERS["ufo"]["combat"]["aoe_radius"]), "pierce": 1, "falloff": 1.0, "armor_penetration": 10.0}
+		_: return {"kind": "soldier_projectile", "source_kind": type_id, "color": Color("EAF6FF"), "radius": PROJECTILE_RADIUS, "speed": DEFAULT_PROJECTILE_SPEED, "offset": 5.0, "range": 500.0, "aoe": 0.0, "pierce": 1, "falloff": 1.0, "armor_penetration": 0.0}
+
+
 func _spawn_unit_projectiles(unit: Dictionary, target: Dictionary, target_kind: String, attack_context: Dictionary, trigger_ids: Array[String]) -> void:
 	var snapshot: Dictionary = unit["upgrade_snapshot"]
+	var type_id := str(unit["type"])
+	var projectile_profile := _campaign_projectile_profile(type_id)
 	var ability_ids := SoldierUpgradeVfxCatalog.active_ids(snapshot, "projectile", 57)
 	for trigger_id in trigger_ids:
 		if trigger_id not in ability_ids:
 			ability_ids.append(trigger_id)
+	if type_id == "bomber":
+		_spawn_bomber_barrage(unit, target, target_kind, attack_context, ability_ids, projectile_profile)
+		return
+	if type_id == "ufo":
+		_spawn_ufo_beam(unit, target, attack_context, ability_ids, projectile_profile)
+		return
 	var split_effect := _special(unit, "split_shot")
 	var extra_projectiles := 0
 	var spread_degrees := 12.0
@@ -979,21 +1088,24 @@ func _spawn_unit_projectiles(unit: Dictionary, target: Dictionary, target_kind: 
 			split_damage_multiplier = clampf(float(split_effect.get("damage_ratio", 0.12)), 0.0, 1.0)
 		var data := {
 			"id": _take_entity_id(),
-			"pos": Vector2(unit["pos"]) + direction * (float(unit["radius"]) + 5.0),
-			"vel": direction * _projectile_speed_for_type(str(unit["type"])),
+			"pos": Vector2(unit["pos"]) + direction * float(projectile_profile["offset"]),
+			"vel": direction * float(projectile_profile["speed"]),
 			"team": str(unit["team"]),
 			"source_id": int(unit["id"]),
-			"source_kind": "soldier",
+			"source_kind": str(projectile_profile["source_kind"]),
 			"target_id": int(target.get("id", 0)),
 			"target_kind": target_kind,
 			"damage": float(unit["attack"]) * _rally_damage_multiplier(unit) * split_damage_multiplier,
-			"range": float(unit["range"]),
-			"radius": PROJECTILE_RADIUS,
-			"ttl": maxf(1.0, float(unit["range"]) / maxf(1.0, _projectile_speed_for_type(str(unit["type"]))) + 1.0),
-			"aoe": float(Dictionary(unit.get("combat", {})).get("aoe_radius", 0.0)),
-			"pierce": maxi(1, int(Dictionary(unit.get("combat", {})).get("pierce", 1))),
-			"remaining_hits": maxi(1, int(Dictionary(unit.get("combat", {})).get("pierce", 1))),
-			"falloff": 1.0 - clampf(float(Dictionary(unit.get("combat", {})).get("damage_falloff", 0.0)), 0.0, 0.95),
+			"range": float(projectile_profile["range"]),
+			"radius": float(projectile_profile["radius"]),
+			"kind": str(projectile_profile["kind"]),
+			"color": Color(projectile_profile["color"]),
+			"ttl": maxf(1.0, float(projectile_profile["range"]) / maxf(1.0, float(projectile_profile["speed"])) + 1.0),
+			"aoe": float(projectile_profile["aoe"]),
+			"pierce": maxi(1, int(projectile_profile["pierce"])),
+			"remaining_hits": maxi(1, int(projectile_profile["pierce"])),
+			"falloff": float(projectile_profile["falloff"]),
+			"armor_penetration": float(projectile_profile["armor_penetration"]),
 			"hit_ids": {},
 			"ability_ids": ability_ids.duplicate(),
 			"vfx_layers": ability_ids.duplicate(),
@@ -1001,6 +1113,54 @@ func _spawn_unit_projectiles(unit: Dictionary, target: Dictionary, target_kind: 
 		var decorated := SoldierUpgradeRuntime.decorate_projectile(data, unit, attack_context)
 		decorated["remaining_hits"] = maxi(1, int(decorated.get("pierce", decorated.get("remaining_hits", 1))))
 		projectiles.append(decorated)
+
+
+func _spawn_bomber_barrage(unit: Dictionary, target: Dictionary, target_kind: String, attack_context: Dictionary, ability_ids: Array[String], profile: Dictionary) -> void:
+	var direction := (Vector2(target["pos"]) - Vector2(unit["pos"])).normalized()
+	if direction.length_squared() < 0.001:
+		direction = Vector2(unit.get("aim_dir", Vector2.RIGHT))
+	var side := Vector2(-direction.y, direction.x)
+	for bomb_index in 3:
+		if projectiles.size() >= MAX_PROJECTILES:
+			break
+		var impact_position := Vector2(target["pos"]) + direction * (float(bomb_index) - 1.0) * 52.0 + side * (-34.0 + float(bomb_index) * 34.0)
+		var delay := 0.55 + float(bomb_index) * 0.24
+		var data := {
+			"id": _take_entity_id(), "kind": "bomb", "source_kind": "bomber",
+			"source_id": int(unit["id"]), "team": str(unit["team"]),
+			"target_id": int(target.get("id", 0)), "target_kind": target_kind,
+			"pos": impact_position, "impact_pos": impact_position, "vel": Vector2.ZERO,
+			"damage": float(unit["attack"]) * _rally_damage_multiplier(unit) * (0.82 + float(bomb_index) * 0.09),
+			"range": 1.0, "radius": float(profile["radius"]), "aoe": float(profile["aoe"]),
+			"pierce": 1, "remaining_hits": 1, "falloff": 1.0,
+			"armor_penetration": float(profile["armor_penetration"]),
+			"color": Color(profile["color"]), "ttl": delay, "initial_ttl": delay,
+			"delayed_impact": true, "drop_height": 92.0, "hit_ids": {},
+			"ability_ids": ability_ids.duplicate(), "vfx_layers": ability_ids.duplicate(),
+		}
+		projectiles.append(SoldierUpgradeRuntime.decorate_projectile(data, unit, attack_context))
+
+
+func _spawn_ufo_beam(unit: Dictionary, target: Dictionary, attack_context: Dictionary, ability_ids: Array[String], profile: Dictionary) -> void:
+	if effects.size() >= MAX_EFFECTS:
+		return
+	var payload := SoldierUpgradeRuntime.decorate_projectile({
+		"source_id": int(unit["id"]), "source_kind": "ufo", "team": str(unit["team"]),
+		"damage": float(unit["attack"]) * _rally_damage_multiplier(unit),
+		"aoe": float(profile["aoe"]), "armor_penetration": float(profile["armor_penetration"]),
+		"ability_ids": ability_ids.duplicate(), "vfx_layers": ability_ids.duplicate(),
+	}, unit, attack_context)
+	effects.append({
+		"id": _take_entity_id(), "kind": "ufo_beam", "ability_id": "ufo_beam",
+		"ability_ids": ability_ids.duplicate(), "vfx_layers": ability_ids.duplicate(),
+		"team": str(unit["team"]), "source_id": int(unit["id"]), "source_kind": "ufo",
+		"pos": Vector2(target["pos"]), "radius": float(payload["aoe"]),
+		"ttl": 2.5, "warmup": 0.75, "initial_warmup": 0.75, "tick": 0.0, "interval": 0.35,
+		"damage": float(payload["damage"]), "armor_penetration": float(payload["armor_penetration"]),
+		"soldier_specials": Dictionary(payload.get("soldier_specials", {})).duplicate(true),
+		"soldier_attack_context": Dictionary(payload.get("soldier_attack_context", {})).duplicate(true),
+		"attack_sequence": int(payload.get("attack_sequence", 0)), "triggered_specials": {},
+	})
 
 
 func _spawn_basic_projectile(
@@ -1037,13 +1197,7 @@ func _spawn_basic_projectile(
 
 
 func _projectile_speed_for_type(type_id: String) -> float:
-	if type_id in ["cannon", "tank", "rocket", "bomber"]:
-		return 500.0
-	if type_id in ["musketeer", "rifleman", "gatling", "helicopter"]:
-		return 940.0
-	if type_id == "ufo":
-		return 1100.0
-	return DEFAULT_PROJECTILE_SPEED
+	return float(_campaign_projectile_profile(type_id).get("speed", DEFAULT_PROJECTILE_SPEED))
 
 
 func _perform_support_action(unit: Dictionary) -> bool:
@@ -1409,7 +1563,13 @@ func _spawn_guardian(source: Dictionary, effect: Dictionary) -> bool:
 	var team_cap := mini(MAX_SUMMONS_PER_TEAM, maxi(1, int(effect.get("team_summon_cap", MAX_SUMMONS_PER_TEAM))))
 	if units.size() >= MAX_BATTLE_UNITS or per_owner >= owner_cap or _team_active_summons(team) >= team_cap:
 		return false
-	var position := _clamp_to_arena(Vector2(source["pos"]) + Vector2(0.0, float(source["radius"]) + 28.0), soldier_radius("swordsman"))
+	var guardian_radius := soldier_radius("swordsman")
+	var position := _nearest_open_battlefield_position(
+		Vector2(source["pos"]) + Vector2(0.0, float(source["radius"]) + 28.0),
+		guardian_radius
+	)
+	if _position_hits_battlefield_tree(position, guardian_radius):
+		return false
 	var guardian := _create_unit("swordsman", team, position)
 	guardian["hp"] = float(source["max_hp"]) * maxf(0.1, float(effect.get("hp_ratio", 0.45)))
 	guardian["max_hp"] = guardian["hp"]
@@ -1489,6 +1649,11 @@ func _update_projectiles(delta: float) -> void:
 	for index in range(projectiles.size() - 1, -1, -1):
 		var projectile := projectiles[index]
 		projectile["ttl"] = float(projectile.get("ttl", 0.0)) - delta
+		if bool(projectile.get("delayed_impact", false)):
+			if float(projectile["ttl"]) <= 0.0:
+				_detonate_delayed_projectile(projectile)
+				projectiles.remove_at(index)
+			continue
 		if float(projectile["ttl"]) <= 0.0:
 			projectiles.remove_at(index)
 			continue
@@ -1511,9 +1676,20 @@ func _update_projectiles(delta: float) -> void:
 			projectile["vel"] = Vector2.from_angle(new_angle) * speed
 		var before := Vector2(projectile["pos"])
 		var after := before + Vector2(projectile["vel"]) * delta
-		projectile["pos"] = after
 		var collision_radius := float(projectile.get("radius", PROJECTILE_RADIUS)) + float(target.get("radius", 14.0))
-		if _distance_squared_to_segment(Vector2(target["pos"]), before, after) <= collision_radius * collision_radius:
+		var target_hit_fraction := _segment_circle_hit_fraction(before, after, Vector2(target["pos"]), collision_radius)
+		var tree_hit_fraction := _first_projectile_tree_hit_fraction(projectile, before, after)
+		if tree_hit_fraction <= 1.0 and tree_hit_fraction <= target_hit_fraction:
+			projectile["pos"] = before.lerp(after, tree_hit_fraction)
+			_add_visual_effect(
+				_first_visual_id(Array(projectile.get("ability_ids", [])), "impact"),
+				Vector2(projectile["pos"]), str(projectile.get("team", "blue")), "terrain_impact", 0.32
+			)
+			projectiles.remove_at(index)
+			continue
+		projectile["pos"] = after
+		if target_hit_fraction <= 1.0:
+			projectile["pos"] = before.lerp(after, target_hit_fraction)
 			_impact_projectile(projectile, target, str(projectile.get("target_kind", "unit")))
 			if int(projectile.get("remaining_hits", 0)) <= 0:
 				projectiles.remove_at(index)
@@ -1526,6 +1702,34 @@ func _update_projectiles(delta: float) -> void:
 			projectile["target_id"] = int(next_target["id"])
 		if not arena_rect.grow(120.0).has_point(Vector2(projectile["pos"])):
 			projectiles.remove_at(index)
+
+
+func _detonate_delayed_projectile(projectile: Dictionary) -> void:
+	var position := Vector2(projectile.get("impact_pos", projectile.get("pos", Vector2.ZERO)))
+	var radius := maxf(0.0, float(projectile.get("aoe", 0.0)))
+	var base_damage := maxf(0.0, float(projectile.get("damage", 0.0)))
+	var armor_penetration := maxf(0.0, float(projectile.get("armor_penetration", 0.0)))
+	var source := _source_record(projectile)
+	var ability_ids: Array = projectile.get("ability_ids", [])
+	var opposing_team := "red" if str(projectile.get("team", "blue")) == "blue" else "blue"
+	for target_id_value in Array(_team_unit_ids[opposing_team]):
+		var target_id := int(target_id_value)
+		if not _unit_by_id.has(target_id):
+			continue
+		var target: Dictionary = _unit_by_id[target_id]
+		var distance := position.distance_to(Vector2(target["pos"]))
+		if float(target.get("hp", 0.0)) <= 0.0 or distance > radius + float(target["radius"]):
+			continue
+		var radial_falloff := lerpf(1.0, 0.68, clampf(distance / maxf(radius, 1.0), 0.0, 1.0))
+		var dealt := _damage_unit(target, base_damage * radial_falloff, "area", source, armor_penetration, ability_ids)
+		if not source.is_empty():
+			_apply_lifesteal(source, dealt)
+		_apply_projectile_specials(projectile, target, "unit", dealt)
+	if str(projectile.get("team", "blue")) == "red" and mode == "challenge" and not hero.is_empty() and float(hero.get("hp", 0.0)) > 0.0:
+		var hero_distance := position.distance_to(Vector2(hero["pos"]))
+		if hero_distance <= radius + float(hero["radius"]):
+			_damage_hero(base_damage * lerpf(1.0, 0.68, clampf(hero_distance / maxf(radius, 1.0), 0.0, 1.0)), source, ability_ids)
+	_add_visual_effect(_first_visual_id(ability_ids, "impact"), position, str(projectile.get("team", "blue")), "explosion", 0.9)
 
 
 func _projectile_next_target(projectile: Dictionary) -> Dictionary:
@@ -1587,7 +1791,7 @@ func _impact_projectile(projectile: Dictionary, target: Dictionary, target_kind:
 
 	var aoe := maxf(0.0, float(projectile.get("aoe", 0.0)))
 	if aoe > 0.0:
-		_damage_area(str(projectile["team"]), Vector2(target["pos"]), aoe, damage * 0.62, source, ability_ids, int(target.get("id", -1)))
+		_damage_area(str(projectile["team"]), Vector2(target["pos"]), aoe, damage * 0.62, source, ability_ids, int(target.get("id", -1)), float(projectile.get("armor_penetration", 0.0)))
 	projectile["remaining_hits"] = int(projectile.get("remaining_hits", 1)) - 1
 	projectile["damage"] = damage * clampf(float(projectile.get("falloff", 1.0)), 0.0, 1.0)
 
@@ -1665,7 +1869,10 @@ func _damage_unit(unit: Dictionary, amount: float, damage_kind: String, source: 
 		var side_sign := -1.0 if int(unit["id"]) % 2 == 0 else 1.0
 		var facing := Vector2(unit.get("aim_dir", Vector2.RIGHT)).normalized()
 		var side := Vector2(-facing.y, facing.x) * side_sign
-		unit["pos"] = _clamp_to_arena(Vector2(unit["pos"]) + side * float(plan.get("sidestep_distance", 0.0)), float(unit["radius"]))
+		unit["pos"] = _move_with_battlefield_collision(
+			Vector2(unit["pos"]), side * float(plan.get("sidestep_distance", 0.0)),
+			float(unit["radius"]), str(unit.get("domain", "ground"))
+		)
 		_add_visual_effect(evade_kind if not evade_kind.is_empty() else "evade_drill", Vector2(unit["pos"]), str(unit["team"]), "evade", 0.55)
 	if bool(plan.get("reactive_armor_triggered", false)):
 		_add_visual_effect("reactive_armor", Vector2(unit["pos"]), str(unit["team"]), "shield", 0.55)
@@ -1741,6 +1948,51 @@ func _distance_squared_to_segment(point: Vector2, start: Vector2, finish: Vector
 		return point.distance_squared_to(start)
 	var t := clampf((point - start).dot(segment) / length_squared, 0.0, 1.0)
 	return point.distance_squared_to(start + segment * t)
+
+
+func _segment_circle_hit_fraction(start: Vector2, finish: Vector2, center: Vector2, radius: float) -> float:
+	var segment := finish - start
+	var a := segment.length_squared()
+	var from_center := start - center
+	var c := from_center.length_squared() - radius * radius
+	if c <= 0.0:
+		return 0.0
+	if a <= 0.000001:
+		return INF
+	var b := 2.0 * from_center.dot(segment)
+	var discriminant := b * b - 4.0 * a * c
+	if discriminant < 0.0:
+		return INF
+	var root := sqrt(discriminant)
+	var near_fraction := (-b - root) / (2.0 * a)
+	if near_fraction >= 0.0 and near_fraction <= 1.0:
+		return near_fraction
+	var far_fraction := (-b + root) / (2.0 * a)
+	return far_fraction if far_fraction >= 0.0 and far_fraction <= 1.0 else INF
+
+
+func _projectile_ignores_battlefield_trees(projectile: Dictionary) -> bool:
+	return str(projectile.get("kind", "")) in [
+		"cannonball", "enemy_cannonball", "enemy_stone", "fireball",
+		"tank_shell", "enemy_tank_shell", "rocket", "enemy_rocket", "bomb",
+	]
+
+
+func _first_projectile_tree_hit_fraction(projectile: Dictionary, start: Vector2, finish: Vector2) -> float:
+	if _projectile_ignores_battlefield_trees(projectile):
+		return INF
+	var first_hit := INF
+	var projectile_radius := maxf(0.0, float(projectile.get("radius", PROJECTILE_RADIUS)))
+	for obstacle_value in battlefield_obstacles:
+		var obstacle := Dictionary(obstacle_value)
+		if str(obstacle.get("type", "")) != "tree":
+			continue
+		var hit_fraction := _segment_circle_hit_fraction(
+			start, finish, Vector2(obstacle["position"]),
+			projectile_radius + float(obstacle["radius"])
+		)
+		first_hit = minf(first_hit, hit_fraction)
+	return first_hit
 
 
 func _apply_projectile_specials(projectile: Dictionary, target: Dictionary, target_kind: String, dealt: float) -> void:
@@ -2023,7 +2275,7 @@ func _add_delayed_target_effect(ability_id: String, team: String, source_id: int
 	})
 
 
-func _damage_area(team: String, position: Vector2, radius: float, damage: float, source: Dictionary, ability_ids: Array, excluded_id: int = -1) -> void:
+func _damage_area(team: String, position: Vector2, radius: float, damage: float, source: Dictionary, ability_ids: Array, excluded_id: int = -1, armor_penetration: float = 0.0) -> void:
 	var opposing_team := "red" if team == "blue" else "blue"
 	for target_id_value in Array(_team_unit_ids[opposing_team]):
 		var target_id := int(target_id_value)
@@ -2031,7 +2283,7 @@ func _damage_area(team: String, position: Vector2, radius: float, damage: float,
 			continue
 		var target: Dictionary = _unit_by_id[target_id]
 		if float(target["hp"]) > 0.0 and position.distance_to(Vector2(target["pos"])) <= radius + float(target["radius"]):
-			var dealt := _damage_unit(target, damage, "area", source, 0.0, ability_ids)
+			var dealt := _damage_unit(target, damage, "area", source, armor_penetration, ability_ids)
 			if not source.is_empty():
 				_apply_lifesteal(source, dealt)
 	if team == "red" and mode == "challenge" and not hero.is_empty() and float(hero.get("hp", 0.0)) > 0.0:
@@ -2048,7 +2300,10 @@ func _knockback_area(team: String, position: Vector2, radius: float, distance: f
 		var target: Dictionary = _unit_by_id[target_id]
 		var offset := Vector2(target["pos"]) - position
 		if offset.length() <= radius + float(target["radius"]) and offset.length_squared() > 0.001:
-			target["pos"] = _clamp_to_arena(Vector2(target["pos"]) + offset.normalized() * distance, float(target["radius"]))
+			target["pos"] = _move_with_battlefield_collision(
+				Vector2(target["pos"]), offset.normalized() * distance,
+				float(target["radius"]), str(target.get("domain", "ground"))
+			)
 
 
 func _trigger_melee_mobility(unit: Dictionary, target: Dictionary) -> float:
@@ -2058,7 +2313,10 @@ func _trigger_melee_mobility(unit: Dictionary, target: Dictionary) -> float:
 	if not dash.is_empty() and float(cooldowns.get("dash", 0.0)) <= 0.0:
 		var direction := (Vector2(target["pos"]) - Vector2(unit["pos"])).normalized()
 		var distance := minf(float(dash.get("distance", 100.0)), maxf(0.0, Vector2(unit["pos"]).distance_to(Vector2(target["pos"])) - float(unit["radius"]) - float(target["radius"])))
-		unit["pos"] = _clamp_to_arena(Vector2(unit["pos"]) + direction * distance, float(unit["radius"]))
+		unit["pos"] = _move_with_battlefield_collision(
+			Vector2(unit["pos"]), direction * distance,
+			float(unit["radius"]), str(unit.get("domain", "ground"))
+		)
 		damage_multiplier = maxf(0.0, float(dash.get("damage_ratio", 1.20)))
 		unit["dash_damage_reduction"] = clampf(float(dash.get("during_dash_damage_reduction", 0.50)), 0.0, 0.9)
 		unit["dash_reduction_ttl"] = 0.20
@@ -2218,7 +2476,14 @@ func _complete_resurrection(effect: Dictionary) -> void:
 		return
 	var team := str(effect["team"])
 	var type_id := str(effect.get("unit_type", "swordsman"))
-	var revived := _create_unit(type_id, team, _clamp_to_arena(Vector2(effect["pos"]), soldier_radius(type_id)))
+	var revive_radius := soldier_radius(type_id)
+	var revive_position := _nearest_open_battlefield_position(Vector2(effect["pos"]), revive_radius)
+	if _position_hits_battlefield_tree(revive_position, revive_radius):
+		var source: Dictionary = _unit_by_id[source_id]
+		revive_position = _nearest_open_battlefield_position(Vector2(source["pos"]), revive_radius)
+	if _position_hits_battlefield_tree(revive_position, revive_radius):
+		return
+	var revived := _create_unit(type_id, team, revive_position)
 	revived["hp"] = float(revived["max_hp"]) * clampf(float(effect.get("revive_hp_ratio", 0.55)), 0.05, 1.0)
 	var shelter: Dictionary = effect.get("soul_shelter", {})
 	if not shelter.is_empty():
@@ -2280,6 +2545,8 @@ func _update_effects(delta: float) -> void:
 					if float(effect.get("damage", 0.0)) > 0.0:
 						_damage_area(str(effect["team"]), Vector2(effect["pos"]), float(effect["radius"]), float(effect["damage"]), _effect_source(effect), [str(effect["ability_id"])])
 					_apply_area_status(effect)
+			"ufo_beam":
+				_update_ufo_beam_effect(effect, delta)
 			"mine":
 				_update_mine_effect(effect, delta)
 			"turret":
@@ -2293,6 +2560,37 @@ func _update_effects(delta: float) -> void:
 func _effect_source(effect: Dictionary) -> Dictionary:
 	var source_id := int(effect.get("source_id", -1))
 	return _unit_by_id[source_id] if _unit_by_id.has(source_id) else {}
+
+
+func _update_ufo_beam_effect(effect: Dictionary, delta: float) -> void:
+	effect["warmup"] = maxf(0.0, float(effect.get("warmup", 0.0)) - delta)
+	if float(effect["warmup"]) > 0.0001:
+		return
+	effect["tick"] = float(effect.get("tick", 0.0)) - delta
+	if float(effect["tick"]) > 0.0:
+		return
+	effect["tick"] = maxf(0.1, float(effect.get("interval", 0.35)))
+	var team := str(effect.get("team", "blue"))
+	var opposing_team := "red" if team == "blue" else "blue"
+	var position := Vector2(effect.get("pos", Vector2.ZERO))
+	var radius := maxf(0.0, float(effect.get("radius", 0.0)))
+	var source := _effect_source(effect)
+	var ability_ids: Array = effect.get("ability_ids", [])
+	var armor_penetration := maxf(10.0, float(effect.get("armor_penetration", 10.0)))
+	for target_id_value in Array(_team_unit_ids[opposing_team]):
+		var target_id := int(target_id_value)
+		if not _unit_by_id.has(target_id):
+			continue
+		var target: Dictionary = _unit_by_id[target_id]
+		if float(target.get("hp", 0.0)) <= 0.0 or position.distance_to(Vector2(target["pos"])) > radius + float(target["radius"]):
+			continue
+		var dealt := _damage_unit(target, float(effect.get("damage", 0.0)), "area", source, armor_penetration, ability_ids)
+		if not source.is_empty():
+			_apply_lifesteal(source, dealt)
+		_apply_projectile_specials(effect, target, "unit", dealt)
+	if team == "red" and mode == "challenge" and not hero.is_empty() and float(hero.get("hp", 0.0)) > 0.0:
+		if position.distance_to(Vector2(hero["pos"])) <= radius + float(hero["radius"]):
+			_damage_hero(float(effect.get("damage", 0.0)), source, ability_ids)
 
 
 func _update_mine_effect(effect: Dictionary, delta: float) -> void:
@@ -2362,7 +2660,10 @@ func _apply_area_status(effect: Dictionary) -> void:
 			if ability_id == "gravity_warhead":
 				var toward_center := Vector2(effect["pos"]) - Vector2(target["pos"])
 				if toward_center.length_squared() > 0.001:
-					target["pos"] = _clamp_to_arena(Vector2(target["pos"]) + toward_center.normalized() * minf(float(effect.get("pull_per_tick", 0.0)), toward_center.length()), float(target["radius"]))
+					target["pos"] = _move_with_battlefield_collision(
+						Vector2(target["pos"]), toward_center.normalized() * minf(float(effect.get("pull_per_tick", 0.0)), toward_center.length()),
+						float(target["radius"]), str(target.get("domain", "ground"))
+					)
 				_apply_status(target, "gravity", maxf(0.05, float(effect.get("ttl", 0.05))), float(effect.get("slow_ratio", 0.15)), 0.0, ability_id)
 			else:
 				_apply_status(target, "burn", 0.8, 0.0, float(effect["damage"]) * 0.35, ability_id)
@@ -2465,6 +2766,25 @@ static func self_test() -> Dictionary:
 	small.confirm_counts()
 	small.start_battle()
 	var small_area := small.arena_rect.size.x * small.arena_rect.size.y
+	var campaign_level_one_stats_ok := false
+	if not small.units.is_empty():
+		var sample_unit: Dictionary = small.units[0]
+		var sample_combat: Dictionary = GameConfig.SOLDIERS[str(sample_unit["type"])]["combat"]
+		campaign_level_one_stats_ok = (
+			Dictionary(sample_unit.get("combat", {})) == sample_combat
+			and is_equal_approx(float(sample_unit["speed"]), float(sample_combat["movement_speed"]) * 1.35)
+			and is_equal_approx(float(sample_unit["radius"]), soldier_radius(str(sample_unit["type"])))
+		)
+	_assert_self_test(campaign_level_one_stats_ok, "arena_uses_campaign_level_one_soldier_stats_and_radius", errors)
+
+	var collision_probe := ArenaController.new()
+	collision_probe.arena_rect = Rect2(-500.0, -300.0, 1000.0, 600.0)
+	collision_probe.battlefield_obstacles = [{"type": "tree", "position": Vector2(30.0, 0.0), "radius": 12.0}]
+	var tree_result := collision_probe._move_with_battlefield_collision(Vector2.ZERO, Vector2(80.0, 0.0), 11.0)
+	var tree_blocked := tree_result.x < 30.0 and not collision_probe._position_hits_battlefield_tree(tree_result, 11.0)
+	collision_probe.battlefield_obstacles = [{"type": "rock", "position": Vector2(30.0, 0.0), "radius": 12.0}]
+	var rock_passable := collision_probe._move_with_battlefield_collision(Vector2.ZERO, Vector2(80.0, 0.0), 11.0).is_equal_approx(Vector2(80.0, 0.0))
+	_assert_self_test(tree_blocked and rock_passable, "arena_campaign_tree_collision_and_scenery_passage_match", errors)
 
 	var large := ArenaController.new()
 	large.choose_mode("spectator")
@@ -2514,6 +2834,8 @@ static func self_test() -> Dictionary:
 			handlers_cover_catalog = false
 			break
 	_assert_self_test(handlers_cover_catalog, "all_57_specials_have_arena_behavior_and_vfx", errors)
+	var weapon_identity_checks := _run_campaign_weapon_identity_self_tests(errors)
+	var battlefield_collision_checks := _run_battlefield_collision_self_tests(errors)
 	var capability_checks := _run_capability_self_tests(errors)
 
 	return {
@@ -2521,6 +2843,8 @@ static func self_test() -> Dictionary:
 		"ok": errors.is_empty(),
 		"errors": errors,
 		"special_behaviors": SPECIAL_BEHAVIORS.size(),
+		"weapon_identity_checks": weapon_identity_checks,
+		"battlefield_collision_checks": battlefield_collision_checks,
 		"capability_checks": capability_checks,
 	}
 
@@ -2581,6 +2905,130 @@ static func _has_effect_id(arena: ArenaController, ability_id: String) -> bool:
 		if str(effect.get("ability_id", "")) == ability_id:
 			return true
 	return false
+
+
+static func _run_campaign_weapon_identity_self_tests(errors: Array[String]) -> int:
+	var checks := 0
+	var probe := ArenaController.new()
+	var expected := {
+		"archer": ["ally_arrow", 720.0, 14.0, 0.0, 1, 1.0, 0.0],
+		"roller": ["rolling_rock", 520.0, 17.0, 0.0, 5, 0.82, 0.0],
+		"mage": ["ally_magic", 500.0, 14.0, 64.0, 1, 1.0, 0.0],
+		"cannon": ["cannonball", 430.0, 24.0, 148.0, 1, 1.0, 0.0],
+		"musketeer": ["musket_ball", 1280.0, 23.0, 0.0, 1, 1.0, 22.0],
+		"rifleman": ["rifle_round", 1540.0, 22.0, 0.0, 1, 1.0, 8.0],
+		"tank": ["tank_shell", 540.0, 38.0, 138.0, 1, 1.0, 16.0],
+		"rocket": ["rocket", 440.0, 32.0, 188.0, 1, 1.0, 12.0],
+		"gatling": ["gatling_round", 1580.0, 30.0, 0.0, 1, 1.0, 7.0],
+		"helicopter": ["gatling_round", 1580.0, 30.0, 0.0, 1, 1.0, 7.0],
+	}
+	var profiles_match := true
+	for type_id_value in expected.keys():
+		var type_id := str(type_id_value)
+		var values: Array = expected[type_id]
+		var profile := probe._campaign_projectile_profile(type_id)
+		profiles_match = profiles_match and str(profile.get("kind", "")) == str(values[0]) and str(profile.get("source_kind", "")) == type_id
+		profiles_match = profiles_match and is_equal_approx(float(profile.get("speed", -1.0)), float(values[1])) and is_equal_approx(float(profile.get("offset", -1.0)), float(values[2]))
+		profiles_match = profiles_match and is_equal_approx(float(profile.get("aoe", -1.0)), float(values[3])) and int(profile.get("pierce", -1)) == int(values[4])
+		profiles_match = profiles_match and is_equal_approx(float(profile.get("falloff", -1.0)), float(values[5])) and is_equal_approx(float(profile.get("armor_penetration", -1.0)), float(values[6]))
+	_assert_self_test(profiles_match, "arena_campaign_projectile_profiles_match", errors)
+	checks += 1
+
+	var bomber_arena := _make_test_arena(["bomber"], ["swordsman"])
+	bomber_arena.start_battle()
+	var bomber := _test_unit(bomber_arena, "blue", "bomber")
+	var bomb_target := _test_unit(bomber_arena, "red", "swordsman")
+	bomber["pos"] = Vector2(100.0, 100.0)
+	bomb_target["pos"] = Vector2(300.0, 100.0)
+	bomber_arena.projectiles.clear()
+	var no_triggers: Array[String] = []
+	bomber_arena._spawn_unit_projectiles(bomber, bomb_target, "unit", {"damage_multiplier": 1.0, "bonus_radius": 0.0, "attack_sequence": 1}, no_triggers)
+	var bombs_match := bomber_arena.projectiles.size() == 3
+	for bomb_index in bomber_arena.projectiles.size():
+		var bomb: Dictionary = bomber_arena.projectiles[bomb_index]
+		bombs_match = bombs_match and str(bomb.get("kind", "")) == "bomb" and str(bomb.get("source_kind", "")) == "bomber" and bool(bomb.get("delayed_impact", false)) and Vector2(bomb.get("vel", Vector2.ONE)) == Vector2.ZERO
+		bombs_match = bombs_match and is_equal_approx(float(bomb.get("ttl", 0.0)), 0.55 + float(bomb_index) * 0.24) and is_equal_approx(float(bomb.get("aoe", 0.0)), 182.0)
+	var bomb_hp_before := float(bomb_target["hp"])
+	bomber_arena._update_projectiles(0.56)
+	var delayed_bombs_resolve := bomber_arena.projectiles.size() == 2 and float(bomb_target["hp"]) < bomb_hp_before
+	bomber_arena._update_projectiles(0.48)
+	delayed_bombs_resolve = delayed_bombs_resolve and bomber_arena.projectiles.is_empty()
+	_assert_self_test(bombs_match and delayed_bombs_resolve, "arena_bomber_uses_three_delayed_campaign_bombs", errors)
+	checks += 1
+
+	var ufo_arena := _make_test_arena(["ufo"], ["swordsman"])
+	ufo_arena.start_battle()
+	var ufo := _test_unit(ufo_arena, "blue", "ufo")
+	var beam_target := _test_unit(ufo_arena, "red", "swordsman")
+	ufo["pos"] = Vector2(100.0, 100.0)
+	beam_target["pos"] = Vector2(300.0, 100.0)
+	ufo_arena.effects.clear()
+	ufo_arena.projectiles.clear()
+	ufo_arena._spawn_unit_projectiles(ufo, beam_target, "unit", {"damage_multiplier": 1.0, "bonus_radius": 0.0, "attack_sequence": 1}, no_triggers)
+	var beam: Dictionary = ufo_arena.effects[0] if ufo_arena.effects.size() == 1 else {}
+	var beam_hp_before := float(beam_target["hp"])
+	ufo_arena._update_effects(0.74)
+	var beam_waits_for_warmup := is_equal_approx(float(beam_target["hp"]), beam_hp_before)
+	ufo_arena._update_effects(0.01)
+	var beam_matches := not beam.is_empty() and str(beam.get("kind", "")) == "ufo_beam" and str(beam.get("source_kind", "")) == "ufo" and is_equal_approx(float(beam.get("radius", 0.0)), 82.0) and is_equal_approx(float(beam.get("interval", 0.0)), 0.35) and is_equal_approx(float(beam.get("armor_penetration", 0.0)), 10.0)
+	_assert_self_test(beam_matches and beam_waits_for_warmup and float(beam_target["hp"]) < beam_hp_before and ufo_arena.projectiles.is_empty(), "arena_ufo_uses_persistent_campaign_beam", errors)
+	checks += 1
+	return checks
+
+
+static func _run_battlefield_collision_self_tests(errors: Array[String]) -> int:
+	var checks := 0
+	var sweep := ArenaController.new()
+	sweep.arena_rect = Rect2(-500.0, -300.0, 1000.0, 600.0)
+	sweep.battlefield_obstacles = [{"type": "tree", "position": Vector2(50.0, 0.0), "radius": 14.0}]
+	var ground_result := sweep._move_with_battlefield_collision(Vector2.ZERO, Vector2(120.0, 0.0), 11.0, "ground")
+	var air_result := sweep._move_with_battlefield_collision(Vector2.ZERO, Vector2(120.0, 0.0), 11.0, "air")
+	_assert_self_test(
+		ground_result.x < 50.0 and not sweep._position_hits_battlefield_tree(ground_result, 11.0) and air_result.is_equal_approx(Vector2(120.0, 0.0)),
+		"arena_forced_ground_movement_sweeps_trees_while_air_crosses",
+		errors
+	)
+	checks += 1
+
+	var tree_before := _make_test_arena(["archer"], ["swordsman"])
+	tree_before.start_battle()
+	var blocking_archer := _test_unit(tree_before, "blue", "archer")
+	var protected_target := _test_unit(tree_before, "red", "swordsman")
+	blocking_archer["pos"] = Vector2(0.0, 0.0)
+	protected_target["pos"] = Vector2(150.0, 0.0)
+	tree_before.battlefield_obstacles = [{"type": "tree", "position": Vector2(75.0, 0.0), "radius": 14.0}]
+	var protected_hp := float(protected_target["hp"])
+	tree_before._perform_unit_attack(blocking_archer, protected_target, "unit")
+	tree_before._update_projectiles(0.25)
+	_assert_self_test(tree_before.projectiles.is_empty() and is_equal_approx(float(protected_target["hp"]), protected_hp), "arena_projectile_tree_before_target_blocks_hit", errors)
+	checks += 1
+
+	var target_before := _make_test_arena(["archer"], ["swordsman"])
+	target_before.start_battle()
+	var clear_archer := _test_unit(target_before, "blue", "archer")
+	var exposed_target := _test_unit(target_before, "red", "swordsman")
+	clear_archer["pos"] = Vector2(0.0, 0.0)
+	exposed_target["pos"] = Vector2(60.0, 0.0)
+	target_before.battlefield_obstacles = [{"type": "tree", "position": Vector2(130.0, 0.0), "radius": 14.0}]
+	var exposed_hp := float(exposed_target["hp"])
+	target_before._perform_unit_attack(clear_archer, exposed_target, "unit")
+	target_before._update_projectiles(0.25)
+	_assert_self_test(float(exposed_target["hp"]) < exposed_hp, "arena_projectile_target_before_tree_hits_first", errors)
+	checks += 1
+
+	var heavy_pass := _make_test_arena(["cannon"], ["swordsman"])
+	heavy_pass.start_battle()
+	var cannon := _test_unit(heavy_pass, "blue", "cannon")
+	var cannon_target := _test_unit(heavy_pass, "red", "swordsman")
+	cannon["pos"] = Vector2(0.0, 0.0)
+	cannon_target["pos"] = Vector2(150.0, 0.0)
+	heavy_pass.battlefield_obstacles = [{"type": "tree", "position": Vector2(75.0, 0.0), "radius": 14.0}]
+	var cannon_target_hp := float(cannon_target["hp"])
+	heavy_pass._perform_unit_attack(cannon, cannon_target, "unit")
+	heavy_pass._update_projectiles(0.40)
+	_assert_self_test(float(cannon_target["hp"]) < cannon_target_hp, "arena_campaign_heavy_projectile_crosses_tree", errors)
+	checks += 1
+	return checks
 
 
 static func _run_capability_self_tests(errors: Array[String]) -> int:
