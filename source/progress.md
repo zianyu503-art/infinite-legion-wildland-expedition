@@ -1,5 +1,19 @@
 Original prompt: 依照 `/Users/alex/.codex/attachments/573a9183-7335-45aa-b2d1-68325b99e124/pasted-text.txt` 的完整規格，製作可直接遊玩的 Godot 無限地圖 2D 動作戰鬥／軍隊養成遊戲，並提供繁體中文操作說明與終端開啟指令。使用者明確指定套用 develop-web-game、game-engine、web-games、2d-games、game-ai-behavior、combat-design、level-design、environment-art、character-design、game-art、vfx-realtime、game-audio、game-design 技能。
 
+## 2026-08-07：57 種士兵強化實戰 VFX 與不遮擋觸控抽屜
+
+- [x] 新增 `soldier_upgrade_vfx_catalog.gd`，精確覆蓋 57 個永久特殊能力；每種能力都有獨立 shape、色彩、輔色與 projectile／unit／status／trigger／area 視覺通道。
+- [x] 火焰、冰霜、雷電、毒素、虛空、時間、爆炸、護盾、治療、召喚等能力接入實際戰鬥繪製；燃燒箭具備火舌與火星尾跡，冰霜箭有冰晶，麻痺箭有電弧，毒箭有毒霧氣泡，命中後敵人仍保留對應狀態特效。
+- [x] 地雷、燃燒區、重力井、持續投射物、連環爆炸、隕石、守護靈、自動砲塔與修復無人機不再共用單一圓圈，改為可直接辨認的裝置、落點、軌跡與區域圖形。
+- [x] 近戰燃燒劍、護盾、光環、集結旗、復仇層數與所有 unit-channel 能力會顯示在士兵本體；Boss 燃燒會正確保留燃燒劍／燃燒彈藥來源，不再混用圖示。
+- [x] 修正滿血吸血仍顯示假治療數字的問題；滿血時不消耗吸血上限，也不生成錯誤 VFX。
+- [x] 觸控版預設只保留畫面頂部中央 52×52 的「功能」按鍵；展開後為 5×2、每顆至少 44×44 的短抽屜，選擇功能或點擊外部會自動收合，不再永久遮住戰場、雙搖桿、技能鈕或軍隊資訊列。
+- [x] 通知文字改到功能鈕／抽屜下方，觸控版最多顯示最新兩則；戰鬥預警與傷害判定仍完全獨立。
+- [x] Web 效能避免每名士兵每幀深複製能力表，VFX 家族與序號改用固定順序查找；觸控版同一投射物最多同時繪製 4 層，再輪替顯示其餘已購買能力。
+- [x] Godot deterministic self-test 最終為 256／256；包含 57 種 VFX 完整性、實際元素投射物、Boss 來源、滿血吸血、568×320／667×375／844×390 抽屜幾何與點外收合測試。
+- [x] 真實 Chrome 驗證桌面繁中、57 種圖鑑、844×390 觸控收合／展開、觸控強化商店與桌面英文，console 0 errors；驗收圖位於 `/tmp/infinite-legion-vfx-combat-desktop-zh.png`、`/tmp/infinite-legion-vfx-gallery-57.png`、`/tmp/infinite-legion-vfx-touch-collapsed-zh.png` 與 `/tmp/infinite-legion-vfx-touch-drawer-zh.png`。
+- [x] 最終 Web 成品已同步 GitHub Pages 根目錄；`index.pck` SHA-256：`d11986b063c6c95124123b68e93c7b433f5850b1eeb2078a13c8e7359a13ac4b`，固定公開網址維持不變。
+
 ## 2026-08-05：國家戰線、士兵永久研究與敵軍特殊強化接線
 
 - [x] 存檔升級至 Schema 7；保存士兵研究，舊存檔安全遷移成空研究，城池國家／原國家與玩家征服旗幟隨城池資料保存。

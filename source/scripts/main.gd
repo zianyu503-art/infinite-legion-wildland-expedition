@@ -11,6 +11,7 @@ const GameLocalization = preload("res://scripts/game_localization.gd")
 const EnemyEnhancementCatalog = preload("res://scripts/enemy_enhancement_catalog.gd")
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
 const SoldierUpgradeRuntime = preload("res://scripts/soldier_upgrade_runtime.gd")
+const SoldierUpgradeVfxCatalog = preload("res://scripts/soldier_upgrade_vfx_catalog.gd")
 const NationCatalog = preload("res://scripts/nation_catalog.gd")
 const PythonBossControllerScript = preload("res://scripts/python_boss.gd")
 const ChaosBossControllerScript = preload("res://scripts/chaos_boss.gd")
@@ -58,6 +59,13 @@ const MAX_UPGRADE_MINES_PER_TEAM := 24
 const MAX_UPGRADE_LINGERING_PER_TEAM := 16
 const MAX_UPGRADE_SUMMONS_PER_TEAM := 5
 const UPGRADE_EFFECT_SCAN_INTERVAL := 0.10
+const UPGRADE_EFFECT_ABILITY: Dictionary = {
+	"temporal_echo": "temporal_echo", "meteor": "meteor", "chain_blast": "chain_explosion",
+	"bomblet": "cluster_warhead", "ufo_echo": "temporal_echo", "mine": "mine_round",
+	"lingering": "lingering_projectile", "burning_zone": "burning_zone",
+	"boss_burn": "burning_ammo", "boss_poison": "toxic_payload", "gravity": "gravity_warhead",
+	"guardian": "guardian", "auto_turret": "auto_turret", "repair_drone": "repair_drone",
+}
 
 const FRIEND_BLUE := Color("3B82F6")
 const FRIEND_DARK := Color("12365A")
@@ -156,6 +164,7 @@ var touch_aim_vector := Vector2.RIGHT
 var touch_move_position := Vector2.ZERO
 var touch_aim_position := Vector2.ZERO
 var touch_button_feedback: Dictionary = {}
+var touch_utility_drawer_open := false
 var last_touch_event_msec := -10000
 var class_select_pointer_guard_until_msec := -10000
 var last_recruit_purchase_msec := -10000
@@ -286,6 +295,7 @@ func _reset_touch_inputs() -> void:
 	touch_move_position = _touch_move_center()
 	touch_aim_position = _touch_aim_center()
 	attack_held = false
+	touch_utility_drawer_open = false
 
 
 func _enter_class_select(guard_pointer: bool) -> void:
@@ -491,6 +501,12 @@ func _setup_web_bridge() -> void:
 			var aionis_phase: int = int(JavaScriptBridge.eval("Number(new URLSearchParams(window.location.search).get('phase') || 4)", true))
 			var aionis_exposed: bool = bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('anchor_state') === 'exposed'", true))
 			call_deferred("_web_force_aionis_showcase_for_test", [str(auto_aionis_scene), aionis_touch, str(aionis_language), str(aionis_skill), aionis_phase, aionis_exposed])
+		var auto_soldier_vfx_scene: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('soldier_vfx_scene') || ''", true)
+		if typeof(auto_soldier_vfx_scene) == TYPE_STRING and str(auto_soldier_vfx_scene) in ["combat", "gallery"]:
+			var soldier_vfx_touch := bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('touch') === '1'", true))
+			var soldier_vfx_language: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('lang') || 'zh_TW'", true)
+			var soldier_vfx_drawer := bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('drawer') === '1'", true))
+			call_deferred("_web_force_soldier_vfx_showcase_for_test", [str(auto_soldier_vfx_scene), soldier_vfx_touch, str(soldier_vfx_language), soldier_vfx_drawer])
 	window.__codex_game_state = render_game_to_text()
 	# JavaScriptBridge callbacks always return null. These small wrappers publish
 	# the state through a window property so browser automation receives a string.
@@ -650,6 +666,144 @@ func _web_force_recruit_showcase_for_test(arguments: Array) -> bool:
 	queue_redraw()
 	_publish_web_game_state(render_game_to_text())
 	return true
+
+
+func _web_force_soldier_vfx_showcase_for_test(arguments: Array) -> bool:
+	var scene := str(arguments[0]) if not arguments.is_empty() else "combat"
+	if scene not in ["combat", "gallery"]:
+		scene = "combat"
+	var use_touch := bool(arguments[1]) if arguments.size() > 1 and typeof(arguments[1]) == TYPE_BOOL else false
+	var requested_language := str(arguments[2]) if arguments.size() > 2 else "zh_TW"
+	var open_drawer := bool(arguments[3]) if arguments.size() > 3 and typeof(arguments[3]) == TYPE_BOOL else false
+	_start_new_game("archer", true)
+	language = requested_language if requested_language in ["zh_TW", "en"] else "zh_TW"
+	_set_input_scheme(InputScheme.TOUCH if use_touch else InputScheme.KEYBOARD_MOUSE)
+	_reset_touch_inputs()
+	touch_utility_drawer_open = use_touch and open_drawer
+	tutorial_visible = false
+	notifications_hidden = false
+	player["level"] = 30
+	player["xp_need"] = GameConfig.xp_needed(30)
+	player["money"] = 250000
+	var showcase_center := HOUSE_POS + Vector2(180.0, 840.0)
+	player["pos"] = showcase_center + Vector2(-screen_size.x * 0.38, screen_size.y * 0.34)
+	player["facing"] = Vector2.RIGHT
+	camera_pos = showcase_center
+	camera_target = camera_pos
+	camera_shake = 0.0
+	camera_shake_offset = Vector2.ZERO
+	castles.clear()
+	camps.clear()
+	snake_nests.clear()
+	enemies.clear()
+	soldiers.clear()
+	projectiles.clear()
+	hazards.clear()
+	upgrade_effects.clear()
+	particles.clear()
+	floaters.clear()
+	soldier_boss_debuffs.clear()
+	soldier_upgrade_shared_cooldowns.clear()
+	notifications.clear()
+	mode = GameMode.PLAYING
+	active_panel = ""
+
+	if scene == "gallery":
+		var gallery_columns := 10
+		var gallery_rows := ceili(float(SoldierUpgradeVfxCatalog.ORDER.size()) / float(gallery_columns))
+		var gallery_left := screen_size.x * 0.11
+		var gallery_top := maxf(170.0, screen_size.y * 0.24)
+		var gallery_width := screen_size.x * 0.78
+		var gallery_height := maxf(180.0, screen_size.y - gallery_top - 42.0)
+		for gallery_index in SoldierUpgradeVfxCatalog.ORDER.size():
+			var gallery_column := gallery_index % gallery_columns
+			var gallery_row := gallery_index / gallery_columns
+			var gallery_screen_position := Vector2(
+				gallery_left + gallery_width * float(gallery_column) / float(gallery_columns - 1),
+				gallery_top + gallery_height * float(gallery_row) / float(maxi(1, gallery_rows - 1))
+			)
+			var gallery_world_position := camera_pos + gallery_screen_position - screen_size * 0.5
+			_spawn_soldier_upgrade_vfx(str(SoldierUpgradeVfxCatalog.ORDER[gallery_index]), gallery_world_position, 0.52)
+			if not particles.is_empty():
+				particles.back()["max_ttl"] = 1.0
+				particles.back()["ttl"] = 0.62
+		_add_notification("57 permanent troop abilities: each has its own shape, color, and combat channel." if language == "en" else "57 種永久士兵能力：每種皆有獨立圖形、色彩與戰鬥通道。", Color("C9EDFF"), 5.0)
+		_web_manual_time_hold = 5.0
+		queue_redraw()
+		_publish_web_game_state(render_game_to_text())
+		var gallery_vfx_count := 0
+		for gallery_particle in particles:
+			if str(gallery_particle.get("kind", "")) == "soldier_upgrade_vfx":
+				gallery_vfx_count += 1
+		return gallery_vfx_count == SoldierUpgradeVfxCatalog.ORDER.size()
+
+	var elemental_ids: Array[String] = ["burning_ammo", "frost_arrow", "paralysis_arrow", "toxic_payload"]
+	var elemental_effects: Dictionary = {}
+	var elemental_active: Array[Dictionary] = []
+	for elemental_id in elemental_ids:
+		var elemental_definition := SoldierUpgradeCatalog.definition_for(elemental_id)
+		var elemental_rank_effects: Array = elemental_definition.get("rank_effects", [])
+		if elemental_rank_effects.is_empty():
+			return false
+		var elemental_effect := Dictionary(elemental_rank_effects[0]).duplicate(true)
+		elemental_effects[elemental_id] = elemental_effect
+		elemental_active.append({"id": elemental_id, "rank": 1, "effect": elemental_effect.duplicate(true)})
+	var elemental_snapshot := {
+		"type": "archer", "base_effects": {},
+		"active_specials": elemental_active,
+		"special_effects": elemental_effects,
+	}
+	var archer_position := showcase_center + Vector2(-screen_size.x * 0.28, 0.0)
+	var showcase_archer_id := _spawn_soldier("archer", archer_position)
+	var showcase_archer: Variant = _find_soldier_by_id(showcase_archer_id)
+	if showcase_archer == null:
+		return false
+	showcase_archer["upgrade_snapshot"] = elemental_snapshot
+	var showcase_runtime := SoldierUpgradeRuntime.create_state(elemental_snapshot, float(showcase_archer["max_hp"]))
+	showcase_runtime["attack_sequence"] = 7
+	showcase_archer["special_runtime"] = showcase_runtime
+	showcase_archer["aim_dir"] = Vector2.RIGHT
+	showcase_archer["state"] = "attack"
+	particles.clear()
+	var row_gap := minf(108.0, screen_size.y * 0.14)
+	var all_statuses_visible := true
+	for elemental_index in elemental_ids.size():
+		var ability_id := elemental_ids[elemental_index]
+		var row_y := (float(elemental_index) - 1.5) * row_gap
+		var enemy_position := showcase_center + Vector2(screen_size.x * 0.23, row_y)
+		var enemy_id := _spawn_enemy("heavy", enemy_position, 24, enemy_position)
+		var enemy_index := _enemy_index_by_id(enemy_id)
+		var single_special := {ability_id: Dictionary(elemental_effects[ability_id]).duplicate(true)}
+		_resolve_soldier_enemy_hit(enemy_index, 18.0, archer_position, "projectile", showcase_archer_id, single_special)
+		var arrow_position := showcase_center + Vector2(-screen_size.x * 0.055, row_y)
+		_spawn_projectile({
+			"team": "friendly", "kind": "ally_arrow", "source_kind": "archer", "source_id": showcase_archer_id,
+			"target_id": enemy_id, "pos": arrow_position, "vel": Vector2.RIGHT * 520.0,
+			"damage": 18.0, "range": screen_size.x * 0.65, "radius": 4.0, "pierce": 1, "aoe": 0.0,
+			"color": Color("EAF6FF"), "soldier_specials": single_special,
+		})
+		var showcase_enemy: Variant = _find_enemy_by_id(enemy_id)
+		if showcase_enemy == null:
+			all_statuses_visible = false
+		elif ability_id == "burning_ammo":
+			all_statuses_visible = all_statuses_visible and float(showcase_enemy.get("soldier_burn_ttl", 0.0)) > 0.0
+		elif ability_id == "frost_arrow":
+			all_statuses_visible = all_statuses_visible and float(showcase_enemy.get("soldier_frost_ttl", 0.0)) > 0.0
+		elif ability_id == "paralysis_arrow":
+			all_statuses_visible = all_statuses_visible and float(showcase_enemy.get("soldier_paralysis_ttl", 0.0)) > 0.0
+		elif ability_id == "toxic_payload":
+			all_statuses_visible = all_statuses_visible and not Dictionary(showcase_enemy.get("soldier_poison_sources", {})).is_empty()
+	if not use_touch:
+		var area_y := screen_size.y * 0.27
+		_add_upgrade_runtime_effect({"kind": "burning_zone", "pos": showcase_center + Vector2(-screen_size.x * 0.14, area_y), "source_id": showcase_archer_id, "radius": 68.0, "ttl": 5.0, "warmup": 0.0, "color": Color("FF572E")})
+		_add_upgrade_runtime_effect({"kind": "mine", "pos": showcase_center + Vector2(-screen_size.x * 0.045, area_y), "source_id": showcase_archer_id, "radius": 58.0, "ttl": 5.0, "warmup": 0.0, "color": Color("FFB34A")})
+		_add_upgrade_runtime_effect({"kind": "gravity", "pos": showcase_center + Vector2(screen_size.x * 0.06, area_y), "source_id": showcase_archer_id, "radius": 72.0, "ttl": 5.0, "warmup": 0.0, "color": Color("9A6CFF")})
+		_add_upgrade_runtime_effect({"kind": "lingering", "pos": showcase_center + Vector2(screen_size.x * 0.16, area_y), "source_id": showcase_archer_id, "radius": 38.0, "ttl": 5.0, "warmup": 0.0, "color": Color("73F3DD")})
+	_add_notification("Burn, frost, paralysis, and poison: both arrow trails and hit statuses are real combat effects." if language == "en" else "燃燒、冰凍、麻痺、毒素：箭矢軌跡與命中狀態皆為實際戰鬥效果。", Color("C9EDFF"), 5.0)
+	_web_manual_time_hold = 5.0
+	queue_redraw()
+	_publish_web_game_state(render_game_to_text())
+	return projectiles.size() == elemental_ids.size() and enemies.size() == elemental_ids.size() and all_statuses_visible
 
 
 func _web_force_heavy_cannon_combat_showcase_for_test(arguments: Array) -> bool:
@@ -968,6 +1122,7 @@ func render_game_to_text() -> String:
 				"damage": snappedf(float(projectile["damage"]), 0.1),
 				"x": snappedf(float(Vector2(projectile["pos"]).x), 0.1),
 				"y": snappedf(float(Vector2(projectile["pos"]).y), 0.1),
+				"vfx_layers": Array(projectile.get("vfx_layers", [])).duplicate(),
 			})
 	var visible_castles: Array[Dictionary] = []
 	for castle in castles.values():
@@ -979,6 +1134,18 @@ func render_game_to_text() -> String:
 				"wall_hp": snappedf(float(castle.get("wall_hp", 0.0)), 0.1),
 				"wall_max_hp": snappedf(float(castle.get("wall_max_hp", 0.0)), 0.1),
 				"wall_breached": bool(castle.get("wall_breached", true)), "owned": bool(castle["owned"]),
+			})
+	var visible_upgrade_vfx: Array[Dictionary] = []
+	for effect in upgrade_effects:
+		if visible_upgrade_vfx.size() >= 24:
+			break
+		if typeof(effect.get("pos", null)) == TYPE_VECTOR2 and player_position.distance_to(Vector2(effect["pos"])) <= 1200.0:
+			visible_upgrade_vfx.append({
+				"ability_id": str(effect.get("ability_id", UPGRADE_EFFECT_ABILITY.get(str(effect.get("kind", "")), ""))),
+				"kind": str(effect.get("kind", "")),
+				"shape": SoldierUpgradeVfxCatalog.shape_for(str(effect.get("ability_id", UPGRADE_EFFECT_ABILITY.get(str(effect.get("kind", "")), "")))),
+				"x": snappedf(Vector2(effect["pos"]).x, 0.1), "y": snappedf(Vector2(effect["pos"]).y, 0.1),
+				"ttl": snappedf(float(effect.get("ttl", 0.0)), 0.01), "warmup": snappedf(float(effect.get("warmup", 0.0)), 0.01),
 			})
 	var aionis_home := Vector2(GameConfig.AIONIS_BOSS_CONFIG["home_position"])
 	var aionis_delta := aionis_home - player_position
@@ -992,6 +1159,7 @@ func render_game_to_text() -> String:
 	var touch_move_rect := Rect2(_touch_move_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
 	var touch_attack_rect := Rect2(_touch_aim_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
 	var touch_special_button_rect := _touch_special_rect()
+	var touch_utility_menu_rect := _touch_utility_menu_rect()
 	var touch_recruit_enabled := player_position.distance_to(HOUSE_POS) <= 185.0
 	if not touch_recruit_enabled:
 		for castle_value in castles.values():
@@ -1009,6 +1177,7 @@ func render_game_to_text() -> String:
 			"width": snappedf(action_rect.size.x, 0.1),
 			"height": snappedf(action_rect.size.y, 0.1),
 			"enabled": action != "recruit" or touch_recruit_enabled,
+			"visible": touch_utility_drawer_open,
 		}
 	var touch_close_rect := _touch_panel_close_rect()
 	var touch_recruit_controls: Array[Dictionary] = []
@@ -1080,6 +1249,7 @@ func render_game_to_text() -> String:
 				"y": snappedf(touch_upgrade_test_rect.position.y, 0.1),
 				"width": snappedf(touch_upgrade_test_rect.size.x, 0.1),
 				"height": snappedf(touch_upgrade_test_rect.size.y, 0.1),
+				"visible": _is_touch_scheme() and touch_utility_drawer_open and mode == GameMode.PLAYING and active_panel.is_empty(),
 			},
 			"virtual_controls": {
 				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
@@ -1100,6 +1270,11 @@ func render_game_to_text() -> String:
 					"x": snappedf(touch_special_button_rect.position.x, 0.1), "y": snappedf(touch_special_button_rect.position.y, 0.1),
 					"width": snappedf(touch_special_button_rect.size.x, 0.1), "height": snappedf(touch_special_button_rect.size.y, 0.1),
 					"enabled": int(player.get("level", 1)) >= 10,
+				},
+				"utility_menu": {
+					"x": snappedf(touch_utility_menu_rect.position.x, 0.1), "y": snappedf(touch_utility_menu_rect.position.y, 0.1),
+					"width": snappedf(touch_utility_menu_rect.size.x, 0.1), "height": snappedf(touch_utility_menu_rect.size.y, 0.1),
+					"expanded": touch_utility_drawer_open,
 				},
 				"utility": touch_utility_state,
 				"panel_close": {
@@ -1137,6 +1312,8 @@ func render_game_to_text() -> String:
 		"soldier_upgrades": {
 			"catalog_schema": SoldierUpgradeCatalog.SCHEMA_VERSION,
 			"special_count": SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER.size(),
+			"vfx_count": SoldierUpgradeVfxCatalog.DESCRIPTORS.size(),
+			"vfx_effects": visible_upgrade_vfx,
 			"selected_type": _selected_soldier_upgrade_type(),
 			"category": soldier_upgrade_category,
 			"page": soldier_upgrade_page,
@@ -1536,23 +1713,29 @@ func _touch_special_rect() -> Rect2:
 
 
 func _touch_utility_rects() -> Dictionary:
-	var keys := ["guide", "map", "skills", "upgrades", "recruit", "command", "notices", "cheat", "fullscreen", "pause"]
+	# Five short columns keep the opened drawer inside the top HUD band instead of
+	# running down through either virtual stick. The drawer is normally collapsed.
+	var keys := ["upgrades", "recruit", "command", "skills", "map", "guide", "notices", "cheat", "fullscreen", "pause"]
 	var result := {}
 	var scale := touch_ui_coordinate_scale
-	var css_size := screen_size / scale
-	var compact := css_size.y < 540.0 or css_size.x < 1000.0
-	var button_size := (52.0 if compact else 68.0) * scale
-	var gap := (6.0 if compact else 8.0) * scale
+	var button_size := 44.0 * scale
+	var gap := 6.0 * scale
 	var columns := 5
-	var start_y := (82.0 if compact else 106.0) * scale
+	var drawer_width := 5.0 * 44.0 + 4.0 * 6.0
+	var start_x := (screen_size.x / scale - drawer_width) * 0.5 * scale
+	var start_y := 72.0 * scale
 	for index in keys.size():
 		var row := index / columns
 		var column := index % columns
-		var items_in_row := mini(columns, keys.size() - row * columns)
-		var row_width := button_size * float(items_in_row) + gap * float(items_in_row - 1)
-		var start_x := (screen_size.x - row_width) * 0.5
 		result[keys[index]] = Rect2(start_x + float(column) * (button_size + gap), start_y + float(row) * (button_size + gap), button_size, button_size)
 	return result
+
+
+func _touch_utility_menu_rect() -> Rect2:
+	var scale := touch_ui_coordinate_scale
+	# The single collapsed handle sits in the top-center HUD corridor. It no longer
+	# overlaps the army strip, either stick, the skill button, or the battlefield.
+	return Rect2(Vector2(screen_size.x * 0.5 - 26.0 * scale, 8.0 * scale), Vector2(52.0, 52.0) * scale)
 
 
 func _touch_panel_close_rect() -> Rect2:
@@ -1645,35 +1828,48 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 		return true
 	if mode != GameMode.PLAYING or active_panel != "":
 		return false
+	if _touch_utility_menu_rect().has_point(position):
+		touch_utility_drawer_open = not touch_utility_drawer_open
+		_mark_touch_feedback("utility_menu")
+		audio.play("ui", 0.45)
+		queue_redraw()
+		return true
+	if touch_utility_drawer_open:
+		var utility_rects := _touch_utility_rects()
+		for action_value in utility_rects.keys():
+			var action := str(action_value)
+			if not Rect2(utility_rects[action]).has_point(position):
+				continue
+			touch_utility_drawer_open = false
+			_mark_touch_feedback(action)
+			match action:
+				"guide": tutorial_visible = not tutorial_visible
+				"map": active_panel = "map"
+				"skills": active_panel = "skills"
+				"upgrades":
+					active_panel = "soldier_upgrades"
+					soldier_upgrade_page = 0
+				"recruit":
+					if _is_near_recruitment():
+						active_panel = "recruit"
+					else:
+						_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
+				"command": active_panel = "command"
+				"notices": _toggle_notifications()
+				"cheat": _open_cheat_input()
+				"fullscreen": _toggle_fullscreen()
+				"pause": mode = GameMode.PAUSED
+			audio.play("ui", 0.45)
+			queue_redraw()
+			return true
+		# Closing the drawer consumes the touch so an outside tap cannot also
+		# start either virtual stick or fire an attack.
+		touch_utility_drawer_open = false
+		queue_redraw()
+		return true
 	if _touch_special_rect().has_point(position):
 		_mark_touch_feedback("special")
 		_try_player_special(_touch_attack_target())
-		return true
-	var utility_rects := _touch_utility_rects()
-	for action_value in utility_rects.keys():
-		var action := str(action_value)
-		if not Rect2(utility_rects[action]).has_point(position):
-			continue
-		_mark_touch_feedback(action)
-		match action:
-			"guide": tutorial_visible = not tutorial_visible
-			"map": active_panel = "map"
-			"skills": active_panel = "skills"
-			"upgrades":
-				active_panel = "soldier_upgrades"
-				soldier_upgrade_page = 0
-			"recruit":
-				if _is_near_recruitment():
-					active_panel = "recruit"
-				else:
-					_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
-			"command": active_panel = "command"
-			"notices": _toggle_notifications()
-			"cheat": _open_cheat_input()
-			"fullscreen": _toggle_fullscreen()
-			"pause": mode = GameMode.PAUSED
-		audio.play("ui", 0.45)
-		queue_redraw()
 		return true
 	return false
 
@@ -2836,28 +3032,30 @@ func _apply_soldier_boss_statuses(soldier: Dictionary, hit_damage: float, damage
 		soldier_boss_debuffs["focus_ttl"] = float(focus.get("effect_duration", 4.0))
 		soldier_boss_debuffs["focus_source_id"] = source_id
 		soldier_boss_debuffs["focus_bonus"] = float(focus.get("other_ally_damage_bonus", 0.0)) * float(focus.get("boss_multiplier", 0.5))
-	var burn := _soldier_special(soldier, "burning_sword" if damage_type == "melee" else "burning_ammo")
+	var burn_ability := "burning_sword" if damage_type == "melee" else "burning_ammo"
+	var burn := _soldier_special(soldier, burn_ability)
 	if not burn.is_empty():
-		_refresh_soldier_boss_dot("boss_burn", soldier, hit_damage, float(burn.get("total_burn_ratio", 0.0)), float(burn.get("duration", 3.0)), 1)
+		_refresh_soldier_boss_dot("boss_burn", soldier, hit_damage, float(burn.get("total_burn_ratio", 0.0)), float(burn.get("duration", 3.0)), 1, burn_ability)
 	var poison := _soldier_special(soldier, "toxic_payload")
 	if not poison.is_empty():
-		_refresh_soldier_boss_dot("boss_poison", soldier, hit_damage, float(poison.get("total_poison_ratio", 0.0)), float(poison.get("duration", 5.0)), maxi(1, int(poison.get("max_stacks", 3))))
+		_refresh_soldier_boss_dot("boss_poison", soldier, hit_damage, float(poison.get("total_poison_ratio", 0.0)), float(poison.get("duration", 5.0)), maxi(1, int(poison.get("max_stacks", 3))), "toxic_payload")
 	var taunt := _soldier_special(soldier, "taunt_guard")
 	if not taunt.is_empty() and _active_boss_kind() == "python" and python_boss != null and python_boss.is_engaged():
 		python_boss.add_threat("soldier", source_id, 14.0)
 
 
-func _refresh_soldier_boss_dot(kind: String, soldier: Dictionary, hit_damage: float, total_ratio: float, duration: float, max_stacks: int) -> void:
+func _refresh_soldier_boss_dot(kind: String, soldier: Dictionary, hit_damage: float, total_ratio: float, duration: float, max_stacks: int, ability_id: String) -> void:
 	var safe_duration := maxf(0.1, duration)
 	for effect in upgrade_effects:
 		if str(effect.get("kind", "")) != kind or int(effect.get("source_id", -1)) != int(soldier["id"]):
 			continue
 		effect["ttl"] = safe_duration
+		effect["ability_id"] = ability_id
 		effect["stacks"] = mini(max_stacks, int(effect.get("stacks", 1)) + 1)
 		effect["damage_per_stack"] = maxf(float(effect.get("damage_per_stack", 0.0)), hit_damage * total_ratio / safe_duration * 0.5)
 		return
 	_add_upgrade_runtime_effect({
-		"kind": kind, "source_id": int(soldier["id"]), "source_kind": "upgrade_dot", "pos": _active_boss_position(),
+		"kind": kind, "ability_id": ability_id, "source_id": int(soldier["id"]), "source_kind": "upgrade_dot", "pos": _active_boss_position(),
 		"ttl": safe_duration, "warmup": 0.0, "radius": 34.0, "tick": 0.5, "tick_interval": 0.5,
 		"stacks": 1, "damage_per_stack": hit_damage * total_ratio / safe_duration * 0.5,
 		"max_per_owner": 1, "color": FIRE_ORANGE if kind == "boss_burn" else Color("83D16F"),
@@ -4034,7 +4232,7 @@ func _update_soldier_enemy_statuses(delta: float) -> void:
 		if enemy_index >= enemies.size():
 			continue
 		var enemy: Dictionary = enemies[enemy_index]
-		for timer_key in ["soldier_void_mark_ttl", "soldier_focus_mark_ttl", "soldier_suppression_ttl"]:
+		for timer_key in ["soldier_void_mark_ttl", "soldier_focus_mark_ttl", "soldier_suppression_ttl", "soldier_frost_ttl", "soldier_paralysis_ttl"]:
 			enemy[timer_key] = maxf(0.0, float(enemy.get(timer_key, 0.0)) - delta)
 		if float(enemy.get("soldier_void_mark_ttl", 0.0)) <= 0.0:
 			enemy["soldier_void_damage_bonus"] = 0.0
@@ -4688,8 +4886,12 @@ func _set_soldier_upgrade_cooldown(soldier: Dictionary, ability_id: String, seco
 func _update_soldier_passive_upgrades(soldier: Dictionary, delta: float) -> void:
 	var self_repair := _soldier_special(soldier, "self_repair")
 	if not self_repair.is_empty() and game_time - float(soldier.get("last_hit", -99.0)) >= float(self_repair.get("no_hit_delay", 5.0)):
+		var hp_before_repair := float(soldier["hp"])
 		var repair := float(soldier.get("max_hp", 1.0)) * float(self_repair.get("max_hp_heal_per_second", 0.0)) * delta
 		soldier["hp"] = minf(float(soldier["max_hp"]), float(soldier["hp"]) + repair)
+		if float(soldier["hp"]) > hp_before_repair and _soldier_upgrade_cooldown_ready(soldier, "self_repair_vfx"):
+			_set_soldier_upgrade_cooldown(soldier, "self_repair_vfx", 0.8)
+			_spawn_soldier_upgrade_vfx("self_repair", Vector2(soldier["pos"]), 0.42)
 
 	var cleanse := _soldier_special(soldier, "cleanse")
 	if not cleanse.is_empty() and _soldier_upgrade_cooldown_ready(soldier, "cleanse"):
@@ -4699,7 +4901,7 @@ func _update_soldier_passive_upgrades(soldier: Dictionary, delta: float) -> void
 	var flares := _soldier_special(soldier, "air_flares")
 	if not flares.is_empty() and _soldier_upgrade_cooldown_ready(soldier, "air_flares") and _try_intercept_hostile_homing_projectile(soldier):
 		_set_soldier_upgrade_cooldown(soldier, "air_flares", float(flares.get("cooldown", 14.0)))
-		_spawn_effect("explosion", soldier["pos"], Color("FFDD7A"), 0.6)
+		_spawn_soldier_upgrade_vfx("air_flares", Vector2(soldier["pos"]), 0.72)
 
 	if not _soldier_upgrade_cooldown_ready(soldier, "summon_scan"):
 		return
@@ -4766,7 +4968,7 @@ func _try_spawn_soldier_upgrade_summon(soldier: Dictionary, ability_id: String) 
 		summon["defeated"] = false
 	_add_upgrade_runtime_effect(summon)
 	_set_soldier_upgrade_cooldown(soldier, ability_id, ttl + 8.0)
-	_spawn_effect("spawn", summon["pos"], Color(summon["color"]), 0.7)
+	_spawn_soldier_upgrade_vfx(ability_id, Vector2(summon["pos"]), 0.78)
 
 
 func _update_soldiers(delta: float) -> void:
@@ -4942,7 +5144,7 @@ func _try_soldier_dash_attack(soldier: Dictionary, enemy: Dictionary, target_id:
 		if enemy_index >= 0:
 			var specials: Dictionary = Dictionary(Dictionary(soldier.get("upgrade_snapshot", {})).get("special_effects", {}))
 			_resolve_soldier_enemy_hit(enemy_index, damage, origin, "melee", int(soldier["id"]), specials)
-	_spawn_effect("dash", soldier["pos"], Color("A8DDFF"), 0.9)
+	_spawn_soldier_upgrade_vfx("dash", origin, 0.90, Vector2(soldier["pos"]))
 	soldier["cooldown"] = _soldier_attack_cooldown(soldier)
 	return true
 
@@ -5079,14 +5281,19 @@ func _perform_soldier_heal(healer: Dictionary, target: Dictionary, base_amount: 
 	if not battlefield_repair.is_empty() and _target_is_vehicle_or_air(target):
 		multiplier *= 1.0 + float(battlefield_repair.get("vehicle_air_healing_bonus", 0.0))
 	var result := _apply_heal_target(target, base_amount * multiplier, int(healer["id"]))
+	var target_position := Vector2(target.get("pos", healer.get("pos", Vector2.ZERO)))
+	if not _soldier_special(healer, "healing_mastery").is_empty():
+		_spawn_soldier_upgrade_vfx("healing_mastery", target_position, 0.50, Vector2(healer["pos"]))
+	if not battlefield_repair.is_empty() and _target_is_vehicle_or_air(target):
+		_spawn_soldier_upgrade_vfx("battlefield_repair", Vector2(healer["pos"]), 0.55, target_position)
 	var holy_shield := _soldier_special(healer, "holy_shield")
 	if not holy_shield.is_empty():
-		_grant_healing_shield(target, float(result.get("max_hp", 0.0)) * float(holy_shield.get("shield_max_hp_ratio", 0.0)), float(holy_shield.get("duration", 4.0)), float(holy_shield.get("target_cooldown", 10.0)))
+		_grant_healing_shield(target, float(result.get("max_hp", 0.0)) * float(holy_shield.get("shield_max_hp_ratio", 0.0)), float(holy_shield.get("duration", 4.0)), float(holy_shield.get("target_cooldown", 10.0)), "holy_shield")
 	var overheal := _soldier_special(healer, "overheal_matrix")
 	if not overheal.is_empty() and float(result.get("overheal", 0.0)) > 0.0:
 		var converted := float(result["overheal"]) * float(overheal.get("overheal_to_shield_ratio", 0.0))
 		var cap := float(result.get("max_hp", 0.0)) * float(overheal.get("shield_target_max_hp_ratio", 0.0))
-		_grant_healing_shield(target, minf(converted, cap), float(overheal.get("duration", 6.0)), 0.0)
+		_grant_healing_shield(target, minf(converted, cap), float(overheal.get("duration", 6.0)), 0.0, "overheal_matrix")
 	var cleanse := _soldier_special(healer, "cleanse")
 	if not cleanse.is_empty() and _soldier_upgrade_cooldown_ready(healer, "cleanse_target") and _cleanse_friendly_target(target):
 		_set_soldier_upgrade_cooldown(healer, "cleanse_target", float(cleanse.get("cooldown", 10.0)))
@@ -5103,8 +5310,9 @@ func _perform_soldier_heal(healer: Dictionary, target: Dictionary, base_amount: 
 				if Vector2(ally["pos"]).distance_to(Vector2(healer["pos"])) > float(healer.get("support_range", 330.0)):
 					continue
 				_apply_heal_target({"kind": "soldier", "id": ally["id"], "pos": ally["pos"]}, base_amount * multiplier * float(group_heal.get("healing_ratio", 0.5)), int(healer["id"]))
+				_spawn_soldier_upgrade_vfx("group_heal", Vector2(healer["pos"]), 0.48, Vector2(ally["pos"]))
 				remaining -= 1
-			_spawn_effect("heal", healer["pos"], Color("8EFFE0"), 1.0)
+			_spawn_soldier_upgrade_vfx("group_heal", Vector2(healer["pos"]), 0.85)
 	return result
 
 
@@ -5128,7 +5336,7 @@ func _apply_heal_target(target: Dictionary, amount: float, healer_id: int = -1) 
 	return {"effective": effective, "overheal": maxf(0.0, amount - effective), "max_hp": maximum}
 
 
-func _grant_healing_shield(target: Dictionary, amount: float, duration: float, target_cooldown: float) -> void:
+func _grant_healing_shield(target: Dictionary, amount: float, duration: float, target_cooldown: float, ability_id: String = "holy_shield") -> void:
 	if amount <= 0.0:
 		return
 	if str(target.get("kind", "")) == "player":
@@ -5136,6 +5344,7 @@ func _grant_healing_shield(target: Dictionary, amount: float, duration: float, t
 			return
 		player["support_shield"] = maxf(float(player.get("support_shield", 0.0)), amount)
 		player["support_shield_ttl"] = maxf(float(player.get("support_shield_ttl", 0.0)), duration)
+		player["support_shield_source"] = ability_id
 		if target_cooldown > 0.0:
 			player["holy_shield_ready_at"] = game_time + target_cooldown
 	else:
@@ -5144,8 +5353,10 @@ func _grant_healing_shield(target: Dictionary, amount: float, duration: float, t
 			return
 		ally["support_shield"] = maxf(float(ally.get("support_shield", 0.0)), amount)
 		ally["support_shield_ttl"] = maxf(float(ally.get("support_shield_ttl", 0.0)), duration)
+		ally["support_shield_source"] = ability_id
 		if target_cooldown > 0.0:
 			ally["holy_shield_ready_at"] = game_time + target_cooldown
+	_spawn_soldier_upgrade_vfx(ability_id, Vector2(target.get("pos", player.get("pos", Vector2.ZERO))), 0.72)
 
 
 func _cleanse_friendly_target(target: Dictionary) -> bool:
@@ -5166,7 +5377,7 @@ func _cleanse_friendly_target(target: Dictionary) -> bool:
 			ally["paralysis_ttl"] = 0.0
 			cleansed = cleansed or had_local_status
 	if cleansed:
-		_spawn_effect("heal", target_position, Color("B9FFF4"), 0.65)
+		_spawn_soldier_upgrade_vfx("cleanse", target_position, 0.65)
 		_add_floater(target_position + Vector2(0, -24), "Cleanse" if language == "en" else "淨化", Color("B9FFF4"), 0.7)
 	return cleansed
 
@@ -5354,6 +5565,14 @@ func _begin_soldier_attack(soldier: Dictionary, target: Variant, target_id: int,
 	soldier["pending_split_scheduled"] = false
 	soldier["pending_echo_scheduled"] = false
 	_try_trigger_soldier_meteor(soldier, target_position)
+	if bool(context.get("execution_triggered", false)):
+		_spawn_soldier_upgrade_vfx("execution_protocol", target_position, 0.72)
+	if bool(context.get("echo", false)):
+		_spawn_soldier_upgrade_vfx("temporal_echo", Vector2(soldier["pos"]), 0.58)
+	if bool(context.get("overcharge_triggered", false)):
+		_spawn_soldier_upgrade_vfx("overcharge_capacitor", Vector2(soldier["pos"]), 0.82)
+	if bool(context.get("vengeance_triggered", false)):
+		_spawn_soldier_upgrade_vfx("vengeance_counter", Vector2(soldier["pos"]), 0.78)
 	if bool(context.get("is_critical", false)):
 		_spawn_effect("hit", soldier["pos"], GOLD, 0.55)
 	return context
@@ -5372,7 +5591,7 @@ func _try_trigger_soldier_meteor(soldier: Dictionary, target_position: Vector2) 
 		"damage": float(soldier.get("attack", 1.0)) * float(meteor.get("damage_ratio", 2.2)),
 		"color": Color("FFB14A"), "effect": meteor.duplicate(true),
 	})
-	_spawn_effect("warning", target_position, Color("FFB14A"), 0.8)
+	_spawn_soldier_upgrade_vfx("meteor", target_position, 0.8)
 
 
 func _fire_soldier_attack(soldier: Dictionary, target_id: int) -> void:
@@ -5526,7 +5745,8 @@ func _resolve_soldier_enemy_hit(
 
 
 func _apply_soldier_statuses_to_enemy(enemy: Dictionary, hit_damage: float, specials: Dictionary, source_id: int, damage_kind: String) -> void:
-	var burn := _special_from_map(specials, "burning_sword" if damage_kind == "melee" else "burning_ammo")
+	var burn_ability := "burning_sword" if damage_kind == "melee" else "burning_ammo"
+	var burn := _special_from_map(specials, burn_ability)
 	if not burn.is_empty():
 		var proc_times: Dictionary = Dictionary(enemy.get("soldier_burn_proc_times", {}))
 		var proc_key := str(source_id)
@@ -5535,39 +5755,58 @@ func _apply_soldier_statuses_to_enemy(enemy: Dictionary, hit_damage: float, spec
 			enemy["soldier_burn_ttl"] = maxf(float(enemy.get("soldier_burn_ttl", 0.0)), burn_duration)
 			enemy["soldier_burn_dps"] = maxf(float(enemy.get("soldier_burn_dps", 0.0)), hit_damage * float(burn.get("total_burn_ratio", 0.0)) / burn_duration)
 			enemy["soldier_burn_source_id"] = source_id
+			enemy["soldier_burn_ability"] = burn_ability
 			proc_times[proc_key] = game_time + maxf(0.0, float(burn.get("source_target_proc_cooldown", 0.0)))
 			enemy["soldier_burn_proc_times"] = proc_times
+			_spawn_soldier_upgrade_vfx(burn_ability, Vector2(enemy["pos"]), 0.65)
 	var toxic := _special_from_map(specials, "toxic_payload")
 	if not toxic.is_empty():
 		var poison_sources: Dictionary = Dictionary(enemy.get("soldier_poison_sources", {}))
 		var poison_key := str(source_id)
 		var poison_entry: Dictionary = Dictionary(poison_sources.get(poison_key, {}))
 		var duration := maxf(0.1, float(toxic.get("duration", 5.0)))
-		poison_entry["stacks"] = mini(maxi(1, int(toxic.get("max_stacks", 3))), int(poison_entry.get("stacks", 0)) + 1)
+		var previous_poison_stacks := int(poison_entry.get("stacks", 0))
+		poison_entry["stacks"] = mini(maxi(1, int(toxic.get("max_stacks", 3))), previous_poison_stacks + 1)
 		poison_entry["ttl"] = duration
 		poison_entry["dps_per_stack"] = maxf(float(poison_entry.get("dps_per_stack", 0.0)), hit_damage * float(toxic.get("total_poison_ratio", 0.0)) / duration)
 		poison_sources[poison_key] = poison_entry
 		enemy["soldier_poison_sources"] = poison_sources
+		if int(poison_entry["stacks"]) > previous_poison_stacks:
+			_spawn_soldier_upgrade_vfx("toxic_payload", Vector2(enemy["pos"]), 0.55)
 	var frost := _special_from_map(specials, "frost_arrow")
 	if not frost.is_empty():
+		var frost_was_inactive := float(enemy.get("soldier_frost_ttl", 0.0)) <= 0.0
 		enemy["slow"] = maxf(float(enemy.get("slow", 0.0)), float(frost.get("duration", 2.0)))
 		enemy["slow_factor"] = maxf(float(enemy.get("slow_factor", 0.0)), float(frost.get("slow_ratio", 0.25)))
+		enemy["soldier_frost_ttl"] = maxf(float(enemy.get("soldier_frost_ttl", 0.0)), float(frost.get("duration", 2.0)))
+		if frost_was_inactive:
+			_spawn_soldier_upgrade_vfx("frost_arrow", Vector2(enemy["pos"]), 0.62)
 	var paralysis := _special_from_map(specials, "paralysis_arrow")
 	if not paralysis.is_empty():
 		var source_soldier: Variant = _find_soldier_by_id(source_id)
 		var sequence := int(Dictionary(source_soldier.get("special_runtime", {})).get("attack_sequence", 0)) if source_soldier != null else 0
 		if sequence > 0 and sequence % maxi(1, int(paralysis.get("arrow_interval", 7))) == 0:
-			enemy["enhancement_stun"] = maxf(float(enemy.get("enhancement_stun", 0.0)), float(paralysis.get("normal_stun", 0.45)))
+			var paralysis_ttl := float(paralysis.get("normal_stun", 0.45))
+			enemy["enhancement_stun"] = maxf(float(enemy.get("enhancement_stun", 0.0)), paralysis_ttl)
+			enemy["soldier_paralysis_ttl"] = maxf(float(enemy.get("soldier_paralysis_ttl", 0.0)), paralysis_ttl)
+			enemy["soldier_last_status"] = "paralysis_arrow"
+			_spawn_soldier_upgrade_vfx("paralysis_arrow", Vector2(enemy["pos"]), 0.72)
 	var corrosion := _special_from_map(specials, "corrosion")
 	if not corrosion.is_empty():
-		var stacks := mini(maxi(1, int(corrosion.get("max_stacks", 2))), int(enemy.get("soldier_corrosion_stacks", 0)) + 1)
+		var previous_corrosion_stacks := int(enemy.get("soldier_corrosion_stacks", 0))
+		var stacks := mini(maxi(1, int(corrosion.get("max_stacks", 2))), previous_corrosion_stacks + 1)
 		enemy["soldier_corrosion_stacks"] = stacks
 		enemy["armor_break"] = maxf(float(enemy.get("armor_break", 0.0)), float(corrosion.get("duration", 4.0)))
 		enemy["armor_reduction"] = maxf(float(enemy.get("armor_reduction", 0.0)), float(corrosion.get("armor_reduction", 0.0)) * float(stacks))
+		if stacks > previous_corrosion_stacks:
+			_spawn_soldier_upgrade_vfx("corrosion", Vector2(enemy["pos"]), 0.58)
 	var void_mark := _special_from_map(specials, "void_mark")
 	if not void_mark.is_empty():
+		var void_was_inactive := float(enemy.get("soldier_void_mark_ttl", 0.0)) <= 0.0
 		enemy["soldier_void_mark_ttl"] = maxf(float(enemy.get("soldier_void_mark_ttl", 0.0)), float(void_mark.get("duration", 4.0)))
 		enemy["soldier_void_damage_bonus"] = maxf(float(enemy.get("soldier_void_damage_bonus", 0.0)), float(void_mark.get("soldier_damage_taken_bonus", 0.0)))
+		if void_was_inactive:
+			_spawn_soldier_upgrade_vfx("void_mark", Vector2(enemy["pos"]), 0.62)
 	var suppression := _special_from_map(specials, "suppression")
 	if not suppression.is_empty():
 		var suppression_hits: Dictionary = Dictionary(enemy.get("soldier_suppression_hits", {}))
@@ -5578,13 +5817,17 @@ func _apply_soldier_statuses_to_enemy(enemy: Dictionary, hit_damage: float, spec
 			enemy["soldier_suppression_ttl"] = maxf(float(enemy.get("soldier_suppression_ttl", 0.0)), float(suppression.get("effect_duration", 3.5)))
 			enemy["soldier_suppression_move_reduction"] = maxf(float(enemy.get("soldier_suppression_move_reduction", 0.0)), float(suppression.get("move_reduction", 0.2)))
 			enemy["soldier_suppression_attack_reduction"] = maxf(float(enemy.get("soldier_suppression_attack_reduction", 0.0)), float(suppression.get("attack_speed_reduction", 0.1)))
+			_spawn_soldier_upgrade_vfx("suppression", Vector2(enemy["pos"]), 0.58)
 		suppression_hits[suppression_key] = hits
 		enemy["soldier_suppression_hits"] = suppression_hits
 	var focus := _special_from_map(specials, "focus_mark")
 	if not focus.is_empty():
+		var focus_was_inactive := float(enemy.get("soldier_focus_mark_ttl", 0.0)) <= 0.0
 		enemy["soldier_focus_mark_ttl"] = float(focus.get("effect_duration", 4.0))
 		enemy["soldier_focus_source_id"] = source_id
 		enemy["soldier_focus_damage_bonus"] = maxf(float(enemy.get("soldier_focus_damage_bonus", 0.0)), float(focus.get("other_ally_damage_bonus", 0.0)))
+		if focus_was_inactive:
+			_spawn_soldier_upgrade_vfx("focus_mark", Vector2(enemy["pos"]), 0.60)
 
 
 func _apply_soldier_lifesteal(source_id: int, dealt_damage: float, specials: Dictionary) -> void:
@@ -5600,11 +5843,14 @@ func _apply_soldier_lifesteal(source_id: int, dealt_damage: float, specials: Dic
 		soldier["lifesteal_used"] = 0.0
 	var cap := float(soldier.get("max_hp", 1.0)) * float(lifesteal.get("max_hp_heal_cap_per_second_ratio", 0.06))
 	var available := maxf(0.0, cap - float(soldier.get("lifesteal_used", 0.0)))
-	var healed := minf(available, dealt_damage * float(lifesteal.get("lifesteal_ratio", 0.0)))
+	var missing_hp := maxf(0.0, float(soldier.get("max_hp", 1.0)) - float(soldier.get("hp", 0.0)))
+	var healed := minf(missing_hp, minf(available, dealt_damage * float(lifesteal.get("lifesteal_ratio", 0.0))))
 	if healed <= 0.0:
 		return
 	soldier["hp"] = minf(float(soldier["max_hp"]), float(soldier["hp"]) + healed)
 	soldier["lifesteal_used"] = float(soldier.get("lifesteal_used", 0.0)) + healed
+	_spawn_soldier_upgrade_vfx("lifesteal", Vector2(soldier["pos"]), 0.46)
+	_add_floater(Vector2(soldier["pos"]) + Vector2(0, -20), "+%d" % maxi(1, roundi(healed)), Color("72E0A3"), 0.55)
 
 
 func _trigger_soldier_melee_followups(soldier: Dictionary, primary_enemy_id: int, origin: Vector2, attack_damage: float) -> void:
@@ -5623,6 +5869,7 @@ func _trigger_soldier_melee_followups(soldier: Dictionary, primary_enemy_id: int
 			var enemy_index := _enemy_index_by_id(int(candidates[candidate_index]["id"]))
 			if enemy_index >= 0:
 				_resolve_soldier_enemy_hit(enemy_index, attack_damage * float(sweep.get("sweep_damage_ratio", 0.6)), origin, "melee", int(soldier["id"]), specials)
+		_spawn_soldier_upgrade_vfx("sweeping_slash", origin, 0.82)
 	var stomp := _special_from_map(specials, "stomp")
 	if stomp.is_empty() or not _soldier_upgrade_cooldown_ready(soldier, "stomp"):
 		return
@@ -5637,7 +5884,7 @@ func _trigger_soldier_melee_followups(soldier: Dictionary, primary_enemy_id: int
 		if enemy_index >= 0:
 			enemies[enemy_index]["enhancement_stun"] = maxf(float(enemies[enemy_index].get("enhancement_stun", 0.0)), float(stomp.get("stun_duration", 0.45)))
 			_resolve_soldier_enemy_hit(enemy_index, attack_damage * float(stomp.get("damage_ratio", 0.65)), origin, "area", int(soldier["id"]), specials)
-	_spawn_effect("explosion", origin, Color("D6A66D"), clampf(radius / 110.0, 0.7, 1.4))
+	_spawn_soldier_upgrade_vfx("stomp", origin, clampf(radius / 110.0, 0.7, 1.4))
 
 
 func _trigger_soldier_ranged_followups(primary_enemy_id: int, primary_position: Vector2, damage: float, source_id: int, specials: Dictionary) -> void:
@@ -5655,7 +5902,7 @@ func _trigger_soldier_ranged_followups(primary_enemy_id: int, primary_position: 
 				break
 			var next_position := Vector2(enemies[next_index]["pos"])
 			_damage_enemy(next_index, damage * float(chain.get("jump_damage_ratio", 0.35)), chain_origin, "chain", 0.0, source_id)
-			_spawn_effect("hit", next_position, Color("9EEAFF"), 0.6)
+			_spawn_soldier_upgrade_vfx("chain_lightning", chain_origin, 0.60, next_position)
 			chain_origin = next_position
 	var ricochet := _special_from_map(specials, "ricochet")
 	if not ricochet.is_empty():
@@ -5667,6 +5914,7 @@ func _trigger_soldier_ranged_followups(primary_enemy_id: int, primary_position: 
 			var bounce_index := _enemy_index_by_id(bounce_id)
 			if bounce_index >= 0:
 				_damage_enemy(bounce_index, damage * float(ricochet.get("ricochet_damage_ratio", 0.45)), primary_position, "projectile", 0.0, source_id)
+				_spawn_soldier_upgrade_vfx("ricochet", primary_position, 0.48, Vector2(enemies[bounce_index]["pos"]))
 
 
 func _nearest_enemy_excluding(position: Vector2, radius: float, excluded: Dictionary) -> int:
@@ -5843,7 +6091,7 @@ func _move_soldier_toward(soldier: Dictionary, destination: Vector2, delta: floa
 		soldier["vel"] = (Vector2(soldier["pos"]) - air_old_position) / maxf(delta, 0.0001)
 		var air_barrier_result := SoldierUpgradeRuntime.record_movement(soldier, air_old_position.distance_to(Vector2(soldier["pos"])))
 		if bool(air_barrier_result.get("activated", false)):
-			_spawn_effect("shield", soldier["pos"], Color("7DD8FF"), 0.72)
+			_spawn_soldier_upgrade_vfx("kinetic_barrier", Vector2(soldier["pos"]), 0.72)
 		return
 	if _position_hits_tree(Vector2(soldier["pos"]), float(soldier["radius"])):
 		var escape_direction := (destination - Vector2(soldier["pos"])).normalized()
@@ -5908,7 +6156,7 @@ func _move_soldier_toward(soldier: Dictionary, destination: Vector2, delta: floa
 	soldier["vel"] = (Vector2(soldier["pos"]) - old_position) / maxf(delta, 0.0001)
 	var barrier_result := SoldierUpgradeRuntime.record_movement(soldier, old_position.distance_to(Vector2(soldier["pos"])))
 	if bool(barrier_result.get("activated", false)):
-		_spawn_effect("shield", soldier["pos"], Color("7DD8FF"), 0.72)
+		_spawn_soldier_upgrade_vfx("kinetic_barrier", Vector2(soldier["pos"]), 0.72)
 
 
 func _damage_soldier(soldier: Dictionary, raw_damage: float, source_pos: Vector2, damage_kind: String) -> void:
@@ -5938,9 +6186,18 @@ func _damage_soldier(soldier: Dictionary, raw_damage: float, source_pos: Vector2
 		soldier["invuln"] = maxf(float(soldier.get("invuln", 0.0)), float(damage_plan["invulnerability"]))
 	if float(damage_plan.get("absorbed", 0.0)) > 0.0:
 		_add_floater(soldier["pos"] + Vector2(0, -22), "盾 %d" % int(damage_plan["absorbed"]), Color("80D9FF"), 0.7)
-		_spawn_effect("shield", soldier["pos"], Color("80D9FF"), 0.55)
+		var shield_ability := str(soldier.get("support_shield_source", "")) if float(damage_plan.get("support_absorbed", 0.0)) > 0.0 else ""
+		if shield_ability.is_empty() and not _soldier_special(soldier, "kinetic_barrier").is_empty():
+			shield_ability = "kinetic_barrier"
+		if shield_ability.is_empty():
+			shield_ability = "tactical_shield"
+		_spawn_soldier_upgrade_vfx(shield_ability, Vector2(soldier["pos"]), 0.55)
+	if bool(damage_plan.get("reactive_armor_triggered", false)):
+		_spawn_soldier_upgrade_vfx("reactive_armor", Vector2(soldier["pos"]), 0.62)
+	var evade_kind := str(damage_plan.get("evade_kind", ""))
+	if not evade_kind.is_empty():
+		_spawn_soldier_upgrade_vfx(evade_kind, source_pos, 0.55, Vector2(soldier["pos"]))
 	if bool(damage_plan.get("evaded", false)):
-		_spawn_effect("dash", soldier["pos"], Color("B9F3FF"), 0.55)
 		return
 	if damage <= 0.0:
 		return
@@ -5951,6 +6208,7 @@ func _damage_soldier(soldier: Dictionary, raw_damage: float, source_pos: Vector2
 		var recovery_duration := maxf(0.1, float(last_stand.get("recovery_duration", 3.0)))
 		soldier["last_stand_recovery_ttl"] = recovery_duration
 		soldier["last_stand_recovery_per_second"] = float(soldier["max_hp"]) * float(last_stand.get("recovery_max_hp_ratio", 0.12)) / recovery_duration
+		_spawn_soldier_upgrade_vfx("last_stand", Vector2(soldier["pos"]), 1.0)
 	soldier["flash"] = 0.12
 	soldier["last_hit"] = game_time
 	_add_floater(soldier["pos"] + Vector2(0, -18), "-%d" % int(damage), Color("FF9B79"), 0.75)
@@ -6000,6 +6258,11 @@ func _revive_tombstone(tomb: Dictionary, priest_id: int = -1, hp_ratio: float = 
 		revived["revive_damage_reduction"] = clampf(float(soul_shelter.get("revived_damage_reduction", 0.0)), 0.0, 0.85)
 		revived["revive_reduction_ttl"] = maxf(0.0, float(soul_shelter.get("reduction_duration", 0.0)))
 	_spawn_effect("revive", tomb["pos"], GOLD, 1.0)
+	var reviving_priest: Variant = _find_soldier_by_id(priest_id) if priest_id >= 0 else null
+	if reviving_priest != null and not _soldier_special(reviving_priest, "resurrection_ritual").is_empty():
+		_spawn_soldier_upgrade_vfx("resurrection_ritual", Vector2(tomb["pos"]), 1.0)
+	if not soul_shelter.is_empty():
+		_spawn_soldier_upgrade_vfx("soul_shelter", Vector2(tomb["pos"]), 0.82)
 	_add_floater(tomb["pos"] + Vector2(0, -25), "復活", GOLD, 1.2)
 	if priest_id >= 0 and python_boss != null and python_boss.is_engaged():
 		python_boss.add_threat("priest", priest_id, float(GameConfig.PYTHON_BOSS_CONFIG["threat"]["revive_flat"]))
@@ -6050,6 +6313,7 @@ func _spawn_projectile(data: Dictionary) -> void:
 	data["slow_duration"] = float(data.get("slow_duration", 0.0))
 	data["fire_duration"] = float(data.get("fire_duration", 5.0))
 	data["fire_tick_damage"] = float(data.get("fire_tick_damage", 0.0))
+	data["vfx_layers"] = SoldierUpgradeVfxCatalog.active_ids(Dictionary(data.get("soldier_specials", {})), "projectile")
 	projectiles.append(data)
 	if source_soldier != null and bool(data.get("allow_special_generation", false)):
 		_spawn_soldier_projectile_children(source_soldier, data)
@@ -6610,6 +6874,7 @@ func _kill_enemy(index: int) -> void:
 	drops.append({"kind": "loot", "pos": pos, "gold": base_gold + salvage_bonus, "xp": int(enemy["reward_xp"]), "ttl": 24.0})
 	if salvage_bonus > 0:
 		_add_floater(pos + Vector2(0, -34), "+$%d" % salvage_bonus, GOLD, 0.9)
+		_spawn_soldier_upgrade_vfx("salvage_protocol", pos, 0.72)
 	player["kills"] = int(player["kills"]) + 1
 	_spawn_effect("death", pos, ENEMY_RED, 0.8 if enemy["type"] != "chief" else 1.4)
 	if enemy["type"] == "chief":
@@ -7237,6 +7502,24 @@ func _spawn_effect(kind: String, position: Vector2, color: Color, scale: float) 
 	_trim_particles()
 
 
+func _spawn_soldier_upgrade_vfx(ability_id: String, position: Vector2, scale: float = 1.0, end_position: Variant = null) -> void:
+	if not SoldierUpgradeVfxCatalog.DESCRIPTORS.has(ability_id):
+		return
+	var ttl := 0.46
+	if ability_id in ["meteor", "last_stand", "resurrection_ritual"]:
+		ttl = 0.85
+	var visual := {
+		"effect": true, "kind": "soldier_upgrade_vfx", "ability_id": ability_id,
+		"pos": position, "vel": Vector2.ZERO,
+		"color": SoldierUpgradeVfxCatalog.color_for(ability_id),
+		"ttl": ttl, "max_ttl": ttl, "size": 20.0 * scale, "priority": 0,
+	}
+	if typeof(end_position) == TYPE_VECTOR2:
+		visual["end_pos"] = Vector2(end_position)
+	particles.append(visual)
+	_trim_particles()
+
+
 func _spawn_particle(position: Vector2, velocity: Vector2, color: Color, ttl: float, size: float, priority: int) -> void:
 	particles.append({"effect": false, "kind": "particle", "pos": position, "vel": velocity, "color": color, "ttl": ttl, "max_ttl": ttl, "size": size, "priority": priority})
 	_trim_particles()
@@ -7284,8 +7567,12 @@ func _add_upgrade_runtime_effect(effect: Dictionary) -> void:
 	var stored := effect.duplicate(true)
 	var kind := str(stored.get("kind", "generic"))
 	stored["kind"] = kind
+	stored["ability_id"] = str(stored.get("ability_id", UPGRADE_EFFECT_ABILITY.get(kind, "")))
 	stored["created_at"] = float(stored.get("created_at", game_time))
 	stored["ttl"] = maxf(0.01, float(stored.get("ttl", 0.01)))
+	stored["initial_ttl"] = maxf(float(stored["ttl"]), float(stored.get("initial_ttl", 0.0)))
+	if stored.has("warmup"):
+		stored["initial_warmup"] = maxf(float(stored.get("warmup", 0.0)), float(stored.get("initial_warmup", 0.0)))
 	var source_id := int(stored.get("source_id", -1))
 	var definition: Dictionary = Dictionary(stored.get("effect", {}))
 	var owner_cap := maxi(0, int(stored.get("max_per_owner", definition.get("max_per_owner", 0))))
@@ -7573,7 +7860,11 @@ func _upgrade_area_damage(effect: Dictionary, ground_only: bool = false, spawn_b
 			var attack_id := _allocate_attack_id("soldier_upgrade_%s" % str(effect.get("kind", "area")))
 			_consume_active_boss_hit_result(_receive_active_boss_hit(attack_id, str(effect.get("source_kind", "soldier")), source_id, damage, Vector2(boss_hit["position"]), "upgrade_area", 0.0))
 	if spawn_burst:
-		_spawn_effect("explosion", position, Color(effect.get("color", FIRE_ORANGE)), clampf(radius / 100.0, 0.55, 1.6))
+		var ability_id := str(effect.get("ability_id", UPGRADE_EFFECT_ABILITY.get(str(effect.get("kind", "")), "")))
+		if SoldierUpgradeVfxCatalog.DESCRIPTORS.has(ability_id):
+			_spawn_soldier_upgrade_vfx(ability_id, position, clampf(radius / 100.0, 0.55, 1.6))
+		else:
+			_spawn_effect("explosion", position, Color(effect.get("color", FIRE_ORANGE)), clampf(radius / 100.0, 0.55, 1.6))
 
 
 func _update_guardian_effect(effect: Dictionary, delta: float) -> void:
@@ -7657,13 +7948,128 @@ func _draw_upgrade_effects() -> void:
 			continue
 		var color := Color(effect.get("color", Color("F4C95D")))
 		var warmup := float(effect.get("warmup", 0.0))
-		var pulse := 0.62 + sin(game_time * 9.0) * 0.18
-		if warmup > 0.0:
-			draw_circle(screen_position, radius, Color(color, 0.10))
-			draw_arc(screen_position, radius, 0.0, TAU, 36, Color(color, pulse), 2.5, true)
-		else:
-			draw_circle(screen_position, radius, Color(color, 0.16))
-			draw_arc(screen_position, radius, 0.0, TAU, 36, Color(color, 0.72), 2.0, true)
+		var initial_warmup := maxf(0.001, float(effect.get("initial_warmup", warmup)))
+		var warmup_progress := clampf(1.0 - warmup / initial_warmup, 0.0, 1.0) if warmup > 0.0 else 1.0
+		var ttl_ratio := clampf(float(effect.get("ttl", 0.0)) / maxf(0.001, float(effect.get("initial_ttl", effect.get("ttl", 1.0)))), 0.0, 1.0)
+		var pulse := 0.55 + 0.45 * sin(game_time * 9.0 + float(int(effect.get("source_id", 0)) % 11))
+		var kind := str(effect.get("kind", "generic"))
+		var ability_id := str(effect.get("ability_id", UPGRADE_EFFECT_ABILITY.get(kind, "")))
+		match kind:
+			"meteor":
+				draw_circle(screen_position, radius, Color("FF4A2F", 0.07 + warmup_progress * 0.08))
+				draw_arc(screen_position, radius, 0, TAU, 48, Color("FFB14A", 0.72 + pulse * 0.20), 3.0, true)
+				draw_arc(screen_position, radius * (0.22 + warmup_progress * 0.78), 0, TAU, 40, Color("FFF08A", 0.86), 2.0, true)
+				var meteor_height := 210.0 * (1.0 - warmup_progress)
+				var meteor_p := screen_position + Vector2(-meteor_height * 0.42, -meteor_height)
+				draw_circle(screen_position + Vector2(0, 3), 16.0 + warmup_progress * 18.0, Color(0.02, 0.01, 0.01, 0.22 + warmup_progress * 0.16))
+				for trail_index in 4:
+					var trail_start := meteor_p + Vector2(-9.0 + trail_index * 6.0, -8.0)
+					draw_line(trail_start, trail_start + Vector2(-34.0 - trail_index * 5.0, -68.0), Color("FF6A2A", 0.52 + trail_index * 0.08), 5.0 - trail_index * 0.55, true)
+				draw_circle(meteor_p, 18.0 + pulse * 2.0, Color("64271C"))
+				draw_circle(meteor_p - Vector2(4, 5), 11.0, Color("FF7043"))
+				draw_arc(meteor_p, 19.0, 0, TAU, 24, Color("FFF08A"), 2.5)
+			"mine":
+				# Armed mines have a solid disc, eight feet, blinking fuse and a
+				# faint scan sector instead of a generic opaque trigger circle.
+				draw_circle(screen_position, radius, Color(color, 0.035 if warmup <= 0.0 else 0.075))
+				draw_arc(screen_position, radius, 0, TAU, 36, Color(color, 0.24 if warmup <= 0.0 else 0.60), 1.4, true)
+				for foot_index in 8:
+					var direction := Vector2.from_angle(float(foot_index) * TAU / 8.0)
+					draw_line(screen_position + direction * 8.0, screen_position + direction * 15.0, Color("5D6670"), 3.0, true)
+				draw_circle(screen_position, 10.0, Color("303940"))
+				draw_arc(screen_position, 10.0, 0, TAU, 18, Color("FFB34A"), 2.0)
+				draw_circle(screen_position, 3.0 + pulse * 1.2, Color("FF4D43") if warmup <= 0.0 else Color("FFE36E"))
+				if warmup <= 0.0:
+					draw_arc(screen_position, radius * 0.72, game_time * 2.4, game_time * 2.4 + 1.1, 12, Color("FF6B55", 0.72), 2.0, true)
+			"burning_zone":
+				draw_circle(screen_position, radius, Color("2B1510", 0.34))
+				draw_circle(screen_position, radius * 0.84, Color("FF572E", 0.10 + pulse * 0.04))
+				draw_arc(screen_position, radius, 0, TAU, 44, Color("FF7A38", 0.58), 2.0, true)
+				for flame_index in 9:
+					var flame_angle := float(flame_index * 13 + int(effect.get("source_id", 0))) * 0.71
+					var flame_distance := radius * (0.18 + float((flame_index * 7) % 10) * 0.065)
+					var flame := screen_position + Vector2.from_angle(flame_angle) * flame_distance
+					var flame_scale := 0.65 + float(flame_index % 3) * 0.22 + pulse * 0.12
+					_draw_polygon_shape(flame, [Vector2(0, -11), Vector2(6, 6), Vector2(0, 2), Vector2(-6, 6)], sin(game_time * 4.0 + flame_index) * 0.18, Color("FF572E", 0.80), Color("FFC857"), 1.0, flame_scale)
+			"gravity":
+				draw_circle(screen_position, radius, Color("4A2388", 0.08 + pulse * 0.03))
+				draw_circle(screen_position, 17.0 + pulse * 3.0, Color(0.01, 0.0, 0.025, 0.96))
+				for spiral_index in 4:
+					var spiral_radius := radius * (0.25 + spiral_index * 0.18)
+					var start := game_time * (0.65 + spiral_index * 0.10) + spiral_index * 1.3
+					draw_arc(screen_position, spiral_radius, start, start + 4.8, 28, Color("9A6CFF", 0.38 + spiral_index * 0.08), 2.0, true)
+				for arrow_index in 6:
+					var direction := Vector2.from_angle(game_time * 0.3 + arrow_index * TAU / 6.0)
+					var outer := screen_position + direction * radius * 0.86
+					var inner := screen_position + direction * radius * 0.58
+					draw_line(outer, inner, Color("E8D5FF", 0.68), 2.0, true)
+					_draw_polygon_shape(inner, [Vector2(5, 0), Vector2(-4, -3), Vector2(-4, 3)], direction.angle() + PI, Color("E8D5FF", 0.72), Color.TRANSPARENT, 0.0)
+			"lingering":
+				draw_circle(screen_position, 15.0 + pulse * 3.0, Color("73F3DD", 0.13))
+				draw_arc(screen_position, 18.0 + pulse * 2.0, game_time * 1.8, game_time * 1.8 + 5.0, 24, Color("73F3DD", 0.82), 2.4, true)
+				draw_arc(screen_position, 10.0, -game_time * 2.4, -game_time * 2.4 + 4.5, 18, Color("D9FFF8", 0.94), 1.6, true)
+				for orbit_index in 3:
+					draw_circle(screen_position + Vector2.from_angle(game_time * 2.2 + orbit_index * TAU / 3.0) * 13.0, 2.5, Color("D9FFF8"))
+			"chain_blast":
+				draw_circle(screen_position, radius * warmup_progress, Color("FF8052", 0.08 + warmup_progress * 0.08))
+				for ring_index in 3:
+					var ring_radius := radius * (0.35 + ring_index * 0.24) * (0.55 + warmup_progress * 0.45)
+					draw_arc(screen_position, ring_radius, game_time * (0.7 + ring_index * 0.2), game_time * (0.7 + ring_index * 0.2) + 4.6, 28, Color("FF8052" if ring_index != 1 else "FFE07A", 0.72), 2.2 + ring_index * 0.5, true)
+			"bomblet":
+				draw_circle(screen_position, radius, Color("FF9B54", 0.055))
+				draw_arc(screen_position, radius, 0, TAU, 32, Color("FF9B54", 0.54), 1.8, true)
+				var bomblet_p := screen_position + Vector2(0, -28.0 * (1.0 - warmup_progress))
+				draw_circle(bomblet_p, 8.0, Color("3B4248"))
+				draw_line(bomblet_p + Vector2(0, -7), bomblet_p + Vector2(4, -14), Color("FFE58A"), 1.8, true)
+				draw_circle(bomblet_p + Vector2(4, -14), 2.2 + pulse, Color("FF7043"))
+			"temporal_echo", "ufo_echo":
+				for echo_index in 3:
+					var echo_radius := radius * (0.35 + echo_index * 0.23) * (0.65 + warmup_progress * 0.35)
+					draw_arc(screen_position, echo_radius, game_time * (1.0 + echo_index * 0.25), game_time * (1.0 + echo_index * 0.25) + 4.7, 24, Color("66F0DD", 0.62 - echo_index * 0.10), 2.0, true)
+				draw_line(screen_position - Vector2(0, 12), screen_position, Color("EAFFFB", 0.84), 2.0, true)
+				draw_line(screen_position, screen_position + Vector2(9, 4), Color("EAFFFB", 0.84), 2.0, true)
+			"guardian":
+				draw_circle(screen_position, radius + 5.0 + pulse * 2.0, Color("79C8FF", 0.09))
+				draw_arc(screen_position, radius + 5.0 + pulse * 2.0, 0, TAU, 24, Color("79C8FF", 0.58), 2.0, true)
+				draw_circle(screen_position + Vector2(0, -9), 6.0, Color("FFF3B0"))
+				draw_line(screen_position + Vector2(0, -2), screen_position + Vector2(0, 14), Color("A9D8FF"), 7.0, true)
+				_draw_polygon_shape(screen_position + Vector2(-9, 5), [Vector2(-5, -8), Vector2(5, -7), Vector2(7, 3), Vector2(0, 10), Vector2(-7, 3)], 0.0, Color("79C8FF", 0.86), Color("FFF3B0"), 1.2)
+				draw_line(screen_position + Vector2(6, 5), screen_position + Vector2(17, -7), Color("FFF3B0"), 2.4, true)
+				if float(effect.get("max_hp", 0.0)) > 0.0:
+					_draw_bar(screen_position + Vector2(-18, -28), Vector2(36, 4), float(effect.get("hp", 0.0)) / float(effect["max_hp"]), Color("79C8FF"), Color("1B2930"))
+			"auto_turret":
+				var turret_direction := Vector2.from_angle(game_time * 1.4 + float(int(effect.get("source_id", 0))))
+				draw_circle(screen_position, 13.0, Color("314A56"))
+				draw_arc(screen_position, 13.0, 0, TAU, 20, Color("68D8FF"), 2.0)
+				for leg_index in 3:
+					var leg := Vector2.from_angle(PI * 0.5 + leg_index * TAU / 3.0)
+					draw_line(screen_position + leg * 6.0, screen_position + leg * 21.0, Color("728893"), 3.0, true)
+				draw_line(screen_position, screen_position + turret_direction * 25.0, Color("EAFBFF"), 6.0, true)
+				draw_circle(screen_position + turret_direction * 26.0, 3.0 + pulse * 1.5, Color("83E8FF"))
+			"repair_drone":
+				var drone_rotation := game_time * 1.6
+				_draw_polygon_shape(screen_position, [Vector2(0, -11), Vector2(14, 0), Vector2(0, 11), Vector2(-14, 0)], drone_rotation * 0.08, Color("2B7563"), Color("EAFFF7"), 1.8)
+				draw_circle(screen_position, 5.0 + pulse, Color("67E8B2"))
+				for rotor_index in 4:
+					var rotor_direction := Vector2.from_angle(drone_rotation + rotor_index * TAU / 4.0)
+					var rotor := screen_position + rotor_direction * 18.0
+					draw_arc(rotor, 5.0, drone_rotation * 2.0, drone_rotation * 2.0 + PI, 10, Color("EAFFF7", 0.76), 1.5, true)
+				draw_line(screen_position - Vector2(6, 0), screen_position + Vector2(6, 0), Color("EAFFF7"), 2.0, true)
+				draw_line(screen_position - Vector2(0, 6), screen_position + Vector2(0, 6), Color("67E8B2"), 2.0, true)
+			"boss_burn":
+				for flame_index in 6:
+					var flame := screen_position + Vector2.from_angle(float(flame_index) * TAU / 6.0) * (radius * 0.7)
+					_draw_polygon_shape(flame, [Vector2(0, -11), Vector2(6, 6), Vector2(0, 2), Vector2(-6, 6)], sin(game_time * 5.0 + flame_index) * 0.2, Color("FF572E", 0.78), Color("FFC857"), 1.0)
+			"boss_poison":
+				for bubble_index in 8:
+					var bubble := screen_position + Vector2.from_angle(game_time * 0.3 + bubble_index * 2.1) * radius * (0.35 + float(bubble_index % 3) * 0.18)
+					draw_circle(bubble, 3.0 + bubble_index % 3, Color("83DC4A", 0.62))
+					draw_arc(bubble, 4.0 + bubble_index % 3, 0, TAU, 10, Color("DCFF9B", 0.76), 1.0)
+			_:
+				draw_circle(screen_position, radius, Color(color, 0.10 if warmup > 0.0 else 0.14))
+				draw_arc(screen_position, radius, 0.0, TAU, 36, Color(color, 0.55 + pulse * 0.20), 2.0, true)
+		if not ability_id.is_empty():
+			_draw_upgrade_vfx_glyph(ability_id, screen_position + Vector2(0, -minf(radius + 11.0, 54.0)), 5.2, 0.72 * maxf(0.25, ttl_ratio))
 
 
 func _update_visuals(delta: float) -> void:
@@ -9365,6 +9771,14 @@ func _draw_units() -> void:
 			draw_arc(p + aim * 58.0, 6.0, 0, TAU, 12, Color("EAF6FF"), 1.5)
 			_draw_character_icon(str(player["class_id"]), p, 1.0, Vector2(player["facing"]).angle(), float(player["flash"]) > 0.0)
 			draw_arc(p, 22.0, 0, TAU, 28, GOLD, 2.5)
+			if float(player.get("support_shield", 0.0)) > 0.0:
+				var player_shield_source := str(player.get("support_shield_source", "holy_shield"))
+				if not SoldierUpgradeVfxCatalog.DESCRIPTORS.has(player_shield_source):
+					player_shield_source = "holy_shield"
+				var player_shield_color := SoldierUpgradeVfxCatalog.color_for(player_shield_source)
+				draw_circle(p, 30.0, Color(player_shield_color, 0.08))
+				draw_arc(p, 30.0 + sin(game_time * 6.0) * 1.5, 0, TAU, 30, Color(player_shield_color, 0.78), 2.4, true)
+				_draw_upgrade_vfx_glyph(player_shield_source, p + Vector2(0, -33), 4.8, 0.82)
 			if float(player["invuln"]) > 0.0:
 				draw_arc(p, 27.0 + sin(game_time * 9.0) * 2.0, 0, TAU, 32, Color(0.85, 0.98, 1.0, 0.65), 2.0)
 
@@ -9681,6 +10095,78 @@ func _draw_character_icon(class_id: String, center: Vector2, scale: float, rotat
 			draw_line(center + Vector2(5, 0).rotated(rotation) * scale, center + Vector2(14, 8).rotated(rotation) * scale, GOLD, 2.0 * scale)
 
 
+func _draw_soldier_upgrade_overlays(soldier: Dictionary, p: Vector2, radius: float) -> void:
+	var snapshot: Dictionary = Dictionary(soldier.get("upgrade_snapshot", {}))
+	# Current snapshots already carry the validated map. Avoid deep-copying that
+	# map for every visible soldier on every Web frame; only legacy fixtures fall
+	# back to the migration helper.
+	var specials: Dictionary = Dictionary(snapshot.get("special_effects", {}))
+	if specials.is_empty() and snapshot.has("active_specials"):
+		specials = SoldierUpgradeRuntime.special_effect_map(snapshot)
+	if specials.is_empty():
+		return
+	var state: Dictionary = Dictionary(soldier.get("special_runtime", {}))
+	var pulse := 0.5 + 0.5 * sin(game_time * 6.0 + float(int(soldier.get("id", 0)) % 17))
+	var facing := Vector2(soldier.get("aim_dir", soldier.get("vel", Vector2.RIGHT))).normalized()
+	if facing.length_squared() < 0.001:
+		facing = Vector2.RIGHT
+	var side := Vector2(-facing.y, facing.x)
+
+	if specials.has("burning_sword"):
+		var blade_start := p + facing * 5.0 - side * 3.0
+		var blade_end := p + facing * (radius + 19.0) - side * 3.0
+		draw_line(blade_start, blade_end, Color("FF5A24"), 6.0, true)
+		draw_line(blade_start, blade_end, Color("FFE36E"), 2.2, true)
+		for flame_index in 3:
+			var flame := blade_start.lerp(blade_end, 0.35 + flame_index * 0.25) + side * sin(game_time * 13.0 + flame_index * 2.1) * 3.5
+			_draw_polygon_shape(flame, [Vector2(6, 0), Vector2(-4, -4), Vector2(-1, 0), Vector2(-4, 4)], facing.angle(), Color("FF6A2A", 0.88), Color("FFE36E"), 0.7)
+
+	var tactical_max := float(state.get("tactical_shield_max", 0.0))
+	var tactical := float(state.get("tactical_shield", 0.0))
+	if tactical_max > 0.0 and tactical > 0.0:
+		var shield_ratio := clampf(tactical / tactical_max, 0.0, 1.0)
+		var shield_radius := radius + 9.0 + pulse * 1.5
+		for edge_index in 6:
+			var a := p + Vector2.from_angle(float(edge_index) * TAU / 6.0) * shield_radius
+			var b := p + Vector2.from_angle(float(edge_index + 1) * TAU / 6.0) * shield_radius
+			draw_line(a, b, Color("62B8FF", 0.26 + shield_ratio * 0.55), 2.0 + shield_ratio, true)
+	if float(state.get("kinetic_barrier", 0.0)) > 0.0:
+		var kinetic_radius := radius + 14.0 + pulse * 2.0
+		draw_arc(p, kinetic_radius, facing.angle() - 1.15, facing.angle() + 1.15, 18, Color("63D5FF", 0.88), 3.5, true)
+		for lane in [-1.0, 1.0]:
+			draw_line(p + facing * kinetic_radius + side * lane * 3.0, p + facing * (kinetic_radius + 9.0) + side * lane * 6.0, Color("EBFCFF", 0.86), 2.0, true)
+	if float(soldier.get("support_shield", 0.0)) > 0.0:
+		var support_source := str(soldier.get("support_shield_source", "holy_shield"))
+		var support_color := SoldierUpgradeVfxCatalog.color_for(support_source if SoldierUpgradeVfxCatalog.DESCRIPTORS.has(support_source) else "holy_shield")
+		draw_circle(p, radius + 12.0 + pulse, Color(support_color, 0.09))
+		draw_arc(p, radius + 12.0 + pulse, 0, TAU, 28, Color(support_color, 0.72), 2.2, true)
+		_draw_upgrade_vfx_glyph(support_source if SoldierUpgradeVfxCatalog.DESCRIPTORS.has(support_source) else "holy_shield", p + Vector2(0, -radius - 15.0), 4.5, 0.85)
+
+	if specials.has("guardian_aura"):
+		var aura_radius := float(Dictionary(specials["guardian_aura"]).get("radius", 180.0))
+		draw_circle(p, aura_radius, Color("78C7FF", 0.025 + pulse * 0.018))
+		draw_arc(p, aura_radius, game_time * 0.24, game_time * 0.24 + 5.2, 48, Color("78C7FF", 0.30), 1.6, true)
+		for ward_index in 4:
+			_draw_upgrade_vfx_glyph("guardian_aura", p + Vector2.from_angle(game_time * 0.24 + ward_index * TAU / 4.0) * aura_radius, 5.0, 0.62)
+	if specials.has("rally_beacon"):
+		var rally_radius := float(Dictionary(specials["rally_beacon"]).get("radius", 170.0))
+		draw_arc(p, rally_radius, -game_time * 0.32, -game_time * 0.32 + 5.0, 44, Color("FFD15B", 0.34), 1.8, true)
+		draw_line(p + Vector2(-5, -radius - 3.0), p + Vector2(-5, -radius - 35.0), Color("FFF5C5", 0.90), 2.0, true)
+		_draw_polygon_shape(p + Vector2(-5, -radius - 34.0), [Vector2(0, 0), Vector2(18, 5), Vector2(0, 11)], 0.0, Color("FFD15B", 0.85), Color("FFF5C5"), 1.0)
+
+	var vengeance_stacks := int(state.get("vengeance_stacks", 0))
+	if vengeance_stacks > 0:
+		for stack_index in vengeance_stacks:
+			var stack_angle := -PI * 0.8 + float(stack_index) * PI * 1.6 / float(maxi(1, vengeance_stacks - 1))
+			draw_circle(p + Vector2.from_angle(stack_angle) * (radius + 12.0), 2.8 + pulse, Color("FF675E"))
+
+	var unit_layers := SoldierUpgradeVfxCatalog.active_ids(specials, "unit", 5, floori(game_time * 0.8) + int(soldier.get("id", 0)))
+	for layer_index in unit_layers.size():
+		var angle := game_time * (0.32 if layer_index % 2 == 0 else -0.27) + float(layer_index) * TAU / float(maxi(1, unit_layers.size()))
+		var glyph_center := p + Vector2.from_angle(angle) * (radius + 19.0 + float(layer_index % 2) * 4.0)
+		_draw_upgrade_vfx_glyph(str(unit_layers[layer_index]), glyph_center, 3.8, 0.70)
+
+
 func _draw_soldier(soldier: Dictionary) -> void:
 	var ground_p := _world_to_screen(soldier["pos"])
 	if not _on_screen(ground_p, 90): return
@@ -9815,6 +10301,7 @@ func _draw_soldier(soldier: Dictionary) -> void:
 				draw_line(p - rifle_facing * 7.0, p + rifle_facing * 31.0, Color("263136"), 5.0)
 				draw_line(p + rifle_facing * 6.0, p + rifle_facing * 35.0, Color("DCE8EA"), 1.8)
 				_draw_polygon_shape(p + rifle_facing * 4.0 + rifle_side * 5.0, [Vector2(-3, -2), Vector2(4, -2), Vector2(6, 8), Vector2(-1, 9)], rifle_facing.angle(), Color("20282C"), FRIEND_DARK, 1.0)
+	_draw_soldier_upgrade_overlays(soldier, p, r)
 	var charge_seconds := _soldier_charge_seconds(type_id)
 	if float(soldier["charge"]) > 0.0 and charge_seconds > 0.0:
 		var charge_ratio := 1.0 - float(soldier["charge"]) / charge_seconds
@@ -9823,6 +10310,55 @@ func _draw_soldier(soldier: Dictionary) -> void:
 		_draw_bar(p + Vector2(-r - 4, -r - 11), Vector2((r + 4) * 2, 4), float(soldier["hp"]) / float(soldier["max_hp"]), HEAL_GREEN, Color("18242A"))
 	if type_id in ["cannon", "musketeer", "rifleman", "tank", "rocket", "gatling", "helicopter", "bomber", "ufo"]:
 		_draw_text(str(GameConfig.SOLDIERS[type_id]["name"]), p + Vector2(0, r + 18.0), 10, Color("C9EDFF"), HORIZONTAL_ALIGNMENT_CENTER, 104.0)
+
+
+func _draw_enemy_soldier_status_vfx(enemy: Dictionary, p: Vector2, radius: float) -> void:
+	var entity_phase := game_time * 8.0 + float(int(enemy.get("id", 0)) % 23)
+	if float(enemy.get("soldier_burn_ttl", 0.0)) > 0.0:
+		for flame_index in 4:
+			var flame_x := -radius * 0.72 + float(flame_index) * radius * 0.48
+			var flame_base := p + Vector2(flame_x, radius * 0.55 + sin(entity_phase + flame_index * 1.7) * 2.0)
+			_draw_polygon_shape(flame_base, [Vector2(0, -12), Vector2(6, 5), Vector2(1, 2), Vector2(-5, 6)], sin(entity_phase * 0.17 + flame_index) * 0.20, Color("FF5A24", 0.88), Color("FFE36E"), 1.0, 0.72 + float(flame_index % 2) * 0.16)
+	var poison_stacks := 0
+	for poison_value in Dictionary(enemy.get("soldier_poison_sources", {})).values():
+		if poison_value is Dictionary and float(Dictionary(poison_value).get("ttl", 0.0)) > 0.0:
+			poison_stacks += int(Dictionary(poison_value).get("stacks", 0))
+	if poison_stacks > 0:
+		for bubble_index in mini(6, poison_stacks + 2):
+			var angle := entity_phase * 0.11 + float(bubble_index) * 2.37
+			var bubble := p + Vector2.from_angle(angle) * (radius + 5.0 + float(bubble_index % 2) * 4.0) + Vector2(0, -5.0)
+			draw_circle(bubble, 2.4 + float(bubble_index % 3), Color("83DC4A", 0.70))
+			draw_arc(bubble, 3.3 + float(bubble_index % 3), 0, TAU, 10, Color("DCFF9B", 0.84), 0.9)
+	if float(enemy.get("soldier_frost_ttl", 0.0)) > 0.0:
+		draw_arc(p, radius + 7.0, 0, TAU, 24, Color("65D9FF", 0.74), 2.2, true)
+		for ice_index in 6:
+			var ice_direction := Vector2.from_angle(float(ice_index) * TAU / 6.0)
+			var ice := p + ice_direction * (radius + 7.0)
+			_draw_polygon_shape(ice, [Vector2(0, -5), Vector2(2.4, 0), Vector2(0, 5), Vector2(-2.4, 0)], ice_direction.angle(), Color("65D9FF", 0.76), Color("E8FBFF"), 0.8)
+	if float(enemy.get("soldier_paralysis_ttl", 0.0)) > 0.0 or float(enemy.get("enhancement_stun", 0.0)) > 0.0 and str(enemy.get("soldier_last_status", "")) == "paralysis_arrow":
+		for bolt_index in 3:
+			var angle := entity_phase * 0.15 + bolt_index * TAU / 3.0
+			var start := p + Vector2.from_angle(angle) * (radius + 3.0)
+			var end := p + Vector2.from_angle(angle + 0.36) * (radius + 13.0)
+			draw_polyline(PackedVector2Array([start, start.lerp(end, 0.5) + Vector2.from_angle(angle + PI * 0.5) * 4.0, end]), Color("FFE25C", 0.92), 2.0, true)
+	if int(enemy.get("soldier_corrosion_stacks", 0)) > 0:
+		for crack_index in 3:
+			var crack_start := p + Vector2(-radius * 0.55 + crack_index * radius * 0.52, -radius * 0.35)
+			draw_polyline(PackedVector2Array([crack_start, crack_start + Vector2(4, 5), crack_start + Vector2(0, 10), crack_start + Vector2(6, 15)]), Color("A8E85B", 0.84), 1.6, true)
+	if float(enemy.get("soldier_void_mark_ttl", 0.0)) > 0.0:
+		var mark := p + Vector2(0, -radius - 18.0)
+		draw_circle(mark, 7.0, Color(0.02, 0.0, 0.06, 0.88))
+		draw_arc(mark, 10.0, entity_phase * 0.1, entity_phase * 0.1 + 5.0, 18, Color("B56CFF"), 2.0, true)
+		draw_circle(mark, 2.3, Color("F0C8FF"))
+	if float(enemy.get("soldier_focus_mark_ttl", 0.0)) > 0.0:
+		var focus_radius := radius + 13.0 + sin(entity_phase) * 1.5
+		for focus_index in 4:
+			var direction := Vector2.from_angle(float(focus_index) * TAU / 4.0)
+			draw_line(p + direction * (focus_radius - 6.0), p + direction * (focus_radius + 4.0), Color("FF6B75", 0.90), 2.2, true)
+	if float(enemy.get("soldier_suppression_ttl", 0.0)) > 0.0:
+		for bar_index in 3:
+			var bar_y := p.y - radius - 9.0 - bar_index * 4.0
+			draw_line(Vector2(p.x - 9.0 + bar_index * 2.0, bar_y), Vector2(p.x + 9.0 - bar_index * 2.0, bar_y), Color("FFB45D", 0.82), 2.0, true)
 
 
 func _draw_enemy(enemy: Dictionary) -> void:
@@ -9976,6 +10512,7 @@ func _draw_enemy(enemy: Dictionary) -> void:
 			draw_line(p + rifle_facing * 7.0, p + rifle_facing * 33.0, Color("AEB8BD"), 1.8)
 			var magazine_side := Vector2(-rifle_facing.y, rifle_facing.x)
 			_draw_polygon_shape(p + rifle_facing * 4.0 + magazine_side * 4.0, [Vector2(-3, -2), Vector2(4, -2), Vector2(6, 7), Vector2(-1, 8)], rifle_facing.angle(), Color("22292C"), ENEMY_DARK, 1.0)
+	_draw_enemy_soldier_status_vfx(enemy, p, r)
 	_draw_bar(p + Vector2(-r - 5, -r - 13), Vector2((r + 5) * 2, 5), float(enemy["hp"]) / float(enemy["max_hp"]), ENEMY_RED, Color("231A1A"))
 	_draw_enemy_enhancement_badge(p, r, enemy)
 	if type_id in ["cannon", "musketeer", "rifleman", "tank", "rocket", "gatling", "helicopter", "bomber", "ufo"]:
@@ -10001,6 +10538,96 @@ func _draw_enemy_enhancement_badge(position: Vector2, radius: float, enemy: Dict
 	# The badge is language-neutral and appears on many enemies, so draw it
 	# directly instead of running the full localization replacement table per unit.
 	draw_string(ui_font, badge.position + Vector2(0.0, 13.0), label, HORIZONTAL_ALIGNMENT_CENTER, badge.size.x, 10, Color("FFF8EC"))
+
+
+func _projectile_visible_vfx_layers(projectile: Dictionary, limit: int = 7) -> Array[String]:
+	var layers: Array[String] = []
+	for layer_value in Array(projectile.get("vfx_layers", [])):
+		var layer_id := str(layer_value)
+		if SoldierUpgradeVfxCatalog.DESCRIPTORS.has(layer_id):
+			layers.append(layer_id)
+	if layers.is_empty():
+		layers = SoldierUpgradeVfxCatalog.active_ids(Dictionary(projectile.get("soldier_specials", {})), "projectile")
+	if layers.size() <= limit:
+		return layers
+	var selected: Array[String] = []
+	# Elemental payloads remain continuously readable; the remaining slots cycle
+	# so even a heavily researched unit visibly exposes every purchased layer.
+	for priority_id in ["burning_ammo", "frost_arrow", "paralysis_arrow", "toxic_payload", "gravity_warhead", "overcharge_capacitor"]:
+		if priority_id in layers and selected.size() < limit:
+			selected.append(priority_id)
+	var cycle_start := posmod(floori(game_time * 2.0) + int(projectile.get("id", 0)), layers.size())
+	for offset in layers.size():
+		var candidate := layers[(cycle_start + offset) % layers.size()]
+		if candidate not in selected:
+			selected.append(candidate)
+		if selected.size() >= limit:
+			break
+	return selected
+
+
+func _draw_soldier_projectile_vfx(projectile: Dictionary, p: Vector2, direction: Vector2) -> void:
+	var layers := _projectile_visible_vfx_layers(projectile, 4 if _is_touch_scheme() else 7)
+	if layers.is_empty():
+		return
+	if direction.length_squared() < 0.001:
+		direction = Vector2.RIGHT
+	var side := Vector2(-direction.y, direction.x)
+	var phase := game_time * 15.0 + float(int(projectile.get("id", 0)) % 31)
+	var drawn_families: Dictionary = {}
+	for layer_index in layers.size():
+		var ability_id := str(layers[layer_index])
+		var family := SoldierUpgradeVfxCatalog.family_for(ability_id)
+		var color := SoldierUpgradeVfxCatalog.color_for(ability_id)
+		var accent := SoldierUpgradeVfxCatalog.accent_for(ability_id)
+		if not drawn_families.has(family):
+			drawn_families[family] = true
+			match family:
+				"fire":
+					# Three asymmetrical flame tongues and sparks make flaming arrows
+					# unmistakable even when the base projectile is only a thin line.
+					draw_line(p - direction * 19.0, p + direction * 7.0, color, 4.5, true)
+					for flame_index in 3:
+						var trail := p - direction * (13.0 + float(flame_index) * 7.0) + side * sin(phase + flame_index * 2.2) * (3.0 + flame_index)
+						_draw_polygon_shape(trail, [Vector2(7, 0), Vector2(-5, -4), Vector2(-2, 0), Vector2(-5, 4)], direction.angle(), Color(color, 0.82 - flame_index * 0.15), Color(accent, 0.88), 0.8, 1.0 + flame_index * 0.12)
+						draw_circle(trail - direction * 6.0 + side * sin(phase * 1.7 + flame_index) * 2.0, 1.8, accent)
+				"frost":
+					draw_line(p - direction * 15.0, p + direction * 9.0, Color(color, 0.86), 3.6, true)
+					for shard_index in 3:
+						var shard := p - direction * (7.0 + shard_index * 8.0) + side * (-5.0 + shard_index * 5.0)
+						_draw_polygon_shape(shard, [Vector2(0, -4), Vector2(2.5, 0), Vector2(0, 4), Vector2(-2.5, 0)], phase * 0.08 + shard_index, Color(color, 0.72), accent, 0.8)
+				"lightning":
+					var bolt := PackedVector2Array([p - direction * 19.0, p - direction * 10.0 + side * sin(phase) * 5.0, p - direction * 2.0 - side * sin(phase * 1.3) * 4.0, p + direction * 8.0])
+					draw_polyline(bolt, Color(color, 0.76), 4.5, true)
+					draw_polyline(bolt, accent, 1.6, true)
+				"toxic":
+					draw_line(p - direction * 17.0, p + direction * 6.0, Color(color, 0.72), 4.0, true)
+					for bubble_index in 3:
+						var bubble := p - direction * (8.0 + bubble_index * 7.0) + side * sin(phase * 0.7 + bubble_index * 2.0) * 5.0
+						draw_circle(bubble, 2.0 + bubble_index * 0.7, Color(color, 0.72))
+						draw_arc(bubble, 2.8 + bubble_index * 0.7, 0, TAU, 10, accent, 0.8)
+				"void", "cosmic":
+					draw_circle(p, 7.0, Color(0.02, 0.01, 0.06, 0.82))
+					draw_arc(p, 11.0, phase * 0.12, phase * 0.12 + 4.8, 18, color, 2.2, true)
+					draw_arc(p, 6.0, -phase * 0.17, -phase * 0.17 + 4.2, 14, accent, 1.4, true)
+				"temporal":
+					for echo_index in 3:
+						var echo_p := p - direction * (9.0 + echo_index * 8.0)
+						draw_arc(echo_p, 5.0 + echo_index, phase * 0.08, phase * 0.08 + 4.7, 14, Color(color, 0.60 - echo_index * 0.14), 1.5, true)
+				"explosive", "earth":
+					draw_circle(p, 9.0 + sin(phase) * 1.5, Color(color, 0.18))
+					draw_arc(p, 10.0, 0, TAU, 18, color, 2.2, true)
+					for node_index in 3:
+						draw_circle(p + Vector2.from_angle(phase * 0.05 + node_index * TAU / 3.0) * 8.0, 2.2, accent)
+				"target", "tech":
+					draw_arc(p + direction * 8.0, 8.0, phase * 0.08, phase * 0.08 + 5.0, 16, color, 1.7, true)
+					draw_line(p + direction * 3.0 - side * 4.0, p + direction * 13.0 + side * 4.0, accent, 1.2, true)
+				"blood":
+					_draw_polygon_shape(p - direction * 8.0, [Vector2(5, 0), Vector2(-2, -4), Vector2(-6, 0), Vector2(-2, 4)], direction.angle(), Color(color, 0.75), accent, 0.8)
+				_:
+					draw_line(p - direction * 14.0, p + direction * 7.0, Color(color, 0.58), 3.2, true)
+		var glyph_offset := p - direction * (25.0 + float(layer_index % 4) * 8.0) + side * (-9.0 if layer_index % 2 == 0 else 9.0)
+		_draw_upgrade_vfx_glyph(ability_id, glyph_offset, 3.2, 0.72)
 
 
 func _draw_projectiles() -> void:
@@ -10046,6 +10673,8 @@ func _draw_projectiles() -> void:
 			_:
 				draw_circle(p, float(projectile["radius"]) + sin(game_time * 11.0) * 1.3, Color(projectile["color"]))
 				draw_circle(p, max(2.0, float(projectile["radius"]) * 0.45), Color("F5FAFF"))
+		if str(projectile.get("team", "")) == "friendly":
+			_draw_soldier_projectile_vfx(projectile, p, direction)
 
 
 func _draw_python_boss_ground_effects() -> void:
@@ -10568,6 +11197,120 @@ func _draw_drops_and_tombstones() -> void:
 		draw_arc(p, 17.0 + sin(game_time * 3.0) * 2.0, 0, TAU, 24, Color(1.0, 0.84, 0.35, 0.35), 1.5)
 
 
+func _draw_upgrade_vfx_glyph(ability_id: String, center: Vector2, size: float, alpha: float = 1.0) -> void:
+	var index := maxi(0, SoldierUpgradeVfxCatalog.visual_index(ability_id))
+	var shape_id := SoldierUpgradeVfxCatalog.shape_for(ability_id)
+	var motif := index % 8
+	var tier := index / 8
+	var color := Color(SoldierUpgradeVfxCatalog.color_for(ability_id), alpha)
+	var accent := Color(SoldierUpgradeVfxCatalog.accent_for(ability_id), alpha)
+	match motif:
+		0:
+			_draw_polygon_shape(center, [Vector2(0, -size), Vector2(size * 0.72, 0), Vector2(0, size), Vector2(-size * 0.72, 0)], 0.0, Color(color, alpha * 0.28), accent, maxf(1.0, size * 0.16))
+		1:
+			_draw_polygon_shape(center, [Vector2(0, -size), Vector2(size * 0.90, size * 0.72), Vector2(-size * 0.90, size * 0.72)], 0.0, Color(color, alpha * 0.30), accent, maxf(1.0, size * 0.16))
+		2:
+			draw_arc(center, size, 0.0, TAU, 18, accent, maxf(1.0, size * 0.17), true)
+			draw_line(center - Vector2(size * 0.62, 0), center + Vector2(size * 0.62, 0), color, maxf(1.0, size * 0.14), true)
+		3:
+			draw_polyline(PackedVector2Array([center + Vector2(-size, -size * 0.45), center, center + Vector2(-size, size * 0.45)]), accent, maxf(1.0, size * 0.19), true)
+			draw_polyline(PackedVector2Array([center, center + Vector2(size, -size * 0.45), center + Vector2(size * 0.55, size * 0.45)]), color, maxf(1.0, size * 0.15), true)
+		4:
+			draw_line(center - Vector2(size, 0), center + Vector2(size, 0), accent, maxf(1.0, size * 0.18), true)
+			draw_line(center - Vector2(0, size), center + Vector2(0, size), color, maxf(1.0, size * 0.18), true)
+		5:
+			draw_rect(Rect2(center - Vector2.ONE * size * 0.75, Vector2.ONE * size * 1.5), Color(color, alpha * 0.20))
+			draw_rect(Rect2(center - Vector2.ONE * size * 0.75, Vector2.ONE * size * 1.5), accent, false, maxf(1.0, size * 0.15))
+		6:
+			for spoke in 4:
+				var direction := Vector2.from_angle(PI * 0.25 + float(spoke) * PI * 0.5)
+				draw_line(center - direction * size, center + direction * size, accent if spoke % 2 == 0 else color, maxf(1.0, size * 0.15), true)
+		7:
+			draw_arc(center, size, -2.7, -0.35, 12, accent, maxf(1.0, size * 0.17), true)
+			draw_arc(center, size, 0.45, 2.8, 12, color, maxf(1.0, size * 0.17), true)
+	for dot_index in tier + 1:
+		var dot_angle := -PI * 0.5 + float(dot_index) * TAU / float(tier + 1)
+		draw_circle(center + Vector2.from_angle(dot_angle) * size * 1.34, maxf(1.0, size * 0.13), accent)
+	# A shape-name signature notch makes the descriptor itself part of the actual
+	# rendered primitive, while motif+tier keeps all 57 glyphs unambiguous.
+	var signature_angle := float(posmod(shape_id.hash(), 997)) / 997.0 * TAU
+	var signature_direction := Vector2.from_angle(signature_angle)
+	draw_line(center + signature_direction * size * 0.32, center + signature_direction * size * 0.88, color, maxf(1.0, size * 0.11), true)
+
+
+func _draw_soldier_upgrade_vfx_burst(particle: Dictionary, center: Vector2, progress: float, ratio: float) -> void:
+	var ability_id := str(particle.get("ability_id", ""))
+	if not SoldierUpgradeVfxCatalog.DESCRIPTORS.has(ability_id):
+		return
+	var family := SoldierUpgradeVfxCatalog.family_for(ability_id)
+	var color := Color(SoldierUpgradeVfxCatalog.color_for(ability_id), ratio)
+	var accent := Color(SoldierUpgradeVfxCatalog.accent_for(ability_id), ratio)
+	var size := float(particle.get("size", 20.0))
+	if typeof(particle.get("end_pos", null)) == TYPE_VECTOR2:
+		var end := _world_to_screen(Vector2(particle["end_pos"]))
+		if family == "lightning":
+			var points := PackedVector2Array([center])
+			var delta := end - center
+			var side := Vector2(-delta.y, delta.x).normalized()
+			for segment in range(1, 5):
+				var t := float(segment) / 5.0
+				points.append(center.lerp(end, t) + side * sin(float(segment) * 8.7 + game_time * 18.0) * 8.0 * ratio)
+			points.append(end)
+			draw_polyline(points, Color(color, ratio * 0.48), 6.0 * ratio + 1.0, true)
+			draw_polyline(points, accent, 2.0 * ratio + 0.8, true)
+		else:
+			draw_line(center, end, Color(color, ratio * 0.30), 8.0 * ratio + 1.0, true)
+			draw_line(center, end, accent, 2.0 * ratio + 0.7, true)
+	match family:
+		"fire":
+			for flame_index in 5:
+				var angle := float(flame_index) * TAU / 5.0 + game_time * 0.7
+				var base := center + Vector2.from_angle(angle) * size * progress
+				_draw_polygon_shape(base, [Vector2(0, -9), Vector2(6, 6), Vector2(0, 3), Vector2(-6, 6)], angle + PI * 0.5, Color(color, ratio * 0.75), accent, 1.0, 0.7 + progress * 0.7)
+		"frost":
+			for ice_index in 6:
+				var direction := Vector2.from_angle(float(ice_index) * TAU / 6.0)
+				draw_line(center + direction * size * 0.25, center + direction * size * (0.8 + progress), accent, 2.0, true)
+				draw_line(center + direction * size * 0.65, center + direction.rotated(0.45) * size * 0.82, color, 1.4, true)
+		"lightning":
+			for bolt_index in 4:
+				var angle := float(bolt_index) * TAU / 4.0 + progress
+				var direction := Vector2.from_angle(angle)
+				draw_polyline(PackedVector2Array([center, center + direction.rotated(0.28) * size * 0.55, center + direction * size * (1.0 + progress)]), accent, 2.2, true)
+		"toxic":
+			for bubble_index in 5:
+				var angle := float(bubble_index) * 2.13 + game_time * 0.8
+				var bubble := center + Vector2.from_angle(angle) * size * (0.35 + progress)
+				draw_circle(bubble, 2.5 + float(bubble_index % 3) * 1.4, Color(color, ratio * 0.72))
+				draw_arc(bubble, 3.5 + float(bubble_index % 3) * 1.4, 0, TAU, 10, accent, 1.0)
+		"void", "temporal", "cosmic":
+			for ring_index in 3:
+				var ring_radius := size * (0.35 + progress * 1.25 + float(ring_index) * 0.28)
+				draw_arc(center, ring_radius, game_time * (1.0 + ring_index * 0.3) + ring_index, game_time * (1.0 + ring_index * 0.3) + ring_index + 4.4, 20, accent if ring_index == 1 else color, 2.0, true)
+		"explosive", "earth":
+			draw_circle(center, size * progress * 2.2, Color(color, ratio * 0.18))
+			draw_arc(center, size * (0.45 + progress * 1.9), 0, TAU, 28, accent, 3.5 * ratio + 1.0, true)
+			for shard_index in 8:
+				var direction := Vector2.from_angle(float(shard_index) * TAU / 8.0)
+				draw_line(center + direction * size * 0.4, center + direction * size * (0.8 + progress * 1.2), color, 2.0, true)
+		"guard", "holy", "soul":
+			for edge_index in 6:
+				var a := center + Vector2.from_angle(float(edge_index) * TAU / 6.0) * size * (0.7 + progress)
+				var b := center + Vector2.from_angle(float(edge_index + 1) * TAU / 6.0) * size * (0.7 + progress)
+				draw_line(a, b, accent, 2.2, true)
+		"healing", "repair":
+			draw_line(center - Vector2(size, 0), center + Vector2(size, 0), accent, 4.0 * ratio + 1.0, true)
+			draw_line(center - Vector2(0, size), center + Vector2(0, size), color, 4.0 * ratio + 1.0, true)
+		"gold":
+			for coin_index in 6:
+				var coin := center + Vector2.from_angle(float(coin_index) * TAU / 6.0) * size * (0.4 + progress)
+				draw_circle(coin, 4.0, color)
+				draw_arc(coin, 4.0, 0, TAU, 10, accent, 1.2)
+		_:
+			draw_arc(center, size * (0.5 + progress), 0, TAU, 24, accent, 2.0, true)
+	_draw_upgrade_vfx_glyph(ability_id, center, size * (0.36 + progress * 0.18), ratio)
+
+
 func _draw_particles_and_floaters() -> void:
 	for particle in particles:
 		var p := _world_to_screen(particle["pos"])
@@ -10591,6 +11334,8 @@ func _draw_particles_and_floaters() -> void:
 				for i in 8: draw_line(p + Vector2.from_angle(i * TAU / 8.0) * 18.0, p + Vector2.from_angle(i * TAU / 8.0) * (42.0 + progress * 34.0), color, 2.0)
 			"fan":
 				for i in 7: draw_line(p, p + Vector2.RIGHT.rotated(lerp(-0.42, 0.42, float(i) / 6.0)) * (35.0 + progress * 28.0), color, 2.0)
+			"soldier_upgrade_vfx":
+				_draw_soldier_upgrade_vfx_burst(particle, p, progress, ratio)
 			_:
 				draw_circle(p, float(particle["size"]) * (1.0 + progress), Color(color, ratio * 0.25))
 				draw_arc(p, float(particle["size"]) * (1.0 + progress), 0, TAU, 24, color, 2.0)
@@ -10653,7 +11398,8 @@ func _draw_hud() -> void:
 		draw_rect(prompt_rect, HEAL_GREEN, false, 2.0)
 		_draw_text("按 E 或 B 開啟招募介面", prompt_rect.position + Vector2(prompt_rect.size.x * 0.5, 25), 15, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, prompt_rect.size.x - 16)
 
-	for i in notifications.size():
+	var visible_notification_count := mini(2, notifications.size()) if _is_touch_scheme() else notifications.size()
+	for i in visible_notification_count:
 		var notice: Dictionary = notifications[notifications.size() - 1 - i]
 		var alpha: float = clamp(float(notice["ttl"]) / min(0.4, float(notice["max_ttl"])), 0.0, 1.0)
 		var boss_hud_visible := _python_boss_hud_should_show() or _chaos_boss_hud_should_show() or _aionis_boss_hud_should_show()
@@ -10664,20 +11410,18 @@ func _draw_hud() -> void:
 		var notice_pitch := 42.0
 		var notice_font := 15
 		if _is_touch_scheme():
-			# Keep warnings below the two utility rows and horizontally between the
-			# move pad and the special button. Notifications must never hide a control.
+			# Touch shows only the two newest messages below the centered Menu handle.
+			# When its drawer is open, messages move beneath the short 5x2 panel.
+			# Combat telegraphs remain world-space cues and are never hidden here.
 			var scale := touch_ui_coordinate_scale
-			var utility_bottom := 0.0
-			for utility_value in _touch_utility_rects().values():
-				utility_bottom = maxf(utility_bottom, Rect2(utility_value).end.y)
-			var safe_left := _touch_move_center().x + (TOUCH_STICK_RADIUS + 12.0) * scale
-			var safe_right := _touch_special_rect().position.x - 12.0 * scale
+			var safe_left := 333.0 + 10.0 * scale
+			var safe_right := screen_size.x - 230.0 - 10.0 * scale
 			notice_x = safe_left
 			notice_width = maxf(180.0 * scale, safe_right - safe_left)
-			notice_y = utility_bottom + 10.0 * scale
-			notice_height = 34.0 * scale
-			notice_pitch = 42.0 * scale
-			notice_font = roundi(14.0 * scale)
+			notice_y = (172.0 if touch_utility_drawer_open else 68.0) * scale
+			notice_height = 30.0 * scale
+			notice_pitch = 34.0 * scale
+			notice_font = roundi(13.0 * scale)
 		var rect := Rect2(notice_x, notice_y + i * notice_pitch, notice_width, notice_height)
 		draw_rect(rect, Color(0.015, 0.03, 0.045, 0.76 * alpha))
 		_draw_text(str(notice["text"]), rect.position + Vector2(notice_width * 0.5, notice_height * 0.68), notice_font, Color(Color(notice["color"]), alpha), HORIZONTAL_ALIGNMENT_CENTER, notice_width - 20.0 * (touch_ui_coordinate_scale if _is_touch_scheme() else 1.0))
@@ -10971,6 +11715,17 @@ func _draw_touch_controls() -> void:
 	if language == "en":
 		labels = {"guide": "Help", "map": "Map", "skills": "Hero", "upgrades": "Troops", "recruit": "Recruit", "command": "Orders", "notices": "Show" if notifications_hidden else "Hide", "cheat": "Cheat", "fullscreen": "Full", "pause": "Pause"}
 	var colors := {"guide": Color("7893A3"), "map": MAGIC_PURPLE, "skills": FRIEND_BLUE, "upgrades": Color("48A0BF"), "recruit": HEAL_GREEN, "command": GOLD, "notices": Color("557A66") if notifications_hidden else Color("6B7188"), "cheat": Color("76528D"), "fullscreen": Color("4E7693"), "pause": Color("D36D68")}
+	var menu_rect := _touch_utility_menu_rect()
+	if touch_utility_drawer_open:
+		var drawer_scale := touch_ui_coordinate_scale
+		var first_utility := Rect2(utility_rects["upgrades"])
+		var last_utility := Rect2(utility_rects["pause"])
+		var drawer_panel := Rect2(first_utility.position - Vector2.ONE * 6.0 * drawer_scale, Vector2(last_utility.end.x - first_utility.position.x + 12.0 * drawer_scale, last_utility.end.y - first_utility.position.y + 12.0 * drawer_scale))
+		draw_rect(drawer_panel, Color(0.015, 0.030, 0.042, 0.86))
+		draw_rect(drawer_panel, Color("5F9CB0"), false, 1.5 * drawer_scale)
+	_draw_touch_round_button(menu_rect, ("Close" if language == "en" else "收合") if touch_utility_drawer_open else ("Menu" if language == "en" else "功能"), Color("3F8196"), _touch_feedback_active("utility_menu") or touch_utility_drawer_open)
+	if not touch_utility_drawer_open:
+		return
 	for action_value in utility_rects.keys():
 		var action := str(action_value)
 		var enabled := action != "recruit" or _is_near_recruitment()
@@ -11709,6 +12464,19 @@ func _run_self_test() -> void:
 	attack_held = true
 	var touch_showcase_ok := _web_force_heavy_cannon_combat_showcase_for_test(["impact", true, "en"])
 	_test_assert(touch_showcase_ok and language == "en" and input_scheme == InputScheme.TOUCH and touch_move_pointer == -1 and touch_move_vector.is_zero_approx() and not attack_held and camera_shake_offset.is_zero_approx(), "heavy_cannon_touch_showcase_resets_transient_input")
+	var soldier_vfx_combat_ok := _web_force_soldier_vfx_showcase_for_test(["combat", true, "zh_TW", false])
+	var showcase_projectile_layers_ok := projectiles.size() == 4
+	for showcase_projectile in projectiles:
+		if Array(showcase_projectile.get("vfx_layers", [])).size() != 1:
+			showcase_projectile_layers_ok = false
+			break
+	_test_assert(soldier_vfx_combat_ok and showcase_projectile_layers_ok and input_scheme == InputScheme.TOUCH and not touch_utility_drawer_open, "soldier_vfx_combat_showcase_uses_real_elemental_projectiles_statuses_and_touch_layout")
+	var soldier_vfx_gallery_ok := _web_force_soldier_vfx_showcase_for_test(["gallery", false, "en", false])
+	var gallery_particle_count := 0
+	for gallery_particle in particles:
+		if str(gallery_particle.get("kind", "")) == "soldier_upgrade_vfx":
+			gallery_particle_count += 1
+	_test_assert(soldier_vfx_gallery_ok and gallery_particle_count == 57, "soldier_vfx_gallery_draws_all_57_descriptor_driven_effects")
 	_start_new_game("warrior")
 	_test_assert(not _web_test_showcase_active and is_zero_approx(_web_manual_time_hold), "normal_game_clears_web_showcase_guards")
 	_test_assert(int(GameConfig.SPECIAL_ATTACKS["archer"]["projectile_count"]) == 7, "scatter_has_seven_arrows")
@@ -12754,8 +13522,10 @@ func _run_self_test() -> void:
 	_test_assert(SoldierUpgradeCatalog.research_is_valid(legacy_research), "legacy_save_migrates_to_valid_empty_soldier_research")
 	var catalog_test := SoldierUpgradeCatalog.catalog_self_test()
 	var runtime_test := SoldierUpgradeRuntime.self_test()
+	var vfx_catalog_test := SoldierUpgradeVfxCatalog.self_test(SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER)
 	_test_assert(bool(catalog_test.get("ok", false)) and int(catalog_test.get("soldier_types", 0)) == 16 and int(catalog_test.get("base_upgrades", 0)) == 8 and int(catalog_test.get("special_abilities", 0)) == 57, "soldier_upgrade_catalog_has_16_types_8_base_and_57_specials")
 	_test_assert(bool(runtime_test.get("ok", false)) and int(runtime_test.get("catalog_ids", 0)) == 57, "soldier_upgrade_runtime_covers_all_57_specials")
+	_test_assert(bool(vfx_catalog_test.get("ok", false)) and int(vfx_catalog_test.get("count", 0)) == 57 and int(vfx_catalog_test.get("unique_shapes", 0)) == 57, "soldier_upgrade_vfx_catalog_covers_all_57_with_unique_visual_shapes")
 	var catalog_price_effects_ok := true
 	for special_id_value in SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER:
 		var special_id := str(special_id_value)
@@ -12943,15 +13713,32 @@ func _run_self_test() -> void:
 	touch_ui_coordinate_scale = 1.0
 	screen_size = Vector2(844.0, 390.0)
 	_set_input_scheme(InputScheme.TOUCH)
+	_reset_touch_inputs()
 	mode = GameMode.PLAYING
 	active_panel = ""
 	var touch_utility := _touch_utility_rects()
 	var touch_upgrade_rect := Rect2(touch_utility["upgrades"])
+	var touch_menu_rect := _touch_utility_menu_rect()
 	var left_stick_bounds := Rect2(_touch_move_center() - Vector2.ONE * TOUCH_STICK_RADIUS, Vector2.ONE * TOUCH_STICK_RADIUS * 2.0)
 	var right_stick_bounds := Rect2(_touch_aim_center() - Vector2.ONE * TOUCH_STICK_RADIUS, Vector2.ONE * TOUCH_STICK_RADIUS * 2.0)
+	var collapsed_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var collapsed_controls := Dictionary(Dictionary(Dictionary(collapsed_state_value).get("input", {})).get("virtual_controls", {})) if collapsed_state_value is Dictionary else {}
+	var collapsed_utilities := Dictionary(collapsed_controls.get("utility", {}))
+	var collapsed_only_menu_visible := not bool(Dictionary(collapsed_controls.get("utility_menu", {})).get("expanded", true))
+	for collapsed_utility_value in collapsed_utilities.values():
+		if bool(Dictionary(collapsed_utility_value).get("visible", true)):
+			collapsed_only_menu_visible = false
+			break
+	var touch_menu_geometry_ok := touch_menu_rect.size.x >= 44.0 and touch_menu_rect.size.y >= 44.0 and not touch_menu_rect.intersects(left_stick_bounds) and not touch_menu_rect.intersects(right_stick_bounds) and not touch_menu_rect.intersects(_touch_special_rect())
+	_handle_touch_action_at(touch_menu_rect.get_center())
+	var touch_drawer_opened := touch_utility_drawer_open
+	var touch_pointers_before_outside := Vector2i(touch_move_pointer, touch_aim_pointer)
+	var touch_outside_consumed := _handle_touch_action_at(Vector2(420.0, 250.0))
+	var touch_drawer_outside_collapsed := touch_outside_consumed and not touch_utility_drawer_open and Vector2i(touch_move_pointer, touch_aim_pointer) == touch_pointers_before_outside
+	_handle_touch_action_at(touch_menu_rect.get_center())
 	var touch_upgrade_geometry_ok := touch_upgrade_rect.size.x >= 44.0 and touch_upgrade_rect.size.y >= 44.0 and not touch_upgrade_rect.intersects(left_stick_bounds) and not touch_upgrade_rect.intersects(right_stick_bounds) and not touch_upgrade_rect.intersects(_touch_special_rect())
 	_handle_touch_action_at(touch_upgrade_rect.get_center())
-	var touch_upgrade_opened := active_panel == "soldier_upgrades"
+	var touch_upgrade_opened := active_panel == "soldier_upgrades" and not touch_utility_drawer_open
 	var touch_upgrade_panel := _soldier_upgrade_panel_rect()
 	var touch_upgrade_controls := _soldier_upgrade_control_rects(touch_upgrade_panel)
 	var touch_targets_large := true
@@ -12972,6 +13759,31 @@ func _run_self_test() -> void:
 	_handle_ui_click(Rect2(touch_upgrade_controls["special_tab"]).get_center())
 	var touch_special_tab_works := soldier_upgrade_category == "special"
 	_handle_touch_action_at(_touch_panel_close_rect().get_center())
+	var compact_touch_layouts_ok := true
+	for css_size_value in [Vector2(568.0, 320.0), Vector2(667.0, 375.0), Vector2(844.0, 390.0)]:
+		var css_size := Vector2(css_size_value)
+		var compact_scale := 720.0 / css_size.y
+		touch_ui_coordinate_scale = compact_scale
+		screen_size = Vector2(css_size.x * compact_scale, 720.0)
+		var compact_bounds := Rect2(Vector2.ZERO, screen_size)
+		var compact_rects: Array[Rect2] = [_touch_utility_menu_rect()]
+		for compact_utility_value in _touch_utility_rects().values():
+			compact_rects.append(Rect2(compact_utility_value))
+		for compact_index in compact_rects.size():
+			var compact_rect := compact_rects[compact_index]
+			var compact_css_size := compact_rect.size / compact_scale
+			if compact_css_size.x < 44.0 or compact_css_size.y < 44.0 or not compact_bounds.encloses(compact_rect):
+				compact_touch_layouts_ok = false
+				break
+			for compact_previous_index in compact_index:
+				if compact_rect.intersects(compact_rects[compact_previous_index]):
+					compact_touch_layouts_ok = false
+					break
+			if not compact_touch_layouts_ok:
+				break
+		if not compact_touch_layouts_ok:
+			break
+	_test_assert(compact_touch_layouts_ok, "touch_utility_drawer_is_in_bounds_disjoint_and_tappable_on_three_short_landscape_sizes")
 	var web_touch_scale := 720.0 / 390.0
 	touch_ui_coordinate_scale = web_touch_scale
 	screen_size = Vector2(844.0 * web_touch_scale, 720.0)
@@ -12982,7 +13794,9 @@ func _run_self_test() -> void:
 	var web_attack_bounds := Rect2(_touch_aim_center() - Vector2.ONE * web_stick_radius, Vector2.ONE * web_stick_radius * 2.0)
 	var web_special_bounds := _touch_special_rect()
 	var web_touch_utility := _touch_utility_rects()
-	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds]
+	var web_menu_bounds := _touch_utility_menu_rect()
+	_handle_touch_action_at(web_menu_bounds.get_center())
+	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds, web_menu_bounds]
 	var web_virtual_layout_ok := web_touch_utility.size() == 10
 	for web_utility_value in web_touch_utility.values():
 		web_virtual_rects.append(Rect2(web_utility_value))
@@ -13043,11 +13857,10 @@ func _run_self_test() -> void:
 	all_soldiers_unlocked = web_layout_unlock_before
 	var web_upgrade_rect := Rect2(_touch_utility_rects()["upgrades"])
 	var web_upgrade_css_size := web_upgrade_rect.size / web_touch_scale
-	var web_upgrade_css_center := web_upgrade_rect.get_center() / web_touch_scale
 	_handle_touch_action_at(web_upgrade_rect.get_center())
 	var web_panel := _soldier_upgrade_panel_rect()
 	var web_controls := _soldier_upgrade_control_rects(web_panel)
-	var web_stretch_targets_ok := active_panel == "soldier_upgrades" and web_upgrade_css_size.x >= 44.0 and web_upgrade_css_size.y >= 44.0 and web_upgrade_css_center.distance_to(Vector2(480.0, 108.0)) < 1.0
+	var web_stretch_targets_ok := active_panel == "soldier_upgrades" and not touch_utility_drawer_open and web_upgrade_css_size.x >= 44.0 and web_upgrade_css_size.y >= 44.0
 	for web_control_value in web_controls.values():
 		var web_control_css_size := Rect2(web_control_value).size / web_touch_scale
 		if web_control_css_size.x < 44.0 or web_control_css_size.y < 44.0:
@@ -13055,7 +13868,7 @@ func _run_self_test() -> void:
 			break
 	web_stretch_targets_ok = web_stretch_targets_ok and not Rect2(web_controls["type_next"]).intersects(_touch_panel_close_rect())
 	_handle_touch_action_at(_touch_panel_close_rect().get_center())
-	_test_assert(touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_button_panel_purchase_and_close")
+	_test_assert(collapsed_only_menu_visible and touch_menu_geometry_ok and touch_drawer_opened and touch_drawer_outside_collapsed and touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_drawer_panel_purchase_and_close")
 	screen_size = stored_screen_size
 	touch_ui_coordinate_scale = stored_touch_ui_coordinate_scale
 	_set_input_scheme(stored_input_scheme)
@@ -13082,10 +13895,26 @@ func _run_self_test() -> void:
 	status_soldier["upgrade_snapshot"] = status_snapshot
 	status_soldier["special_runtime"] = SoldierUpgradeRuntime.create_state(status_snapshot, float(status_soldier["max_hp"]))
 	status_soldier["hp"] = float(status_soldier["max_hp"]) * 0.5
+	_spawn_projectile({"team": "friendly", "kind": "ally_arrow", "source_kind": "archer", "source_id": status_soldier_id, "target_id": status_enemy_id, "pos": Vector2(2120.0, 2200.0), "vel": Vector2.RIGHT * 720.0, "damage": 25.0, "range": 500.0, "radius": 4.0, "pierce": 1, "aoe": 0.0, "color": Color("A9D8FF"), "soldier_specials": Dictionary(status_snapshot["special_effects"])})
+	var status_projectile_vfx := Array(projectiles.back().get("vfx_layers", []))
+	var projectile_vfx_contract_ok := (
+		"burning_ammo" in status_projectile_vfx
+		and "frost_arrow" in status_projectile_vfx
+		and "toxic_payload" in status_projectile_vfx
+		and SoldierUpgradeVfxCatalog.shape_for("burning_ammo") != SoldierUpgradeVfxCatalog.shape_for("frost_arrow")
+		and SoldierUpgradeVfxCatalog.shape_for("frost_arrow") != SoldierUpgradeVfxCatalog.shape_for("toxic_payload")
+	)
+	_test_assert(projectile_vfx_contract_ok, "soldier_projectile_carries_distinct_fire_frost_and_toxic_vfx_layers")
 	var status_hp_before := float(status_soldier["hp"])
 	_resolve_soldier_enemy_hit(status_enemy_index, 80.0, status_soldier["pos"], "projectile", status_soldier_id, Dictionary(status_snapshot["special_effects"]))
 	var status_enemy: Variant = _find_enemy_by_id(status_enemy_id)
 	_test_assert(status_enemy != null and float(status_enemy.get("soldier_burn_ttl", 0.0)) > 0.0 and not Dictionary(status_enemy.get("soldier_poison_sources", {})).is_empty() and float(status_enemy.get("armor_break", 0.0)) > 0.0 and float(status_enemy.get("slow", 0.0)) > 0.0 and float(status_soldier["hp"]) > status_hp_before, "soldier_projectile_applies_dot_control_armor_break_marks_and_lifesteal")
+	status_soldier["hp"] = float(status_soldier["max_hp"])
+	status_soldier["lifesteal_used"] = 0.0
+	var full_hp_vfx_count_before := particles.size()
+	var full_hp_floater_count_before := floaters.size()
+	_apply_soldier_lifesteal(status_soldier_id, 200.0, Dictionary(status_snapshot["special_effects"]))
+	_test_assert(is_zero_approx(float(status_soldier.get("lifesteal_used", 0.0))) and particles.size() == full_hp_vfx_count_before and floaters.size() == full_hp_floater_count_before, "lifesteal_at_full_health_does_not_fake_healing_vfx_or_spend_cap")
 
 	projectiles.clear()
 	upgrade_effects.clear()
@@ -13112,6 +13941,15 @@ func _run_self_test() -> void:
 		var summon_kind: String = ["guardian", "auto_turret", "repair_drone"][summon_index % 3]
 		_add_upgrade_runtime_effect({"kind": summon_kind, "source_id": summon_index, "pos": Vector2(float(summon_index), 0.0), "ttl": 5.0, "team_cap": 5})
 	_test_assert(mine_cap_ok and lingering_cap_ok and _upgrade_summon_count() == MAX_UPGRADE_SUMMONS_PER_TEAM, "persistent_upgrade_effect_caps_are_enforced")
+
+	upgrade_effects.clear()
+	var boss_dot_visual_soldier := {"id": 99117}
+	_refresh_soldier_boss_dot("boss_burn", boss_dot_visual_soldier, 100.0, 0.25, 3.0, 1, "burning_sword")
+	var melee_boss_burn_vfx := str(upgrade_effects[0].get("ability_id", "")) if not upgrade_effects.is_empty() else ""
+	upgrade_effects.clear()
+	_refresh_soldier_boss_dot("boss_burn", boss_dot_visual_soldier, 100.0, 0.25, 3.0, 1, "burning_ammo")
+	var ranged_boss_burn_vfx := str(upgrade_effects[0].get("ability_id", "")) if not upgrade_effects.is_empty() else ""
+	_test_assert(melee_boss_burn_vfx == "burning_sword" and ranged_boss_burn_vfx == "burning_ammo", "boss_burn_vfx_preserves_melee_sword_and_ranged_ammunition_identity")
 
 	projectiles.clear()
 	upgrade_effects.clear()
@@ -13358,6 +14196,7 @@ func _run_self_test() -> void:
 	var touch_attack_stopped := not attack_held and touch_aim_pointer < 0 and not bool(touch_attack_released_input.get("attack_held", true)) and not bool(touch_attack_released_control.get("held", true)) and is_zero_approx(float(player["attack_cd"]))
 	_test_assert(touch_attack_render_pressed_ok and touch_attack_aim_ok and touch_attack_executed and touch_attack_stopped, "touch_attack_stick_holds_aims_attacks_and_stops_on_release")
 
+	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_command_entry := InputEventScreenTouch.new()
 	touch_command_entry.index = 52
 	touch_command_entry.pressed = true
@@ -13385,6 +14224,7 @@ func _run_self_test() -> void:
 	active_panel = ""
 	last_recruit_purchase_msec = -10000
 	last_recruit_purchase_type = ""
+	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_recruit_entry := InputEventScreenTouch.new()
 	touch_recruit_entry.index = 54
 	touch_recruit_entry.pressed = true
@@ -13411,6 +14251,7 @@ func _run_self_test() -> void:
 	player["money"] = touch_recruit_money_before
 	active_panel = ""
 
+	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_pause_entry := InputEventScreenTouch.new()
 	touch_pause_entry.index = 56
 	touch_pause_entry.pressed = true
@@ -13476,6 +14317,7 @@ func _run_self_test() -> void:
 	_test_assert(_needs_landscape_rotation(), "portrait_touch_requests_landscape_rotation")
 	screen_size = landscape_screen
 	tutorial_visible = false
+	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_guide := InputEventScreenTouch.new()
 	touch_guide.index = 44
 	touch_guide.pressed = true
