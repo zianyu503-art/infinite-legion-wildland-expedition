@@ -12,6 +12,8 @@ const EnemyEnhancementCatalog = preload("res://scripts/enemy_enhancement_catalog
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
 const SoldierUpgradeRuntime = preload("res://scripts/soldier_upgrade_runtime.gd")
 const SoldierUpgradeVfxCatalog = preload("res://scripts/soldier_upgrade_vfx_catalog.gd")
+const ArenaControllerScript = preload("res://scripts/arena_controller.gd")
+const ArenaViewScript = preload("res://scripts/arena_view.gd")
 const NationCatalog = preload("res://scripts/nation_catalog.gd")
 const PythonBossControllerScript = preload("res://scripts/python_boss.gd")
 const ChaosBossControllerScript = preload("res://scripts/chaos_boss.gd")
@@ -19,7 +21,7 @@ const AionisBossControllerScript = preload("res://scripts/aionis_boss.gd")
 const CAVIAR_AVATAR_TEXTURE = preload("res://assets/ui/caviar_avatar.png")
 const UI_FONT_PATH := "res://assets/fonts/NotoSansTC-Regular.otf"
 
-enum GameMode { TITLE, CLASS_SELECT, PLAYING, PAUSED, DEAD, ENDING }
+enum GameMode { TITLE, CLASS_SELECT, PLAYING, PAUSED, DEAD, ENDING, ARENA }
 enum InputScheme { KEYBOARD_MOUSE, TOUCH }
 
 const VIEW_BASE := Vector2(1280.0, 720.0)
@@ -85,6 +87,7 @@ var world_seed: int = 20260731
 var world_generator: WorldGenerator
 var audio: GameAudioManager
 var ui_font: Font
+var arena_view: ArenaView
 
 var player: Dictionary = {}
 var camera_pos := HOUSE_POS
@@ -186,6 +189,7 @@ var _web_force_recruit_callback: Variant = null
 var _web_heavy_cannon_showcase_callback: Variant = null
 var _web_chaos_showcase_callback: Variant = null
 var _web_aionis_showcase_callback: Variant = null
+var _web_arena_showcase_callback: Variant = null
 var _web_manual_time_hold := 0.0
 var _web_test_showcase_active := false
 
@@ -212,6 +216,15 @@ func _ready() -> void:
 	audio.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(audio)
 	audio.set_volume(master_volume)
+	arena_view = ArenaViewScript.new()
+	arena_view.name = "ArenaView"
+	arena_view.position = Vector2.ZERO
+	arena_view.size = screen_size
+	arena_view.z_index = 200
+	add_child(arena_view)
+	arena_view.close_requested.connect(_exit_arena)
+	arena_view.language_toggle_requested.connect(_toggle_language)
+	arena_view.sound_requested.connect(_on_arena_sound_requested)
 	world_generator = WorldGenerator.new(world_seed)
 	_initialize_empty_player()
 	soldier_research = SoldierUpgradeCatalog.create_empty_research()
@@ -242,6 +255,10 @@ func _ready() -> void:
 func _on_viewport_size_changed() -> void:
 	screen_size = get_viewport_rect().size
 	_refresh_touch_ui_coordinate_scale()
+	if arena_view != null:
+		arena_view.position = Vector2.ZERO
+		arena_view.size = screen_size
+		arena_view.set_presentation(language, _is_touch_scheme(), touch_ui_coordinate_scale)
 	_layout_cheat_input()
 	queue_redraw()
 
@@ -285,6 +302,8 @@ func _set_input_scheme(scheme: int) -> void:
 	input_scheme = scheme
 	if scheme == InputScheme.TOUCH:
 		touch_capable = true
+	if arena_view != null:
+		arena_view.set_presentation(language, _is_touch_scheme(), touch_ui_coordinate_scale)
 	queue_redraw()
 
 
@@ -307,6 +326,32 @@ func _enter_class_select(guard_pointer: bool) -> void:
 	queue_redraw()
 
 
+func _enter_arena() -> void:
+	mode = GameMode.ARENA
+	active_panel = ""
+	_reset_touch_inputs()
+	if arena_view != null:
+		arena_view.size = screen_size
+		arena_view.open(language, _is_touch_scheme(), touch_ui_coordinate_scale)
+	audio.play("ui", 0.55)
+	queue_redraw()
+
+
+func _exit_arena() -> void:
+	if arena_view != null:
+		arena_view.close()
+	mode = GameMode.TITLE
+	active_panel = ""
+	_reset_touch_inputs()
+	audio.play("ui", 0.45)
+	queue_redraw()
+
+
+func _on_arena_sound_requested(event_name: String, volume: float, pitch: float) -> void:
+	if audio != null:
+		audio.play(event_name, volume, pitch)
+
+
 func _class_select_pointer_is_guarded() -> bool:
 	return Time.get_ticks_msec() < class_select_pointer_guard_until_msec
 
@@ -321,6 +366,8 @@ func _needs_landscape_rotation() -> bool:
 
 func _toggle_language() -> void:
 	language = "en" if language != "en" else "zh_TW"
+	if arena_view != null:
+		arena_view.set_presentation(language, _is_touch_scheme(), touch_ui_coordinate_scale)
 	if OS.has_feature("web"):
 		JavaScriptBridge.eval("try { localStorage.setItem('infinite_legion_language', '%s'); } catch (_) {}" % language)
 	queue_redraw()
@@ -481,12 +528,14 @@ func _setup_web_bridge() -> void:
 		_web_heavy_cannon_showcase_callback = JavaScriptBridge.create_callback(Callable(self, "_web_force_heavy_cannon_combat_showcase_for_test"))
 		_web_chaos_showcase_callback = JavaScriptBridge.create_callback(Callable(self, "_web_force_chaos_showcase_for_test"))
 		_web_aionis_showcase_callback = JavaScriptBridge.create_callback(Callable(self, "_web_force_aionis_showcase_for_test"))
+		_web_arena_showcase_callback = JavaScriptBridge.create_callback(Callable(self, "_web_force_arena_showcase_for_test"))
 		window.__codex_force_world_boss_for_test = _web_force_boss_callback
 		window.__codex_set_touch_mode_for_test = _web_touch_mode_callback
 		window.__codex_force_recruit_showcase_for_test = _web_force_recruit_callback
 		window.__codex_force_heavy_cannon_combat_showcase_for_test = _web_heavy_cannon_showcase_callback
 		window.__codex_force_chaos_showcase_for_test = _web_chaos_showcase_callback
 		window.__codex_force_aionis_showcase_for_test = _web_aionis_showcase_callback
+		window.__codex_force_arena_showcase_for_test = _web_arena_showcase_callback
 		var auto_chaos_scene: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('chaos_scene') || ''", true)
 		if typeof(auto_chaos_scene) == TYPE_STRING and str(auto_chaos_scene) in ["battle", "ending", "pause", "recruit"]:
 			var auto_touch: bool = bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('touch') === '1'", true))
@@ -507,6 +556,12 @@ func _setup_web_bridge() -> void:
 			var soldier_vfx_language: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('lang') || 'zh_TW'", true)
 			var soldier_vfx_drawer := bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('drawer') === '1'", true))
 			call_deferred("_web_force_soldier_vfx_showcase_for_test", [str(auto_soldier_vfx_scene), soldier_vfx_touch, str(soldier_vfx_language), soldier_vfx_drawer])
+		var auto_arena_scene: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('arena_scene') || ''", true)
+		if typeof(auto_arena_scene) == TYPE_STRING and str(auto_arena_scene) in ["types", "counts", "upgrades", "battle"]:
+			var arena_touch := bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('touch') === '1'", true))
+			var arena_language: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('lang') || 'zh_TW'", true)
+			var arena_mode: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('arena_mode') || 'spectator'", true)
+			call_deferred("_web_force_arena_showcase_for_test", [str(auto_arena_scene), str(arena_mode), str(arena_language), arena_touch])
 	window.__codex_game_state = render_game_to_text()
 	# JavaScriptBridge callbacks always return null. These small wrappers publish
 	# the state through a window property so browser automation receives a string.
@@ -548,6 +603,10 @@ func _setup_web_bridge() -> void:
 				};
 				window.force_aionis_showcase_for_test = (scene = "battle", touchMode = false, requestedLanguage = "zh_TW", skill = "twelfth_bell", phase = 4, exposed = false) => {
 					window.__codex_force_aionis_showcase_for_test(String(scene), Boolean(touchMode), String(requestedLanguage), String(skill), Number(phase), Boolean(exposed));
+					return window.__codex_game_state || "";
+				};
+				window.force_arena_showcase_for_test = (scene = "battle", arenaMode = "spectator", requestedLanguage = "zh_TW", touchMode = false) => {
+					window.__codex_force_arena_showcase_for_test(String(scene), String(arenaMode), String(requestedLanguage), Boolean(touchMode));
 					return window.__codex_game_state || "";
 				};
 			}
@@ -674,12 +733,11 @@ func _web_force_soldier_vfx_showcase_for_test(arguments: Array) -> bool:
 		scene = "combat"
 	var use_touch := bool(arguments[1]) if arguments.size() > 1 and typeof(arguments[1]) == TYPE_BOOL else false
 	var requested_language := str(arguments[2]) if arguments.size() > 2 else "zh_TW"
-	var open_drawer := bool(arguments[3]) if arguments.size() > 3 and typeof(arguments[3]) == TYPE_BOOL else false
 	_start_new_game("archer", true)
 	language = requested_language if requested_language in ["zh_TW", "en"] else "zh_TW"
 	_set_input_scheme(InputScheme.TOUCH if use_touch else InputScheme.KEYBOARD_MOUSE)
 	_reset_touch_inputs()
-	touch_utility_drawer_open = use_touch and open_drawer
+	touch_utility_drawer_open = false
 	tutorial_visible = false
 	notifications_hidden = false
 	player["level"] = 30
@@ -1070,8 +1128,31 @@ func _web_force_aionis_showcase_for_test(arguments: Array) -> bool:
 	return true
 
 
+func _web_force_arena_showcase_for_test(arguments: Array) -> bool:
+	if not OS.has_feature("web") or arena_view == null:
+		return false
+	var scene := str(arguments[0]) if arguments.size() > 0 else "battle"
+	var arena_mode := str(arguments[1]) if arguments.size() > 1 else "spectator"
+	var requested_language := str(arguments[2]) if arguments.size() > 2 else "zh_TW"
+	var requested_touch := bool(arguments[3]) if arguments.size() > 3 else false
+	if scene not in ["types", "counts", "upgrades", "battle"]:
+		return false
+	language = "en" if requested_language == "en" else "zh_TW"
+	_set_input_scheme(InputScheme.TOUCH if requested_touch else InputScheme.KEYBOARD_MOUSE)
+	_web_test_showcase_active = true
+	active_panel = ""
+	mode = GameMode.ARENA
+	arena_view.position = Vector2.ZERO
+	arena_view.size = screen_size
+	var success := arena_view.force_test_scene(scene, arena_mode, language, requested_touch)
+	_web_manual_time_hold = 0.0
+	queue_redraw()
+	_publish_web_game_state(render_game_to_text())
+	return success
+
+
 func render_game_to_text() -> String:
-	var mode_names := ["title", "class_select", "playing", "paused", "dead", "ending"]
+	var mode_names := ["title", "class_select", "playing", "paused", "dead", "ending", "arena"]
 	var player_position: Vector2 = Vector2(player.get("pos", HOUSE_POS))
 	var visible_enemies: Array[Dictionary] = []
 	for enemy in enemies:
@@ -1147,6 +1228,33 @@ func render_game_to_text() -> String:
 				"x": snappedf(Vector2(effect["pos"]).x, 0.1), "y": snappedf(Vector2(effect["pos"]).y, 0.1),
 				"ttl": snappedf(float(effect.get("ttl", 0.0)), 0.01), "warmup": snappedf(float(effect.get("warmup", 0.0)), 0.01),
 			})
+	# One-shot ability glyphs live in the particle pool rather than the
+	# persistent runtime-effect pool. Include them in the Web QA projection so
+	# the 57-ability gallery verifies what is actually visible on canvas.
+	for particle in particles:
+		if visible_upgrade_vfx.size() >= 24:
+			break
+		if str(particle.get("kind", "")) != "soldier_upgrade_vfx" or typeof(particle.get("pos", null)) != TYPE_VECTOR2:
+			continue
+		var particle_position := Vector2(particle["pos"])
+		if player_position.distance_to(particle_position) > 1200.0:
+			continue
+		var particle_ability_id := str(particle.get("ability_id", ""))
+		visible_upgrade_vfx.append({
+			"ability_id": particle_ability_id,
+			"kind": "soldier_upgrade_vfx",
+			"shape": SoldierUpgradeVfxCatalog.shape_for(particle_ability_id),
+			"x": snappedf(particle_position.x, 0.1), "y": snappedf(particle_position.y, 0.1),
+			"ttl": snappedf(float(particle.get("ttl", 0.0)), 0.01), "warmup": 0.0,
+		})
+	var particle_vfx_id_set: Dictionary = {}
+	for particle in particles:
+		if str(particle.get("kind", "")) == "soldier_upgrade_vfx":
+			var particle_vfx_id := str(particle.get("ability_id", ""))
+			if not particle_vfx_id.is_empty():
+				particle_vfx_id_set[particle_vfx_id] = true
+	var particle_vfx_ids: Array = particle_vfx_id_set.keys()
+	particle_vfx_ids.sort()
 	var aionis_home := Vector2(GameConfig.AIONIS_BOSS_CONFIG["home_position"])
 	var aionis_delta := aionis_home - player_position
 	var aionis_direction := aionis_delta.normalized() if aionis_delta.length_squared() > 0.001 else Vector2.ZERO
@@ -1177,7 +1285,7 @@ func render_game_to_text() -> String:
 			"width": snappedf(action_rect.size.x, 0.1),
 			"height": snappedf(action_rect.size.y, 0.1),
 			"enabled": action != "recruit" or touch_recruit_enabled,
-			"visible": touch_utility_drawer_open,
+			"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
 		}
 	var touch_close_rect := _touch_panel_close_rect()
 	var touch_recruit_controls: Array[Dictionary] = []
@@ -1249,7 +1357,7 @@ func render_game_to_text() -> String:
 				"y": snappedf(touch_upgrade_test_rect.position.y, 0.1),
 				"width": snappedf(touch_upgrade_test_rect.size.x, 0.1),
 				"height": snappedf(touch_upgrade_test_rect.size.y, 0.1),
-				"visible": _is_touch_scheme() and touch_utility_drawer_open and mode == GameMode.PLAYING and active_panel.is_empty(),
+				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
 			},
 			"virtual_controls": {
 				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
@@ -1274,8 +1382,10 @@ func render_game_to_text() -> String:
 				"utility_menu": {
 					"x": snappedf(touch_utility_menu_rect.position.x, 0.1), "y": snappedf(touch_utility_menu_rect.position.y, 0.1),
 					"width": snappedf(touch_utility_menu_rect.size.x, 0.1), "height": snappedf(touch_utility_menu_rect.size.y, 0.1),
-					"expanded": touch_utility_drawer_open,
+					"visible": false,
+					"expanded": false,
 				},
+				"utility_layout": "dual_side_rails",
 				"utility": touch_utility_state,
 				"panel_close": {
 					"visible": _is_touch_scheme() and mode == GameMode.PLAYING and not active_panel.is_empty() and touch_close_rect.has_area(),
@@ -1314,6 +1424,7 @@ func render_game_to_text() -> String:
 			"special_count": SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER.size(),
 			"vfx_count": SoldierUpgradeVfxCatalog.DESCRIPTORS.size(),
 			"vfx_effects": visible_upgrade_vfx,
+			"particle_vfx_ids": particle_vfx_ids,
 			"selected_type": _selected_soldier_upgrade_type(),
 			"category": soldier_upgrade_category,
 			"page": soldier_upgrade_page,
@@ -1327,6 +1438,7 @@ func render_game_to_text() -> String:
 		"boss": _boss_text_state(),
 		"chaos_boss": null if chaos_boss == null else chaos_boss.get_text_state(),
 		"aionis_boss": null if aionis_boss == null else aionis_boss.get_text_state(),
+		"arena": _arena_text_state(),
 		"aionis_marker": {
 			"visible": true,
 			"locked": not timeless_gate_unlocked,
@@ -1348,7 +1460,100 @@ func render_game_to_text() -> String:
 			"recruitable_types": _recruitable_soldier_order(),
 		},
 	}
+	if mode == GameMode.ARENA and arena_view != null and arena_view.controller != null and arena_view.controller.mode == "spectator":
+		# Spectator mode has no on-field player. Keep campaign state isolated and
+		# avoid exposing its dormant hero snapshot as if it were in the arena.
+		payload["player"] = null
 	return JSON.stringify(payload)
+
+
+func _arena_text_state() -> Variant:
+	if arena_view == null or arena_view.controller == null:
+		return null
+	var arena := arena_view.controller
+	var raw := arena.render_state()
+	var raw_teams: Dictionary = raw.get("teams", {})
+	var bounds := arena.arena_rect
+	var sampled_units: Array[Dictionary] = []
+	var vfx_ids: Dictionary = {}
+	for unit in arena.units:
+		var unit_specials: Array[String] = []
+		for active_value in Array(Dictionary(unit.get("upgrade_snapshot", {})).get("active_specials", [])):
+			if active_value is Dictionary:
+				var special_id := str(Dictionary(active_value).get("id", ""))
+				if not special_id.is_empty():
+					unit_specials.append(special_id)
+					vfx_ids[special_id] = true
+		if sampled_units.size() < 20 and float(unit.get("hp", 0.0)) > 0.0:
+			var position := Vector2(unit.get("pos", Vector2.ZERO))
+			sampled_units.append({
+				"id": int(unit.get("id", -1)), "type": str(unit.get("type", "")), "team": str(unit.get("team", "")),
+				"x": snappedf(position.x, 0.1), "y": snappedf(position.y, 0.1),
+				"hp": snappedf(float(unit.get("hp", 0.0)), 0.1), "max_hp": snappedf(float(unit.get("max_hp", 0.0)), 0.1),
+				"state": str(unit.get("state", "")), "target_kind": str(unit.get("target_kind", "")), "specials": unit_specials,
+			})
+	var sampled_projectiles: Array[Dictionary] = []
+	for projectile in arena.projectiles:
+		var ids: Array = Array(projectile.get("vfx_layers", projectile.get("ability_ids", [])))
+		for id_value in ids:
+			vfx_ids[str(id_value)] = true
+		if sampled_projectiles.size() < 20:
+			var position := Vector2(projectile.get("pos", Vector2.ZERO))
+			sampled_projectiles.append({
+				"team": str(projectile.get("team", "")), "x": snappedf(position.x, 0.1), "y": snappedf(position.y, 0.1),
+				"target_kind": str(projectile.get("target_kind", "")), "ability_ids": ids.duplicate(),
+			})
+	var sampled_effects: Array[Dictionary] = []
+	for effect in arena.effects:
+		var ability_id := str(effect.get("ability_id", effect.get("kind", "")))
+		if not ability_id.is_empty():
+			vfx_ids[ability_id] = true
+		if sampled_effects.size() < 20:
+			var position := Vector2(effect.get("pos", Vector2.ZERO))
+			sampled_effects.append({
+				"kind": str(effect.get("kind", "")), "ability_id": ability_id,
+				"x": snappedf(position.x, 0.1), "y": snappedf(position.y, 0.1), "ttl": snappedf(float(effect.get("ttl", 0.0)), 0.01),
+			})
+	var hero_state: Variant = null
+	if not arena.hero.is_empty():
+		var hero_position := Vector2(arena.hero.get("pos", Vector2.ZERO))
+		hero_state = {
+			"class": str(arena.hero.get("class_id", arena_view.hero_class)), "x": snappedf(hero_position.x, 0.1), "y": snappedf(hero_position.y, 0.1),
+			"hp": snappedf(float(arena.hero.get("hp", 0.0)), 0.1), "max_hp": snappedf(float(arena.hero.get("max_hp", 0.0)), 0.1),
+		}
+	var view_state := arena_view.render_state()
+	var current_upgrade_type := arena.current_upgrade_type()
+	var visible_upgrade_options: Array[Dictionary] = []
+	if arena.phase == "upgrades" and not current_upgrade_type.is_empty():
+		var upgrade_layout: Dictionary = Dictionary(view_state.get("layout", {})).get("upgrade_controls", {})
+		for upgrade_id_value in upgrade_layout.keys():
+			var upgrade_id := str(upgrade_id_value)
+			visible_upgrade_options.append({
+				"id": upgrade_id,
+				"rank": SoldierUpgradeCatalog.current_rank(current_upgrade_type, upgrade_id, arena.team_research[arena.active_team]),
+				"max_rank": SoldierUpgradeCatalog.max_rank(upgrade_id),
+			})
+	var sorted_vfx_ids: Array = vfx_ids.keys()
+	sorted_vfx_ids.sort()
+	return {
+		"active": arena_view.visible and mode == GameMode.ARENA,
+		"mode": arena.mode, "phase": arena.phase, "stage": arena.phase, "active_team": arena.active_team,
+		"upgrade_category": arena.upgrade_category, "upgrade_page": arena.upgrade_page,
+		"current_upgrade_type": current_upgrade_type, "upgrade_options": visible_upgrade_options,
+		"selection_flow": ["types", "counts", "upgrades", "battle"],
+		"selected_types": {"blue": arena.selected_types_for("blue"), "red": arena.selected_types_for("red")},
+		"counts": arena.counts.duplicate(true),
+		"teams": {
+			"blue": {"alive": int(Dictionary(raw_teams.get("blue", {})).get("alive", 0)), "total": arena.team_total("blue")},
+			"red": {"alive": int(Dictionary(raw_teams.get("red", {})).get("alive", 0)), "total": arena.team_total("red")},
+		},
+		"bounds": {"x": snappedf(bounds.position.x, 0.1), "y": snappedf(bounds.position.y, 0.1), "width": snappedf(bounds.size.x, 0.1), "height": snappedf(bounds.size.y, 0.1)},
+		"auto_sized": true, "no_player": arena.hero.is_empty(), "hero": hero_state,
+		"winner": arena.winner, "battle_time": snappedf(arena.battle_time, 0.01),
+		"unit_count": arena.units.size(), "projectile_count": arena.projectiles.size(), "effect_count": arena.effects.size(),
+		"units": sampled_units, "projectiles": sampled_projectiles, "effects": sampled_effects, "active_vfx_ids": sorted_vfx_ids,
+		"layout": Dictionary(view_state.get("layout", {})), "camera": Dictionary(view_state.get("camera", {})),
+	}
 
 
 func _boss_text_state() -> Variant:
@@ -1713,29 +1918,29 @@ func _touch_special_rect() -> Rect2:
 
 
 func _touch_utility_rects() -> Dictionary:
-	# Five short columns keep the opened drawer inside the top HUD band instead of
-	# running down through either virtual stick. The drawer is normally collapsed.
-	var keys := ["upgrades", "recruit", "command", "skills", "map", "guide", "notices", "cheat", "fullscreen", "pause"]
-	var result := {}
+	# Permanent dual side rails keep the center of the battlefield clear. In CSS
+	# pixels each rail is exactly 44 wide with a two-pixel safety gap from the
+	# virtual-stick hit regions, including the 568x320 compact landscape case.
+	var left_keys := ["upgrades", "recruit", "command", "skills", "map"]
+	var right_keys := ["guide", "notices", "cheat", "fullscreen", "pause"]
+	var result: Dictionary = {}
 	var scale := touch_ui_coordinate_scale
 	var button_size := 44.0 * scale
-	var gap := 6.0 * scale
-	var columns := 5
-	var drawer_width := 5.0 * 44.0 + 4.0 * 6.0
-	var start_x := (screen_size.x / scale - drawer_width) * 0.5 * scale
-	var start_y := 72.0 * scale
-	for index in keys.size():
-		var row := index / columns
-		var column := index % columns
-		result[keys[index]] = Rect2(start_x + float(column) * (button_size + gap), start_y + float(row) * (button_size + gap), button_size, button_size)
+	var pitch := 47.0 * scale
+	# 176 logical pixels is the bottom edge of the compact minimap. Adding four
+	# CSS pixels works for both expand-mode Web canvases and native touch windows.
+	var start_y := 176.0 + 4.0 * scale
+	for index in left_keys.size():
+		result[left_keys[index]] = Rect2(2.0 * scale, start_y + float(index) * pitch, button_size, button_size)
+	for index in right_keys.size():
+		result[right_keys[index]] = Rect2(screen_size.x - 46.0 * scale, start_y + float(index) * pitch, button_size, button_size)
 	return result
 
 
 func _touch_utility_menu_rect() -> Rect2:
-	var scale := touch_ui_coordinate_scale
-	# The single collapsed handle sits in the top-center HUD corridor. It no longer
-	# overlaps the army strip, either stick, the skill button, or the battlefield.
-	return Rect2(Vector2(screen_size.x * 0.5 - 26.0 * scale, 8.0 * scale), Vector2(52.0, 52.0) * scale)
+	# Kept as an empty compatibility hook for older Web QA callers. The utility
+	# actions now live directly on the left and right rails and need no drawer.
+	return Rect2()
 
 
 func _touch_panel_close_rect() -> Rect2:
@@ -1760,6 +1965,9 @@ func _touch_panel_close_rect() -> Rect2:
 
 
 func _language_toggle_rect() -> Rect2:
+	if _is_touch_scheme():
+		var scale := touch_ui_coordinate_scale
+		return Rect2(screen_size.x - 80.0 * scale, 8.0 * scale, 72.0 * scale, 44.0 * scale)
 	return Rect2(screen_size.x - 146.0, 16.0, 128.0, 72.0 if _is_touch_scheme() else 46.0)
 
 
@@ -1776,6 +1984,10 @@ func _soldier_upgrade_toggle_rect() -> Rect2:
 
 
 func _tutorial_panel_rect() -> Rect2:
+	if _is_touch_scheme():
+		# Side rails own the outer 46 CSS pixels. Centering the tutorial leaves both
+		# rails and both virtual sticks unobstructed on short landscape phones.
+		return Rect2(screen_size.x * 0.5 - 150.0, 158.0, 300.0, 154.0)
 	var tutorial_y := 158.0
 	if python_boss != null:
 		var tutorial_status: Dictionary = python_boss.get_unit_status("player", 0)
@@ -1828,43 +2040,30 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 		return true
 	if mode != GameMode.PLAYING or active_panel != "":
 		return false
-	if _touch_utility_menu_rect().has_point(position):
-		touch_utility_drawer_open = not touch_utility_drawer_open
-		_mark_touch_feedback("utility_menu")
+	var utility_rects := _touch_utility_rects()
+	for action_value in utility_rects.keys():
+		var action := str(action_value)
+		if not Rect2(utility_rects[action]).has_point(position):
+			continue
+		_mark_touch_feedback(action)
+		match action:
+			"guide": tutorial_visible = not tutorial_visible
+			"map": active_panel = "map"
+			"skills": active_panel = "skills"
+			"upgrades":
+				active_panel = "soldier_upgrades"
+				soldier_upgrade_page = 0
+			"recruit":
+				if _is_near_recruitment():
+					active_panel = "recruit"
+				else:
+					_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
+			"command": active_panel = "command"
+			"notices": _toggle_notifications()
+			"cheat": _open_cheat_input()
+			"fullscreen": _toggle_fullscreen()
+			"pause": mode = GameMode.PAUSED
 		audio.play("ui", 0.45)
-		queue_redraw()
-		return true
-	if touch_utility_drawer_open:
-		var utility_rects := _touch_utility_rects()
-		for action_value in utility_rects.keys():
-			var action := str(action_value)
-			if not Rect2(utility_rects[action]).has_point(position):
-				continue
-			touch_utility_drawer_open = false
-			_mark_touch_feedback(action)
-			match action:
-				"guide": tutorial_visible = not tutorial_visible
-				"map": active_panel = "map"
-				"skills": active_panel = "skills"
-				"upgrades":
-					active_panel = "soldier_upgrades"
-					soldier_upgrade_page = 0
-				"recruit":
-					if _is_near_recruitment():
-						active_panel = "recruit"
-					else:
-						_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
-				"command": active_panel = "command"
-				"notices": _toggle_notifications()
-				"cheat": _open_cheat_input()
-				"fullscreen": _toggle_fullscreen()
-				"pause": mode = GameMode.PAUSED
-			audio.play("ui", 0.45)
-			queue_redraw()
-			return true
-		# Closing the drawer consumes the touch so an outside tap cannot also
-		# start either virtual stick or fire an attack.
-		touch_utility_drawer_open = false
 		queue_redraw()
 		return true
 	if _touch_special_rect().has_point(position):
@@ -1950,6 +2149,24 @@ func _handle_screen_drag(event: InputEventScreenDrag) -> void:
 func _input(event: InputEvent) -> void:
 	if mode == GameMode.ENDING:
 		return
+	if mode == GameMode.ARENA:
+		if event is InputEventScreenTouch or event is InputEventScreenDrag:
+			last_touch_event_msec = Time.get_ticks_msec()
+			_set_input_scheme(InputScheme.TOUCH)
+		elif event is InputEventMouseButton:
+			if event.device == InputEvent.DEVICE_ID_EMULATION or Time.get_ticks_msec() - last_touch_event_msec <= 650:
+				return
+			_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
+		elif event is InputEventMouseMotion:
+			if Time.get_ticks_msec() - last_touch_event_msec <= 650:
+				return
+			if event.relative.length_squared() > 0.0:
+				_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
+		elif event is InputEventKey:
+			_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
+		if arena_view != null and arena_view.handle_input(event):
+			get_viewport().set_input_as_handled()
+		return
 	if cheat_input_active:
 		if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_ESCAPE:
 			_close_cheat_input()
@@ -1973,6 +2190,9 @@ func _input(event: InputEvent) -> void:
 			_toggle_fullscreen()
 			return
 		if mode == GameMode.TITLE:
+			if key == KEY_A:
+				_enter_arena()
+				return
 			if key == KEY_ENTER or key == KEY_SPACE:
 				_enter_class_select(false)
 			return
@@ -2085,6 +2305,10 @@ func _process(delta: float) -> void:
 
 
 func _simulate_game(delta: float) -> void:
+	if mode == GameMode.ARENA:
+		if arena_view != null:
+			arena_view.advance(delta)
+		return
 	if ending_pending:
 		_begin_ending()
 		return
@@ -3330,6 +3554,8 @@ func _update_player(delta: float) -> void:
 
 
 func _update_camera(delta: float) -> void:
+	if mode == GameMode.ARENA:
+		return
 	if player.is_empty():
 		return
 	var look_ahead: Vector2 = Vector2(player.get("facing", Vector2.RIGHT)) * 52.0
@@ -8746,14 +8972,17 @@ func _handle_ui_click(position: Vector2) -> bool:
 			return true
 		return true
 	if mode == GameMode.TITLE:
-		var center := screen_size * 0.5
-		if Rect2(center + Vector2(-140, 55), Vector2(280, 54)).has_point(position):
+		var title_rects := _title_action_rects()
+		if Rect2(title_rects["start"]).has_point(position):
 			# Touch browsers can emit a compatibility mouse press before the real
 			# screen-touch event. Consume that same physical press on the next screen
 			# so the centered Mage card is never chosen automatically.
 			_enter_class_select(true)
 			return true
-		if GameSaveManager.has_save() and Rect2(center + Vector2(-140, 120), Vector2(280, 48)).has_point(position):
+		if Rect2(title_rects["arena"]).has_point(position):
+			_enter_arena()
+			return true
+		if GameSaveManager.has_save() and Rect2(title_rects["load"]).has_point(position):
 			_load_game()
 			return true
 		return false
@@ -9134,6 +9363,8 @@ func _draw() -> void:
 			_draw_title_screen()
 		GameMode.CLASS_SELECT:
 			_draw_class_select()
+		GameMode.ARENA:
+			draw_rect(Rect2(Vector2.ZERO, screen_size), Color("0B161D"))
 		_:
 			_draw_world()
 			_draw_python_boss_ground_effects()
@@ -9229,10 +9460,26 @@ func _draw_title_screen() -> void:
 	_draw_text("無盡軍勢", c + Vector2(0, -122), 54, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 600)
 	_draw_text("荒 原 遠 征", c + Vector2(0, -72), 25, GOLD, HORIZONTAL_ALIGNMENT_CENTER, 440)
 	_draw_text("程序生成的無限草原．動作戰鬥．軍隊養成．城堡征服", c + Vector2(0, -25), 18, Color("AFC7D6"), HORIZONTAL_ALIGNMENT_CENTER, 720)
-	_draw_button(Rect2(c + Vector2(-140, 55), Vector2(280, 54)), "開始遠征", FRIEND_BLUE)
+	var title_rects := _title_action_rects()
+	_draw_button(Rect2(title_rects["start"]), "開始遠征", FRIEND_BLUE)
+	_draw_button(Rect2(title_rects["arena"]), "Arena" if language == "en" else "競技場", Color("8C6AB1"))
 	if GameSaveManager.has_save():
-		_draw_button(Rect2(c + Vector2(-140, 120), Vector2(280, 48)), "讀取上次進度", Color("466B76"))
-	_draw_text("Enter / 點擊開始　　F 全螢幕", Vector2(c.x, screen_size.y - 42), 15, Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, 520)
+		_draw_button(Rect2(title_rects["load"]), "讀取上次進度", Color("466B76"))
+	_draw_text("Enter / 點擊開始　　A 競技場　　F 全螢幕", Vector2(c.x, screen_size.y - 30), 15, Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, 620)
+
+
+func _title_action_rects() -> Dictionary:
+	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
+	var width := minf(screen_size.x - 24.0 * scale, 280.0 * scale)
+	var height := maxf(54.0, 44.0 * scale)
+	var gap := 6.0 * scale
+	var start_y := screen_size.y * 0.5 - 10.0 if _is_touch_scheme() else screen_size.y * 0.5 + 55.0
+	var start_x := (screen_size.x - width) * 0.5
+	return {
+		"start": Rect2(start_x, start_y, width, height),
+		"arena": Rect2(start_x, start_y + height + gap, width, height),
+		"load": Rect2(start_x, start_y + (height + gap) * 2.0, width, height),
+	}
 
 
 func _draw_class_select() -> void:
@@ -11399,6 +11646,10 @@ func _draw_hud() -> void:
 		_draw_text("按 E 或 B 開啟招募介面", prompt_rect.position + Vector2(prompt_rect.size.x * 0.5, 25), 15, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, prompt_rect.size.x - 16)
 
 	var visible_notification_count := mini(2, notifications.size()) if _is_touch_scheme() else notifications.size()
+	if _is_touch_scheme() and tutorial_visible and active_panel == "":
+		# The centered touch tutorial owns this small top corridor. World-space
+		# combat warnings and damage resolution continue normally underneath it.
+		visible_notification_count = 0
 	for i in visible_notification_count:
 		var notice: Dictionary = notifications[notifications.size() - 1 - i]
 		var alpha: float = clamp(float(notice["ttl"]) / min(0.4, float(notice["max_ttl"])), 0.0, 1.0)
@@ -11410,15 +11661,14 @@ func _draw_hud() -> void:
 		var notice_pitch := 42.0
 		var notice_font := 15
 		if _is_touch_scheme():
-			# Touch shows only the two newest messages below the centered Menu handle.
-			# When its drawer is open, messages move beneath the short 5x2 panel.
+			# Touch shows only the two newest messages between the two side rails.
 			# Combat telegraphs remain world-space cues and are never hidden here.
 			var scale := touch_ui_coordinate_scale
 			var safe_left := 333.0 + 10.0 * scale
 			var safe_right := screen_size.x - 230.0 - 10.0 * scale
 			notice_x = safe_left
 			notice_width = maxf(180.0 * scale, safe_right - safe_left)
-			notice_y = (172.0 if touch_utility_drawer_open else 68.0) * scale
+			notice_y = 68.0 * scale
 			notice_height = 30.0 * scale
 			notice_pitch = 34.0 * scale
 			notice_font = roundi(13.0 * scale)
@@ -11437,7 +11687,7 @@ func _draw_hud() -> void:
 			draw_rect(close_rect, PANEL_EDGE, false, 1.5)
 			_draw_text("×", close_rect.get_center() + Vector2(0.0, 7.0), 22, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, close_rect.size.x)
 			_draw_text("左搖桿移動　右搖桿瞄準並攻擊", tutorial.position + Vector2(14, 50), 13, Color("C8DBE5"))
-			_draw_text("技能鈕施放絕招；上方按鈕開啟功能", tutorial.position + Vector2(14, 72), 13, Color("C8DBE5"))
+			_draw_text("技能鈕施放絕招；左右兩側按鈕開啟功能", tutorial.position + Vector2(14, 72), 13, Color("C8DBE5"))
 			_draw_text("靠近據點後點擊招募；能力可分配技能點", tutorial.position + Vector2(14, 94), 13, Color("C8DBE5"))
 			_draw_text("軍令鈕可選跟隨、防守、攻擊、撤退、駐守與攻城", tutorial.position + Vector2(14, 116), 12, Color("C8DBE5"))
 			_draw_text("兵強→特殊：購買後重新招募，戰鬥時自動觸發", tutorial.position + Vector2(14, 138), 12, Color("A9D9E7"))
@@ -11664,7 +11914,7 @@ func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color
 	var scale := touch_ui_coordinate_scale
 	var radius := TOUCH_STICK_RADIUS * scale
 	var alpha := 0.72 if active else 0.48
-	draw_circle(center + Vector2(0.0, 5.0 * scale), radius + 6.0 * scale, Color(0.01, 0.02, 0.025, 0.50))
+	draw_circle(center + Vector2(0.0, 5.0 * scale), radius + 2.0 * scale, Color(0.01, 0.02, 0.025, 0.50))
 	draw_circle(center, radius, Color(0.025, 0.055, 0.07, alpha))
 	draw_arc(center, radius, 0.0, TAU, 42, Color(color, 0.74 if active else 0.45), 3.0 * scale, true)
 	for direction_value in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
@@ -11713,19 +11963,8 @@ func _draw_touch_controls() -> void:
 	var utility_rects := _touch_utility_rects()
 	var labels := {"guide": "說明", "map": "地圖", "skills": "能力", "upgrades": "兵強", "recruit": "招募", "command": "軍令", "notices": "通知開" if notifications_hidden else "通知關", "cheat": "作弊", "fullscreen": "全螢", "pause": "暫停"}
 	if language == "en":
-		labels = {"guide": "Help", "map": "Map", "skills": "Hero", "upgrades": "Troops", "recruit": "Recruit", "command": "Orders", "notices": "Show" if notifications_hidden else "Hide", "cheat": "Cheat", "fullscreen": "Full", "pause": "Pause"}
+		labels = {"guide": "Help", "map": "Map", "skills": "Hero", "upgrades": "Boost", "recruit": "Hire", "command": "Order", "notices": "Show" if notifications_hidden else "Hide", "cheat": "Cheat", "fullscreen": "Full", "pause": "Pause"}
 	var colors := {"guide": Color("7893A3"), "map": MAGIC_PURPLE, "skills": FRIEND_BLUE, "upgrades": Color("48A0BF"), "recruit": HEAL_GREEN, "command": GOLD, "notices": Color("557A66") if notifications_hidden else Color("6B7188"), "cheat": Color("76528D"), "fullscreen": Color("4E7693"), "pause": Color("D36D68")}
-	var menu_rect := _touch_utility_menu_rect()
-	if touch_utility_drawer_open:
-		var drawer_scale := touch_ui_coordinate_scale
-		var first_utility := Rect2(utility_rects["upgrades"])
-		var last_utility := Rect2(utility_rects["pause"])
-		var drawer_panel := Rect2(first_utility.position - Vector2.ONE * 6.0 * drawer_scale, Vector2(last_utility.end.x - first_utility.position.x + 12.0 * drawer_scale, last_utility.end.y - first_utility.position.y + 12.0 * drawer_scale))
-		draw_rect(drawer_panel, Color(0.015, 0.030, 0.042, 0.86))
-		draw_rect(drawer_panel, Color("5F9CB0"), false, 1.5 * drawer_scale)
-	_draw_touch_round_button(menu_rect, ("Close" if language == "en" else "收合") if touch_utility_drawer_open else ("Menu" if language == "en" else "功能"), Color("3F8196"), _touch_feedback_active("utility_menu") or touch_utility_drawer_open)
-	if not touch_utility_drawer_open:
-		return
 	for action_value in utility_rects.keys():
 		var action := str(action_value)
 		var enabled := action != "recruit" or _is_near_recruitment()
@@ -13526,6 +13765,7 @@ func _run_self_test() -> void:
 	_test_assert(bool(catalog_test.get("ok", false)) and int(catalog_test.get("soldier_types", 0)) == 16 and int(catalog_test.get("base_upgrades", 0)) == 8 and int(catalog_test.get("special_abilities", 0)) == 57, "soldier_upgrade_catalog_has_16_types_8_base_and_57_specials")
 	_test_assert(bool(runtime_test.get("ok", false)) and int(runtime_test.get("catalog_ids", 0)) == 57, "soldier_upgrade_runtime_covers_all_57_specials")
 	_test_assert(bool(vfx_catalog_test.get("ok", false)) and int(vfx_catalog_test.get("count", 0)) == 57 and int(vfx_catalog_test.get("unique_shapes", 0)) == 57, "soldier_upgrade_vfx_catalog_covers_all_57_with_unique_visual_shapes")
+	_test_assert(SoldierUpgradeCatalog.next_rank_cost("archer", "attack_or_healing", SoldierUpgradeCatalog.create_empty_research()) == 500, "permanent_troop_upgrade_prices_are_exactly_one_tenth")
 	var catalog_price_effects_ok := true
 	for special_id_value in SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER:
 		var special_id := str(special_id_value)
@@ -13534,6 +13774,93 @@ func _run_self_test() -> void:
 			catalog_price_effects_ok = false
 			break
 	_test_assert(catalog_price_effects_ok, "all_57_specials_expose_positive_prices_and_bilingual_effects")
+
+	# Arena setup is a strict three-confirmation flow and owns disposable team
+	# research. It must never mutate the campaign wallet or permanent upgrades.
+	var arena_controller_test := ArenaControllerScript.self_test()
+	_test_assert(bool(arena_controller_test.get("passed", false)) and int(arena_controller_test.get("special_behaviors", 0)) == 57, "arena_controller_flow_ai_and_all_57_behavior_contracts")
+	var campaign_money_before_arena := int(player.get("money", 0))
+	var campaign_research_before_arena := JSON.stringify(soldier_research)
+	var setup_arena: ArenaController = ArenaControllerScript.new()
+	var arena_types_ok := setup_arena.choose_mode("spectator")
+	setup_arena.set_active_team("blue")
+	arena_types_ok = arena_types_ok and setup_arena.toggle_type("archer") and setup_arena.toggle_type("healer")
+	setup_arena.set_active_team("red")
+	arena_types_ok = arena_types_ok and setup_arena.toggle_type("swordsman") and setup_arena.toggle_type("mage")
+	var every_arena_type_has_upgrades := true
+	for arena_team in ["blue", "red"]:
+		for arena_type_value in setup_arena.selected_types_for(arena_team):
+			var arena_type := str(arena_type_value)
+			if setup_arena.upgrade_ids(arena_team, arena_type, "base").is_empty() or setup_arena.upgrade_ids(arena_team, arena_type, "special").is_empty():
+				every_arena_type_has_upgrades = false
+	_test_assert(arena_types_ok and every_arena_type_has_upgrades, "arena_every_selected_soldier_type_has_base_and_special_upgrades")
+	var arena_counts_ok := setup_arena.confirm_types()
+	setup_arena.set_active_team("blue")
+	arena_counts_ok = arena_counts_ok and setup_arena.adjust_count("archer", 3) == 4
+	setup_arena.set_active_team("red")
+	arena_counts_ok = arena_counts_ok and setup_arena.adjust_count("swordsman", 2) == 3 and setup_arena.confirm_counts()
+	setup_arena.set_active_team("blue")
+	var arena_upgrade_id := str(setup_arena.upgrade_ids("blue", "archer", "special")[0])
+	var arena_upgrade_ok := setup_arena.adjust_upgrade(arena_upgrade_id, 1, "blue", "archer") == 1
+	var arena_battle_ok := setup_arena.start_battle()
+	_test_assert(arena_counts_ok and arena_upgrade_ok and arena_battle_ok and setup_arena.hero.is_empty(), "arena_types_counts_upgrades_then_spectator_battle_flow")
+	for _arena_frame in 180:
+		setup_arena.update(FIXED_STEP)
+	var spectator_targets_player := false
+	for arena_unit in setup_arena.units:
+		if str(arena_unit.get("target_kind", "")) == "hero":
+			spectator_targets_player = true
+	for arena_projectile in setup_arena.projectiles:
+		if str(arena_projectile.get("target_kind", "")) == "hero":
+			spectator_targets_player = true
+	_test_assert(not spectator_targets_player and setup_arena.hero.is_empty(), "arena_spectator_has_no_player_entity_or_player_targeting")
+	var compact_arena_area := setup_arena.arena_rect.size.x * setup_arena.arena_rect.size.y
+	var large_arena: ArenaController = ArenaControllerScript.new()
+	large_arena.choose_mode("spectator")
+	large_arena.set_active_team("blue")
+	large_arena.toggle_type("ufo")
+	large_arena.set_active_team("red")
+	large_arena.toggle_type("ufo")
+	large_arena.confirm_types()
+	large_arena.set_active_team("blue")
+	large_arena.adjust_count("ufo", 29)
+	large_arena.set_active_team("red")
+	large_arena.adjust_count("ufo", 29)
+	large_arena.confirm_counts()
+	large_arena.start_battle()
+	_test_assert(large_arena.arena_rect.size.x * large_arena.arena_rect.size.y > compact_arena_area, "arena_size_grows_with_soldier_count_and_unit_radius")
+	_test_assert(int(player.get("money", 0)) == campaign_money_before_arena and JSON.stringify(soldier_research) == campaign_research_before_arena, "arena_loadouts_do_not_mutate_campaign_wallet_or_research")
+	if arena_view != null:
+		arena_view.size = Vector2(1280.0, 720.0)
+		var arena_touch_layout_ok := arena_view.force_test_scene("types", "spectator", "zh_TW", true)
+		arena_view.set_presentation("zh_TW", true, 2.25)
+		var arena_layout := Dictionary(arena_view.render_state().get("layout", {}))
+		for type_rect_value in Dictionary(arena_layout.get("type_buttons", {})).values():
+			var type_rect: Dictionary = Dictionary(type_rect_value)
+			if float(type_rect.get("width", 0.0)) / 2.25 < 44.0 or float(type_rect.get("height", 0.0)) / 2.25 < 44.0:
+				arena_touch_layout_ok = false
+				break
+		_test_assert(arena_touch_layout_ok, "arena_touch_type_selection_targets_are_at_least_44_css_pixels")
+		var mode_before_arena_input_test := mode
+		mode = GameMode.ARENA
+		last_touch_event_msec = -10000
+		var ufo_rect: Dictionary = Dictionary(Dictionary(arena_layout.get("type_buttons", {})).get("ufo", {}))
+		var arena_type_point := Vector2(float(ufo_rect.get("x", 0.0)) + float(ufo_rect.get("width", 0.0)) * 0.5, float(ufo_rect.get("y", 0.0)) + float(ufo_rect.get("height", 0.0)) * 0.5)
+		var arena_touch_press := InputEventScreenTouch.new()
+		arena_touch_press.index = 71
+		arena_touch_press.pressed = true
+		arena_touch_press.position = arena_type_point
+		_input(arena_touch_press)
+		var selected_after_touch := "ufo" in arena_view.controller.selected_types_for(arena_view.controller.active_team)
+		var arena_compatibility_mouse := InputEventMouseButton.new()
+		arena_compatibility_mouse.button_index = MOUSE_BUTTON_LEFT
+		arena_compatibility_mouse.pressed = true
+		arena_compatibility_mouse.position = arena_type_point
+		_input(arena_compatibility_mouse)
+		_test_assert(selected_after_touch and "ufo" in arena_view.controller.selected_types_for(arena_view.controller.active_team) and arena_view.touch_mode, "arena_touch_compatibility_mouse_cannot_double_toggle_or_hide_virtual_controls")
+		mode = mode_before_arena_input_test
+		arena_view.close()
+		arena_view.size = screen_size
 
 	# Existing soldiers retain their immutable research snapshot. Only recruits
 	# created after a purchase inherit the new permanent rank.
@@ -13705,46 +14032,40 @@ func _run_self_test() -> void:
 	GameSaveManager.delete_save(nation_roundtrip_path)
 	_test_assert(_load_game(test_path), "nation_roundtrip_test_restores_canonical_save")
 
-	# Touch layout includes a dedicated, non-overlapping troop-upgrade button and
-	# all in-panel actions meet the minimum 44 px touch target.
+	# Touch layout keeps ten always-visible utilities on two narrow side rails.
+	# Every action and in-panel control meets the 44 CSS-pixel touch minimum.
 	var stored_screen_size := screen_size
 	var stored_input_scheme := input_scheme
 	var stored_touch_ui_coordinate_scale := touch_ui_coordinate_scale
-	touch_ui_coordinate_scale = 1.0
-	screen_size = Vector2(844.0, 390.0)
+	var initial_touch_scale := 720.0 / 390.0
+	touch_ui_coordinate_scale = initial_touch_scale
+	screen_size = Vector2(844.0 * initial_touch_scale, 720.0)
 	_set_input_scheme(InputScheme.TOUCH)
 	_reset_touch_inputs()
 	mode = GameMode.PLAYING
 	active_panel = ""
 	var touch_utility := _touch_utility_rects()
 	var touch_upgrade_rect := Rect2(touch_utility["upgrades"])
-	var touch_menu_rect := _touch_utility_menu_rect()
-	var left_stick_bounds := Rect2(_touch_move_center() - Vector2.ONE * TOUCH_STICK_RADIUS, Vector2.ONE * TOUCH_STICK_RADIUS * 2.0)
-	var right_stick_bounds := Rect2(_touch_aim_center() - Vector2.ONE * TOUCH_STICK_RADIUS, Vector2.ONE * TOUCH_STICK_RADIUS * 2.0)
-	var collapsed_state_value: Variant = JSON.parse_string(render_game_to_text())
-	var collapsed_controls := Dictionary(Dictionary(Dictionary(collapsed_state_value).get("input", {})).get("virtual_controls", {})) if collapsed_state_value is Dictionary else {}
-	var collapsed_utilities := Dictionary(collapsed_controls.get("utility", {}))
-	var collapsed_only_menu_visible := not bool(Dictionary(collapsed_controls.get("utility_menu", {})).get("expanded", true))
-	for collapsed_utility_value in collapsed_utilities.values():
-		if bool(Dictionary(collapsed_utility_value).get("visible", true)):
-			collapsed_only_menu_visible = false
+	var touch_scale := touch_ui_coordinate_scale
+	var left_stick_bounds := Rect2(_touch_move_center() - Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale, Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale * 2.0)
+	var right_stick_bounds := Rect2(_touch_aim_center() - Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale, Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale * 2.0)
+	var rails_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var rails_controls := Dictionary(Dictionary(Dictionary(rails_state_value).get("input", {})).get("virtual_controls", {})) if rails_state_value is Dictionary else {}
+	var rails_utilities := Dictionary(rails_controls.get("utility", {}))
+	var rails_all_visible := rails_utilities.size() == 10 and str(rails_controls.get("utility_layout", "")) == "dual_side_rails"
+	for rail_state_value in rails_utilities.values():
+		if not bool(Dictionary(rail_state_value).get("visible", false)):
+			rails_all_visible = false
 			break
-	var touch_menu_geometry_ok := touch_menu_rect.size.x >= 44.0 and touch_menu_rect.size.y >= 44.0 and not touch_menu_rect.intersects(left_stick_bounds) and not touch_menu_rect.intersects(right_stick_bounds) and not touch_menu_rect.intersects(_touch_special_rect())
-	_handle_touch_action_at(touch_menu_rect.get_center())
-	var touch_drawer_opened := touch_utility_drawer_open
-	var touch_pointers_before_outside := Vector2i(touch_move_pointer, touch_aim_pointer)
-	var touch_outside_consumed := _handle_touch_action_at(Vector2(420.0, 250.0))
-	var touch_drawer_outside_collapsed := touch_outside_consumed and not touch_utility_drawer_open and Vector2i(touch_move_pointer, touch_aim_pointer) == touch_pointers_before_outside
-	_handle_touch_action_at(touch_menu_rect.get_center())
-	var touch_upgrade_geometry_ok := touch_upgrade_rect.size.x >= 44.0 and touch_upgrade_rect.size.y >= 44.0 and not touch_upgrade_rect.intersects(left_stick_bounds) and not touch_upgrade_rect.intersects(right_stick_bounds) and not touch_upgrade_rect.intersects(_touch_special_rect())
+	var touch_upgrade_geometry_ok := touch_upgrade_rect.size.x / touch_scale >= 43.9 and touch_upgrade_rect.size.y / touch_scale >= 43.9 and not touch_upgrade_rect.intersects(left_stick_bounds) and not touch_upgrade_rect.intersects(right_stick_bounds) and not touch_upgrade_rect.intersects(_touch_special_rect())
 	_handle_touch_action_at(touch_upgrade_rect.get_center())
-	var touch_upgrade_opened := active_panel == "soldier_upgrades" and not touch_utility_drawer_open
+	var touch_upgrade_opened := active_panel == "soldier_upgrades"
 	var touch_upgrade_panel := _soldier_upgrade_panel_rect()
 	var touch_upgrade_controls := _soldier_upgrade_control_rects(touch_upgrade_panel)
 	var touch_targets_large := true
 	for control_value in touch_upgrade_controls.values():
 		var control_rect := Rect2(control_value)
-		if control_rect.size.x < 44.0 or control_rect.size.y < 44.0:
+		if control_rect.size.x / touch_scale < 43.9 or control_rect.size.y / touch_scale < 43.9:
 			touch_targets_large = false
 			break
 	var close_does_not_overlap_next := not Rect2(touch_upgrade_controls["type_next"]).intersects(_touch_panel_close_rect())
@@ -13766,7 +14087,12 @@ func _run_self_test() -> void:
 		touch_ui_coordinate_scale = compact_scale
 		screen_size = Vector2(css_size.x * compact_scale, 720.0)
 		var compact_bounds := Rect2(Vector2.ZERO, screen_size)
-		var compact_rects: Array[Rect2] = [_touch_utility_menu_rect()]
+		var compact_stick_radius := TOUCH_STICK_RADIUS * compact_scale
+		var compact_rects: Array[Rect2] = [
+			Rect2(_touch_move_center() - Vector2.ONE * compact_stick_radius, Vector2.ONE * compact_stick_radius * 2.0),
+			Rect2(_touch_aim_center() - Vector2.ONE * compact_stick_radius, Vector2.ONE * compact_stick_radius * 2.0),
+			_touch_special_rect(),
+		]
 		for compact_utility_value in _touch_utility_rects().values():
 			compact_rects.append(Rect2(compact_utility_value))
 		for compact_index in compact_rects.size():
@@ -13783,7 +14109,12 @@ func _run_self_test() -> void:
 				break
 		if not compact_touch_layouts_ok:
 			break
-	_test_assert(compact_touch_layouts_ok, "touch_utility_drawer_is_in_bounds_disjoint_and_tappable_on_three_short_landscape_sizes")
+		var compact_tutorial := _tutorial_panel_rect()
+		for compact_utility_value in _touch_utility_rects().values():
+			if compact_tutorial.intersects(Rect2(compact_utility_value)):
+				compact_touch_layouts_ok = false
+				break
+	_test_assert(compact_touch_layouts_ok, "touch_dual_side_rails_are_in_bounds_disjoint_and_tappable_on_three_short_landscape_sizes")
 	var web_touch_scale := 720.0 / 390.0
 	touch_ui_coordinate_scale = web_touch_scale
 	screen_size = Vector2(844.0 * web_touch_scale, 720.0)
@@ -13794,9 +14125,7 @@ func _run_self_test() -> void:
 	var web_attack_bounds := Rect2(_touch_aim_center() - Vector2.ONE * web_stick_radius, Vector2.ONE * web_stick_radius * 2.0)
 	var web_special_bounds := _touch_special_rect()
 	var web_touch_utility := _touch_utility_rects()
-	var web_menu_bounds := _touch_utility_menu_rect()
-	_handle_touch_action_at(web_menu_bounds.get_center())
-	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds, web_menu_bounds]
+	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds]
 	var web_virtual_layout_ok := web_touch_utility.size() == 10
 	for web_utility_value in web_touch_utility.values():
 		web_virtual_rects.append(Rect2(web_utility_value))
@@ -13860,7 +14189,7 @@ func _run_self_test() -> void:
 	_handle_touch_action_at(web_upgrade_rect.get_center())
 	var web_panel := _soldier_upgrade_panel_rect()
 	var web_controls := _soldier_upgrade_control_rects(web_panel)
-	var web_stretch_targets_ok := active_panel == "soldier_upgrades" and not touch_utility_drawer_open and web_upgrade_css_size.x >= 44.0 and web_upgrade_css_size.y >= 44.0
+	var web_stretch_targets_ok := active_panel == "soldier_upgrades" and web_upgrade_css_size.x >= 44.0 and web_upgrade_css_size.y >= 44.0
 	for web_control_value in web_controls.values():
 		var web_control_css_size := Rect2(web_control_value).size / web_touch_scale
 		if web_control_css_size.x < 44.0 or web_control_css_size.y < 44.0:
@@ -13868,7 +14197,7 @@ func _run_self_test() -> void:
 			break
 	web_stretch_targets_ok = web_stretch_targets_ok and not Rect2(web_controls["type_next"]).intersects(_touch_panel_close_rect())
 	_handle_touch_action_at(_touch_panel_close_rect().get_center())
-	_test_assert(collapsed_only_menu_visible and touch_menu_geometry_ok and touch_drawer_opened and touch_drawer_outside_collapsed and touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_drawer_panel_purchase_and_close")
+	_test_assert(rails_all_visible and touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_side_rail_panel_purchase_and_close")
 	screen_size = stored_screen_size
 	touch_ui_coordinate_scale = stored_touch_ui_coordinate_scale
 	_set_input_scheme(stored_input_scheme)
@@ -14105,7 +14434,9 @@ func _run_self_test() -> void:
 	_initialize_empty_player()
 	mode = GameMode.TITLE
 	class_select_pointer_guard_until_msec = -10000
-	var title_start_point := screen_size * 0.5 + Vector2(0, 82)
+	# Derive the press from the responsive title layout.  On compact touch
+	# viewports the Arena row moves Start above the legacy fixed Y offset.
+	var title_start_point := Rect2(_title_action_rects()["start"]).get_center()
 	_handle_ui_click(title_start_point)
 	_handle_ui_click(title_start_point)
 	_test_assert(mode == GameMode.CLASS_SELECT and str(player["class_id"]).is_empty(), "title_touch_cannot_fall_through_to_center_mage_card")
@@ -14196,7 +14527,6 @@ func _run_self_test() -> void:
 	var touch_attack_stopped := not attack_held and touch_aim_pointer < 0 and not bool(touch_attack_released_input.get("attack_held", true)) and not bool(touch_attack_released_control.get("held", true)) and is_zero_approx(float(player["attack_cd"]))
 	_test_assert(touch_attack_render_pressed_ok and touch_attack_aim_ok and touch_attack_executed and touch_attack_stopped, "touch_attack_stick_holds_aims_attacks_and_stops_on_release")
 
-	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_command_entry := InputEventScreenTouch.new()
 	touch_command_entry.index = 52
 	touch_command_entry.pressed = true
@@ -14224,7 +14554,6 @@ func _run_self_test() -> void:
 	active_panel = ""
 	last_recruit_purchase_msec = -10000
 	last_recruit_purchase_type = ""
-	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_recruit_entry := InputEventScreenTouch.new()
 	touch_recruit_entry.index = 54
 	touch_recruit_entry.pressed = true
@@ -14251,7 +14580,6 @@ func _run_self_test() -> void:
 	player["money"] = touch_recruit_money_before
 	active_panel = ""
 
-	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_pause_entry := InputEventScreenTouch.new()
 	touch_pause_entry.index = 56
 	touch_pause_entry.pressed = true
@@ -14317,7 +14645,6 @@ func _run_self_test() -> void:
 	_test_assert(_needs_landscape_rotation(), "portrait_touch_requests_landscape_rotation")
 	screen_size = landscape_screen
 	tutorial_visible = false
-	_handle_touch_action_at(_touch_utility_menu_rect().get_center())
 	var touch_guide := InputEventScreenTouch.new()
 	touch_guide.index = 44
 	touch_guide.pressed = true

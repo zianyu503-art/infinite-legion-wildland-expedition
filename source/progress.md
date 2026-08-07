@@ -1,5 +1,18 @@
 Original prompt: 依照 `/Users/alex/.codex/attachments/573a9183-7335-45aa-b2d1-68325b99e124/pasted-text.txt` 的完整規格，製作可直接遊玩的 Godot 無限地圖 2D 動作戰鬥／軍隊養成遊戲，並提供繁體中文操作說明與終端開啟指令。使用者明確指定套用 develop-web-game、game-engine、web-games、2d-games、game-ai-behavior、combat-design、level-design、environment-art、character-design、game-art、vfx-realtime、game-audio、game-design 技能。
 
+## 2026-08-07：Arena 競技場、雙側觸控鍵與平價永久士兵強化
+
+- [x] 新增完整 Arena 競技場模式：可選擇挑戰模式或觀戰模式，依照「兵種選擇 → 數量加減 → 每兵種強化 → 開戰」流程建立戰鬥。
+- [x] Arena 觀戰模式為俯視視角，沒有玩家角色、沒有玩家碰撞／仇恨，士兵只會依隊伍互相戰鬥；挑戰模式保留玩家對選定士兵作戰。
+- [x] Arena 場地會依士兵數量與單位半徑自動放大，避免大量或大型兵種擠在一起；返回設定會保留選擇與研究，但清除戰鬥暫態。
+- [x] Arena 內每種被選兵種都能購買一般強化與特殊能力；燃燒、冰霜、麻痺、毒、隕石、地雷、持續投射物、延遲目標、召喚、護盾、治療、連鎖等 57 種特殊能力都有實際戰鬥效果與專屬視覺。
+- [x] 永久士兵強化價格調整為原本十分之一；`full upgrade` 仍只提升英雄，不會升級士兵。
+- [x] 觸控版功能鍵改為左右兩側：左側放強化、招募、軍令、技能、地圖，右側放說明、通知、作弊、全螢幕、暫停；568×320、844×390 等短橫屏仍保持 44 CSS px 以上可點擊範圍。
+- [x] Arena 觸控版加入獨立虛擬移動／瞄準按鍵，直屏時顯示旋轉提示並暫停隱藏戰鬥，轉回橫屏後恢復。
+- [x] `render_game_to_text` 擴充 Arena、強化選項、active VFX 與 57 種粒子圖鑑狀態，支援 Web 自動驗證。
+- [x] Godot deterministic self-test 最終為 265／265；Playwright Web 驗證 11／11 通過，涵蓋桌面繁中、桌面英文、觸控雙側按鍵、Arena 選擇／數量／強化流程、觀戰、挑戰與直屏旋轉。
+- [x] Web 成品已重新匯出；`index.pck` SHA-256：`a1169d7c99bbeb808e7ad7bf13bd5403765f458be629ec1ce0fbb0f178d418c7`，固定公開網址維持不變。
+
 ## 2026-08-07：57 種士兵強化實戰 VFX 與不遮擋觸控抽屜
 
 - [x] 新增 `soldier_upgrade_vfx_catalog.gd`，精確覆蓋 57 個永久特殊能力；每種能力都有獨立 shape、色彩、輔色與 projectile／unit／status／trigger／area 視覺通道。

@@ -7,6 +7,7 @@ extends RefCounted
 
 const SCHEMA_VERSION := 2
 const RECRUIT_DISCOUNT_CAP := 0.35
+const PRICE_SCALE := 0.10
 const SPECIAL_RANK_COST_MULTIPLIERS: Array[int] = [1, 2, 4]
 const SUMMON_TEAM_CAP := 5
 const SUMMON_RECURSIVE_ALLOWED := false
@@ -305,7 +306,8 @@ const SPECIAL_ABILITY_ORDER: Array[String] = [
 ]
 
 ## Special prices are stored as rank-I base prices. next_rank_cost() applies
-## [P, 2P, 4P], then the soldier multiplier, and finally rounds upward to 100.
+## [P, 2P, 4P], then the soldier multiplier, rounds upward to 100, and finally
+## applies the shared permanent-upgrade price scale.
 ## Each rank_effects entry is the complete effect for that rank (not an increment).
 const SPECIAL_ABILITIES: Dictionary = {
 	"burning_sword": {
@@ -1086,16 +1088,20 @@ static func next_rank_cost(type_id: String, upgrade_id: String, research: Varian
 	var sanitized := sanitize_research(research)
 	var rank := _rank_from_sanitized(type_id, upgrade_id, sanitized)
 	var category := category_for(upgrade_id)
+	var unscaled_cost := -1
 	if category == "base":
 		var prices: Array = BASE_UPGRADES[upgrade_id]["prices"]
-		return -1 if rank >= prices.size() else int(prices[rank])
-	if category == "special":
+		if rank < prices.size():
+			unscaled_cost = int(prices[rank])
+	elif category == "special":
 		if rank >= 3:
 			return -1
 		var base_price := int(SPECIAL_ABILITIES[upgrade_id]["base_price"])
 		var unrounded := float(base_price * SPECIAL_RANK_COST_MULTIPLIERS[rank]) * soldier_multiplier(type_id)
-		return _round_up_to_100(unrounded)
-	return -1
+		unscaled_cost = _round_up_to_100(unrounded)
+	if unscaled_cost < 0:
+		return -1
+	return maxi(1, int(round(float(unscaled_cost) * PRICE_SCALE)))
 
 
 static func can_purchase(
@@ -1328,6 +1334,11 @@ static func catalog_self_test() -> Dictionary:
 	var empty_research := create_empty_research()
 	if not validate_research(empty_research).is_empty():
 		errors.append("empty_research_invalid")
+	if next_rank_cost("archer", "attack_or_healing", empty_research) != 500:
+		errors.append("base_price_scale_failed")
+	# 55,000 × priest 1.45 rounds to the former 79,800 price, then scales to 7,980.
+	if next_rank_cost("priest", "evade_drill", empty_research) != 7980:
+		errors.append("special_price_scale_or_rounding_failed")
 	var discount_test := create_empty_research()
 	var discount_types: Dictionary = discount_test["types"]
 	var swordsman: Dictionary = discount_types["swordsman"]
