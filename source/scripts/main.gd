@@ -384,7 +384,7 @@ func _initialize_cheat_input() -> void:
 	cheat_input.name = "CheatCodeInput"
 	cheat_input.visible = false
 	cheat_input.max_length = 64
-	cheat_input.placeholder_text = "gold coins / full upgrade / change"
+	cheat_input.placeholder_text = "gold coins / full upgrade / the best / change"
 	cheat_input.select_all_on_focus = true
 	cheat_input.virtual_keyboard_enabled = true
 	cheat_input.add_theme_font_override("font", ui_font)
@@ -450,6 +450,8 @@ func _on_cheat_code_submitted(raw_code: String) -> void:
 			audio.play("coin", 0.75)
 		"full upgrade":
 			_apply_full_hero_upgrade()
+		"the best":
+			_apply_full_soldier_upgrade()
 		"change":
 			class_change_pending = true
 			_enter_class_select(true)
@@ -473,6 +475,15 @@ func _apply_full_hero_upgrade() -> void:
 	player["special_cd"] = 0.0
 	_spawn_effect("level_up", player["pos"], GOLD, 1.6)
 	_add_notification("作弊碼成功：英雄已達滿級；士兵強化未變更。", GOLD, 4.0)
+	audio.play("level_up", 0.95)
+
+
+func _apply_full_soldier_upgrade() -> void:
+	# Permanent research keeps its normal snapshot contract: troops already on
+	# the field do not change, while every later recruit or revival is maxed.
+	soldier_research = SoldierUpgradeCatalog.create_max_research()
+	_spawn_effect("level_up", player.get("pos", HOUSE_POS), MAGIC_PURPLE, 1.6)
+	_add_notification("作弊碼成功：全部兵種永久強化已達滿級；之後招募或復活時自動套用。", GOLD, 4.5)
 	audio.play("level_up", 0.95)
 
 
@@ -1351,6 +1362,7 @@ func render_game_to_text() -> String:
 		"input": {
 			"scheme": "touch" if _is_touch_scheme() else "keyboard_mouse",
 			"touch_capable": touch_capable,
+			"cheat_active": cheat_input_active,
 			"logical_viewport_width": snappedf(screen_size.x, 0.1),
 			"logical_viewport_height": snappedf(screen_size.y, 0.1),
 			"touch_ui_coordinate_scale": snappedf(touch_ui_coordinate_scale, 0.001),
@@ -1425,6 +1437,8 @@ func render_game_to_text() -> String:
 		"soldier_upgrades": {
 			"catalog_schema": SoldierUpgradeCatalog.SCHEMA_VERSION,
 			"special_count": SoldierUpgradeCatalog.SPECIAL_ABILITY_ORDER.size(),
+			"soldier_type_count": SoldierUpgradeCatalog.SOLDIER_ORDER.size(),
+			"all_maxed": SoldierUpgradeCatalog.research_is_maxed(soldier_research),
 			"vfx_count": SoldierUpgradeVfxCatalog.DESCRIPTORS.size(),
 			"vfx_effects": visible_upgrade_vfx,
 			"particle_vfx_ids": particle_vfx_ids,
@@ -9425,7 +9439,8 @@ func _draw_cheat_overlay() -> void:
 	draw_rect(panel, PANEL_BG)
 	draw_rect(panel, MAGIC_PURPLE, false, 3.0)
 	_draw_text("輸入作弊碼", center + Vector2(0.0, -88.0), 27, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
-	_draw_text("gold coins：+100000 金幣　 full upgrade：英雄滿級（不升士兵）　 change：保留進度切換職業", center + Vector2(0.0, -54.0), 14, Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
+	_draw_text("gold coins：+100000 金幣　 full upgrade：英雄滿級（不升士兵）", center + Vector2(0.0, -58.0), 14, Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
+	_draw_text("the best：全部兵種永久強化滿級　 change：保留進度切換職業", center + Vector2(0.0, -35.0), 14, Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
 	_draw_text("按 Enter 確認；Esc 取消", center + Vector2(0.0, 92.0), 13, Color("91A9B8"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
 
 
@@ -13998,6 +14013,43 @@ func _run_self_test() -> void:
 	var snapshot_rejection_money := int(player["money"])
 	_test_assert(not _load_game(malformed_snapshot_path) and int(player["money"]) == snapshot_rejection_money, "schema8_rejects_malformed_soldier_upgrade_snapshot_without_mutation")
 	GameSaveManager.delete_save(malformed_snapshot_path)
+
+	var the_best_original_research := soldier_research.duplicate(true)
+	var the_best_original_soldiers: Array[Dictionary] = soldiers.duplicate(true)
+	var the_best_original_next_entity_id := next_entity_id
+	var the_best_money_before := int(player.get("money", 0))
+	var the_best_level_before := int(player.get("level", 1))
+	var the_best_unlock_before := all_soldiers_unlocked
+	soldiers.clear()
+	soldier_research = SoldierUpgradeCatalog.create_empty_research()
+	var pre_cheat_archer_id := _spawn_soldier("archer", Vector2(player.get("pos", HOUSE_POS)) + Vector2(80.0, 0.0))
+	var pre_cheat_archer: Variant = _find_soldier_by_id(pre_cheat_archer_id)
+	var pre_cheat_snapshot := JSON.stringify(Dictionary(pre_cheat_archer).get("upgrade_snapshot", {})) if pre_cheat_archer != null else ""
+	_on_cheat_code_submitted("  ThE   BeSt  ")
+	var existing_snapshot_unchanged := pre_cheat_archer != null and JSON.stringify(Dictionary(pre_cheat_archer).get("upgrade_snapshot", {})) == pre_cheat_snapshot
+	var post_cheat_archer_id := _spawn_soldier("archer", Vector2(player.get("pos", HOUSE_POS)) + Vector2(120.0, 0.0))
+	var post_cheat_archer: Variant = _find_soldier_by_id(post_cheat_archer_id)
+	var post_cheat_snapshot: Dictionary = Dictionary(post_cheat_archer).get("upgrade_snapshot", {}) if post_cheat_archer != null else {}
+	var future_archer_maxed := post_cheat_archer != null and Array(post_cheat_snapshot.get("active_specials", [])).size() == SoldierUpgradeCatalog.compatible_special_ids("archer").size()
+	for base_upgrade_value in SoldierUpgradeCatalog.BASE_UPGRADE_ORDER:
+		var base_upgrade_id := str(base_upgrade_value)
+		future_archer_maxed = future_archer_maxed and int(Dictionary(post_cheat_snapshot.get("base_ranks", {})).get(base_upgrade_id, 0)) == SoldierUpgradeCatalog.max_rank(base_upgrade_id)
+	for special_upgrade_value in SoldierUpgradeCatalog.compatible_special_ids("archer"):
+		var special_upgrade_id := str(special_upgrade_value)
+		future_archer_maxed = future_archer_maxed and int(Dictionary(post_cheat_snapshot.get("special_ranks", {})).get(special_upgrade_id, 0)) == SoldierUpgradeCatalog.max_rank(special_upgrade_id)
+	_test_assert(
+		SoldierUpgradeCatalog.research_is_maxed(soldier_research)
+		and existing_snapshot_unchanged
+		and future_archer_maxed
+		and int(player.get("money", 0)) == the_best_money_before
+		and int(player.get("level", 1)) == the_best_level_before
+		and all_soldiers_unlocked == the_best_unlock_before,
+		"the_best_maxes_all_troop_research_for_future_recruits_only"
+	)
+	soldier_research = the_best_original_research
+	soldiers.clear()
+	soldiers.append_array(the_best_original_soldiers)
+	next_entity_id = the_best_original_next_entity_id
 
 	var cheat_money_before := int(player["money"])
 	_on_cheat_code_submitted("  GOLD   coins ")

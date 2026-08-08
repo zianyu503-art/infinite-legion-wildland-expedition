@@ -191,6 +191,17 @@ await runCase(
     assert.equal(state.projectiles.length, 4);
     const layers = state.projectiles.map((projectile) => projectile.vfx_layers[0]).sort();
     assert.deepEqual(layers, ["burning_ammo", "frost_arrow", "paralysis_arrow", "toxic_payload"].sort());
+    assert.equal(state.soldier_upgrades.all_maxed, false);
+    await page.keyboard.press("t");
+    await waitForState(page, (value) => value.input.cheat_active === true);
+    await page.keyboard.press("Control+A");
+    await page.keyboard.type("the best");
+    await page.keyboard.press("Enter");
+    const maxedState = await waitForState(page, (value) => value.soldier_upgrades.all_maxed === true);
+    assert.equal(maxedState.input.cheat_active, false);
+    assert.equal(maxedState.soldier_upgrades.soldier_type_count, 16);
+    assert.ok(Object.values(maxedState.soldier_upgrades.selected_research.base).every((rank) => rank > 0));
+    assert.ok(Object.values(maxedState.soldier_upgrades.selected_research.special).every((rank) => rank === 3));
   },
 );
 

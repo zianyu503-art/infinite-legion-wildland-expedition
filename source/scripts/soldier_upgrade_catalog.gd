@@ -986,6 +986,30 @@ static func create_empty_research() -> Dictionary:
 	return {"version": SCHEMA_VERSION, "types": types}
 
 
+static func create_max_research() -> Dictionary:
+	var research := create_empty_research()
+	var types: Dictionary = research["types"]
+	for type_value in SOLDIER_ORDER:
+		var type_id := str(type_value)
+		var type_research: Dictionary = types[type_id]
+		var base_ranks: Dictionary = type_research["base"]
+		for upgrade_value in BASE_UPGRADE_ORDER:
+			var upgrade_id := str(upgrade_value)
+			base_ranks[upgrade_id] = max_rank(upgrade_id)
+		type_research["base"] = base_ranks
+		var special_ranks: Dictionary = type_research["special"]
+		for ability_value in SPECIAL_ABILITY_ORDER:
+			var ability_id := str(ability_value)
+			if special_ranks.has(ability_id):
+				special_ranks[ability_id] = max_rank(ability_id)
+		type_research["special"] = special_ranks
+		types[type_id] = type_research
+	research["types"] = types
+	# Keep the cheat output on the same canonical path as loaded save data. Base
+	# ranks are filled first so every rank-III special satisfies its prerequisite.
+	return sanitize_research(research)
+
+
 static func sanitize_research(raw_research: Variant) -> Dictionary:
 	var sanitized := create_empty_research()
 	var raw_root := _as_dictionary(raw_research)
@@ -1039,6 +1063,21 @@ static func validate_research(raw_research: Variant) -> PackedStringArray:
 
 static func research_is_valid(raw_research: Variant) -> bool:
 	return validate_research(raw_research).is_empty()
+
+
+static func research_is_maxed(raw_research: Variant) -> bool:
+	var sanitized := sanitize_research(raw_research)
+	for type_value in SOLDIER_ORDER:
+		var type_id := str(type_value)
+		for upgrade_value in BASE_UPGRADE_ORDER:
+			var upgrade_id := str(upgrade_value)
+			if _rank_from_sanitized(type_id, upgrade_id, sanitized) != max_rank(upgrade_id):
+				return false
+		for ability_value in SPECIAL_ABILITY_ORDER:
+			var ability_id := str(ability_value)
+			if is_compatible(type_id, ability_id) and _rank_from_sanitized(type_id, ability_id, sanitized) != max_rank(ability_id):
+				return false
+	return true
 
 
 static func is_compatible(type_id: String, upgrade_id: String) -> bool:
@@ -1334,6 +1373,9 @@ static func catalog_self_test() -> Dictionary:
 	var empty_research := create_empty_research()
 	if not validate_research(empty_research).is_empty():
 		errors.append("empty_research_invalid")
+	var max_research := create_max_research()
+	if not validate_research(max_research).is_empty() or not research_is_maxed(max_research):
+		errors.append("max_research_invalid_or_incomplete")
 	if next_rank_cost("archer", "attack_or_healing", empty_research) != 500:
 		errors.append("base_price_scale_failed")
 	# 55,000 × priest 1.45 rounds to the former 79,800 price, then scales to 7,980.

@@ -1,5 +1,13 @@
 Original prompt: 依照 `/Users/alex/.codex/attachments/573a9183-7335-45aa-b2d1-68325b99e124/pasted-text.txt` 的完整規格，製作可直接遊玩的 Godot 無限地圖 2D 動作戰鬥／軍隊養成遊戲，並提供繁體中文操作說明與終端開啟指令。使用者明確指定套用 develop-web-game、game-engine、web-games、2d-games、game-ai-behavior、combat-design、level-design、environment-art、character-design、game-art、vfx-realtime、game-audio、game-design 技能。
 
+## 2026-08-08：`the best` 全兵種永久強化作弊碼
+
+- [x] 新增 `the best` 作弊碼；16 種兵種的 8 類基礎強化與所有相容特殊能力一次升至最高階。
+- [x] 沿用永久強化快照規則：現役士兵不被追溯修改，之後招募或復活的士兵自動取得滿級研究；`full upgrade` 仍只提升英雄。
+- [x] Cheat 輸入提示、作弊面板與中英文成功訊息同步更新；`render_game_to_text` 回報 `all_maxed` 與兵種數量。
+- [x] Godot deterministic self-test 269／269 通過；Playwright 桌面、觸控、英文與 Arena 11／11 通過，桌面案例實際輸入 `the best` 驗證滿級研究。
+- [x] Web 成品已重新匯出；`index.pck` SHA-256：`a841ca759941341cee537a12eadc6759fd4c63129a37077688da53a9131cdeb5`，固定公開網址維持不變。
+
 ## 2026-08-07：競技場與普通戰場共用士兵、英雄及荒原地圖
 
 - [x] 新增 `CampaignVisualRenderer`，普通場與競技場實際共用同一套 16 兵種輪廓、武器、載具、空軍浮動／陰影及三職業英雄繪製；紅隊只替換隊伍識別色，不再使用三類簡化棋子。
