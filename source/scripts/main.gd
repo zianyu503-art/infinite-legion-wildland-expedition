@@ -25,6 +25,8 @@ const ChaosBossControllerScript = preload("res://scripts/chaos_boss.gd")
 const AionisBossControllerScript = preload("res://scripts/aionis_boss.gd")
 const CAVIAR_AVATAR_TEXTURE = preload("res://assets/ui/caviar_avatar.png")
 const UI_STEEL_TEXTURE = preload("res://assets/ui/textures/dark_blued_steel.png")
+const UI_BRONZE_TEXTURE = preload("res://assets/ui/textures/aged_hammered_bronze.png")
+const UI_CANVAS_TEXTURE = preload("res://assets/ui/textures/tactical_waxed_canvas.png")
 const UI_FONT_PATH := "res://assets/fonts/NotoSansTC-Regular.otf"
 
 enum GameMode { TITLE, CLASS_SELECT, PLAYING, PAUSED, DEAD, ENDING, ARENA }
@@ -63,8 +65,12 @@ const VIP_RESOURCE_STATE_LIMIT := 8192
 const VIP_RESOURCE_AMOUNT_LIMIT := 1000000
 const VIP_RESOURCE_KEYS: Array[String] = ["wood", "stone", "iron", "gold", "herbs", "fish", "salt", "crystal"]
 const ENDING_DURATION := 9.6
-const TOUCH_STICK_MIN_RADIUS_CSS := 50.0
-const TOUCH_STICK_MAX_RADIUS_CSS := 54.0
+const TOUCH_STICK_MIN_RADIUS_CSS := 34.0
+const TOUCH_STICK_MAX_RADIUS_CSS := 38.0
+const TOUCH_STICK_BASE_ALPHA := 0.22
+const TOUCH_STICK_RING_ALPHA := 0.46
+const TOUCH_STICK_KNOB_ALPHA := 0.56
+const TOUCH_STICK_DIRECTION_CUE_COUNT := 4
 const TOUCH_SPECIAL_SIZE_CSS := 52.0
 const TOUCH_RAIL_BUTTON_SIZE_CSS := 44.0
 const TOUCH_EDGE_MARGIN_CSS := 8.0
@@ -73,6 +79,9 @@ const TOUCH_CLUSTER_GAP_CSS := 6.0
 const UI_FORGED_BRASS := Color("B9904F")
 const UI_FORGED_BRASS_LIGHT := Color("E0C27A")
 const UI_FORGED_INK := Color("091016")
+const VIP_TERRAIN_DETAIL_FLECKS_PER_CELL := 4
+const VIP_TERRAIN_TRANSITION_SAMPLES := 9
+const VIP_ROAD_PATH_SAMPLES := 24
 const CLASS_SELECT_POINTER_GUARD_MSEC := 420
 const HERO_LEVEL_CAP := 50
 const ENEMY_PREDICTION_MAX_LEAD := 220.0
@@ -201,9 +210,11 @@ var touch_ui_coordinate_scale := 1.0
 var touch_move_pointer := -1
 var touch_aim_pointer := -1
 var touch_move_vector := Vector2.ZERO
-var touch_aim_vector := Vector2.RIGHT
+var touch_aim_vector := Vector2.ZERO
 var touch_move_position := Vector2.ZERO
 var touch_aim_position := Vector2.ZERO
+var touch_move_origin := Vector2.ZERO
+var touch_aim_origin := Vector2.ZERO
 var touch_button_feedback: Dictionary = {}
 var touch_utility_drawer_open := false
 var last_touch_event_msec := -10000
@@ -297,6 +308,17 @@ func _ready() -> void:
 func _on_viewport_size_changed() -> void:
 	screen_size = get_viewport_rect().size
 	_refresh_touch_ui_coordinate_scale()
+	# Mobile browsers are not guaranteed to deliver the final touch-release when
+	# their canvas changes orientation. Clear every owner before the portrait
+	# blocker appears so returning to landscape can never leave movement or fire
+	# latched from the previous viewport.
+	var portrait_reset := _enforce_touch_orientation_safety()
+	if not portrait_reset and touch_move_pointer >= 0:
+		touch_move_origin = _clamp_touch_origin(touch_move_origin, true)
+		touch_move_position = touch_move_origin + touch_move_vector.limit_length(1.0) * _touch_stick_radius()
+	if not portrait_reset and touch_aim_pointer >= 0:
+		touch_aim_origin = _clamp_touch_origin(touch_aim_origin, false)
+		touch_aim_position = touch_aim_origin + touch_aim_vector.limit_length(1.0) * _touch_stick_radius()
 	if arena_view != null:
 		arena_view.position = Vector2.ZERO
 		arena_view.size = screen_size
@@ -353,10 +375,20 @@ func _reset_touch_inputs() -> void:
 	touch_move_pointer = -1
 	touch_aim_pointer = -1
 	touch_move_vector = Vector2.ZERO
-	touch_move_position = _touch_move_center()
-	touch_aim_position = _touch_aim_center()
+	touch_aim_vector = Vector2.ZERO
+	touch_move_position = Vector2.ZERO
+	touch_aim_position = Vector2.ZERO
+	touch_move_origin = Vector2.ZERO
+	touch_aim_origin = Vector2.ZERO
 	attack_held = false
 	touch_utility_drawer_open = false
+
+
+func _enforce_touch_orientation_safety() -> bool:
+	if not _needs_landscape_rotation():
+		return false
+	_reset_touch_inputs()
+	return true
 
 
 func _enter_class_select(guard_pointer: bool) -> void:
@@ -515,17 +547,22 @@ func _initialize_cheat_input() -> void:
 	cheat_input.add_theme_color_override("font_color", Color("F5FAFF"))
 	cheat_input.add_theme_color_override("caret_color", GOLD)
 	cheat_input.add_theme_color_override("font_placeholder_color", Color("90A7B5"))
-	var normal_style := StyleBoxFlat.new()
-	normal_style.bg_color = Color(0.025, 0.045, 0.06, 0.98)
-	normal_style.border_color = Color("6B95A8")
-	normal_style.set_border_width_all(2)
-	normal_style.set_corner_radius_all(8)
+	# The editable field participates in the same real material system as the
+	# surrounding command panel. Keeping it as a StyleBoxTexture also prevents a
+	# native Control from reintroducing a flat-color rectangle over the canvas.
+	var normal_style := StyleBoxTexture.new()
+	normal_style.texture = UI_CANVAS_TEXTURE
+	normal_style.modulate_color = Color(0.32, 0.43, 0.50, 0.96)
+	normal_style.texture_margin_left = 18.0
+	normal_style.texture_margin_right = 18.0
+	normal_style.texture_margin_top = 14.0
+	normal_style.texture_margin_bottom = 14.0
 	normal_style.content_margin_left = 16.0
 	normal_style.content_margin_right = 16.0
 	cheat_input.add_theme_stylebox_override("normal", normal_style)
-	var focus_style := normal_style.duplicate()
-	focus_style.border_color = GOLD
-	focus_style.set_border_width_all(3)
+	var focus_style: StyleBoxTexture = normal_style.duplicate()
+	focus_style.texture = UI_BRONZE_TEXTURE
+	focus_style.modulate_color = Color(0.50, 0.42, 0.24, 0.98)
 	cheat_input.add_theme_stylebox_override("focus", focus_style)
 	cheat_input.text_submitted.connect(_on_cheat_code_submitted)
 	add_child(cheat_input)
@@ -535,10 +572,15 @@ func _initialize_cheat_input() -> void:
 func _layout_cheat_input() -> void:
 	if cheat_input == null:
 		return
+	var input_rect := _cheat_input_rect()
+	cheat_input.position = input_rect.position
+	cheat_input.size = input_rect.size
+
+
+func _cheat_input_rect() -> Rect2:
 	var width := minf(660.0, maxf(300.0, screen_size.x - 80.0))
 	var height := 62.0 if _is_touch_scheme() else 54.0
-	cheat_input.position = Vector2((screen_size.x - width) * 0.5, screen_size.y * 0.5 - 8.0)
-	cheat_input.size = Vector2(width, height)
+	return Rect2(Vector2((screen_size.x - width) * 0.5, screen_size.y * 0.5 - 8.0), Vector2(width, height))
 
 
 func _open_cheat_input() -> void:
@@ -1297,6 +1339,10 @@ func _web_force_arena_showcase_for_test(arguments: Array) -> bool:
 	arena_view.position = Vector2.ZERO
 	arena_view.size = screen_size
 	arena_view.configure_campaign_world(world_seed, Vector2(player.get("pos", HOUSE_POS)))
+	# The browser may already be in touch mode, in which case _set_input_scheme()
+	# intentionally returns early. Push the current logical-to-CSS scale before
+	# the QA scene opens so its responsive layout matches the real Arena entry.
+	arena_view.set_presentation(language, requested_touch, touch_ui_coordinate_scale)
 	var success := arena_view.force_test_scene(scene, arena_mode, language, requested_touch)
 	_web_manual_time_hold = 0.0
 	queue_redraw()
@@ -1447,6 +1493,58 @@ func _vip_text_state() -> Dictionary:
 	}
 
 
+func _ui_visual_contract() -> Dictionary:
+	var texture_resources := {
+		"steel": UI_STEEL_TEXTURE,
+		"bronze": UI_BRONZE_TEXTURE,
+		"canvas": UI_CANVAS_TEXTURE,
+	}
+	var texture_state := {}
+	var complete := true
+	for material_value in texture_resources.keys():
+		var material := str(material_value)
+		var texture: Texture2D = texture_resources[material]
+		var loaded := texture != null and texture.get_width() > 0 and texture.get_height() > 0
+		complete = complete and loaded
+		texture_state[material] = {
+			"path": texture.resource_path if texture != null else "",
+			"loaded": loaded,
+			"width": texture.get_width() if texture != null else 0,
+			"height": texture.get_height() if texture != null else 0,
+		}
+	var textured_regions := [
+		"title.background", "title.actions", "title.language",
+		"class_select.background", "class_select.cards", "class_select.actions",
+		"campaign.hud.player", "campaign.hud.minimap", "campaign.hud.army",
+		"campaign.controls.special", "campaign.controls.utility", "campaign.controls.dynamic_sticks",
+		"campaign.notifications", "campaign.tutorial", "campaign.recruit_prompt",
+		"panels.skills", "panels.recruit", "panels.soldier_upgrades", "panels.command", "panels.map",
+		"panels.pause", "panels.cheat", "panels.confirm_restart", "panels.death",
+		"boss.aionis", "boss.chaos", "boss.python", "boss.status_badges",
+		"rotation.overlay",
+	]
+	return {
+		"profile": "forged_expedition_materials_v2",
+		"complete": complete,
+		"textures": texture_state,
+		"material_roles": {"shell": "steel", "content": "canvas", "primary_vip_confirm": "bronze"},
+		"round_control_material_clip": "convex_uv_texture_polygon",
+		"touch_direction_cues": "four_cardinal_chevrons",
+		"mobile_notification_overflow": "two_line_wrap_then_ellipsis",
+		"cheat_input_style": "StyleBoxTexture:canvas_normal:bronze_focus",
+		"portrait_touch_reset_policy": "clear_owners_vectors_attack_on_resize",
+		"textured_regions": textured_regions,
+		"textured_region_count": textured_regions.size(),
+		"active_surface": "arena" if mode == GameMode.ARENA else ("panel.%s" % active_panel if not active_panel.is_empty() else _mode_name_for_visual_contract()),
+		"scope": "interactive_ui; world terrain, damage telegraphs, cooldown masks and cinematic black remain semantic",
+	}
+
+
+func _mode_name_for_visual_contract() -> String:
+	var names := ["title", "class_select", "playing", "paused", "dead", "ending", "arena"]
+	return str(names[clampi(mode, 0, names.size() - 1)])
+
+
 func render_game_to_text() -> String:
 	var mode_names := ["title", "class_select", "playing", "paused", "dead", "ending", "arena"]
 	var player_position: Vector2 = Vector2(player.get("pos", HOUSE_POS))
@@ -1561,10 +1659,18 @@ func render_game_to_text() -> String:
 	var touch_upgrade_test_rect := Rect2(touch_utility_rects.get("upgrades", Rect2()))
 	var touch_scale := maxf(0.001, touch_ui_coordinate_scale)
 	var touch_radius := _touch_stick_radius()
-	var touch_move_rect := Rect2(_touch_move_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
-	var touch_attack_rect := Rect2(_touch_aim_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
-	var touch_move_hit_rect := _touch_stick_hit_rect(_touch_move_center())
-	var touch_attack_hit_rect := _touch_stick_hit_rect(_touch_aim_center())
+	var touch_move_display_center := _touch_move_display_center()
+	var touch_attack_display_center := _touch_aim_display_center()
+	var touch_move_rect := Rect2(touch_move_display_center - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
+	var touch_attack_rect := Rect2(touch_attack_display_center - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
+	var touch_move_activation_zone := _touch_move_activation_zone()
+	var touch_attack_activation_zone := _touch_aim_activation_zone()
+	var touch_move_origin_bounds := _touch_origin_bounds(true)
+	var touch_attack_origin_bounds := _touch_origin_bounds(false)
+	# Keep the legacy `hit` alias useful to existing browser automation: with a
+	# dynamic stick its actual hit surface is the lower-half activation zone.
+	var touch_move_hit_rect := touch_move_activation_zone
+	var touch_attack_hit_rect := touch_attack_activation_zone
 	var touch_special_button_rect := _touch_special_rect()
 	var touch_gameplay_clear_rect := _touch_gameplay_clear_rect()
 	var touch_primary_controls_visible := _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty() and not touch_utility_drawer_open
@@ -1657,6 +1763,7 @@ func render_game_to_text() -> String:
 		"panel": active_panel,
 		"language": language,
 		"edition": world_edition,
+		"ui": _ui_visual_contract(),
 		"vip": _vip_text_state(),
 		"input": {
 			"scheme": "touch" if _is_touch_scheme() else "keyboard_mouse",
@@ -1677,7 +1784,8 @@ func render_game_to_text() -> String:
 			"virtual_controls": {
 				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
 				"coordinate_space": "logical_viewport_pixels",
-				"layout_version": 3,
+				"layout_version": 4,
+				"joystick_mode": "dynamic_origin",
 				"gameplay_clear": {
 					"x": snappedf(touch_gameplay_clear_rect.position.x, 0.1), "y": snappedf(touch_gameplay_clear_rect.position.y, 0.1),
 					"width": snappedf(touch_gameplay_clear_rect.size.x, 0.1), "height": snappedf(touch_gameplay_clear_rect.size.y, 0.1),
@@ -1685,9 +1793,35 @@ func render_game_to_text() -> String:
 				"move": {
 					"x": snappedf(touch_move_rect.position.x, 0.1), "y": snappedf(touch_move_rect.position.y, 0.1),
 					"width": snappedf(touch_move_rect.size.x, 0.1), "height": snappedf(touch_move_rect.size.y, 0.1),
-					"center_x": snappedf(_touch_move_center().x, 0.1), "center_y": snappedf(_touch_move_center().y, 0.1),
+					"center_x": snappedf(touch_move_display_center.x, 0.1), "center_y": snappedf(touch_move_display_center.y, 0.1),
+					"joystick_mode": "dynamic_origin",
 					"radius": snappedf(touch_radius, 0.1), "pointer": touch_move_pointer,
+					"radius_css": snappedf(touch_radius / touch_scale, 0.1),
+					"origin_x": snappedf(touch_move_origin.x, 0.1), "origin_y": snappedf(touch_move_origin.y, 0.1),
+					"origin": {"x": snappedf(touch_move_origin.x, 0.1), "y": snappedf(touch_move_origin.y, 0.1)},
+					"vector": {"x": snappedf(touch_move_vector.x, 0.01), "y": snappedf(touch_move_vector.y, 0.01)},
+					"active": touch_move_pointer >= 0,
 					"visible": touch_primary_controls_visible,
+					"visual_visible": touch_primary_controls_visible and touch_move_pointer >= 0,
+					"base_alpha": TOUCH_STICK_BASE_ALPHA,
+					"ring_alpha": TOUCH_STICK_RING_ALPHA,
+					"knob_alpha": TOUCH_STICK_KNOB_ALPHA,
+					"base_material": "steel",
+					"knob_material": "bronze",
+					"direction_cues": "four_cardinal_chevrons",
+					"direction_cue_count": TOUCH_STICK_DIRECTION_CUE_COUNT,
+					"activation_zone": {
+						"x": snappedf(touch_move_activation_zone.position.x, 0.1), "y": snappedf(touch_move_activation_zone.position.y, 0.1),
+						"width": snappedf(touch_move_activation_zone.size.x, 0.1), "height": snappedf(touch_move_activation_zone.size.y, 0.1),
+					},
+					"origin_bounds": {
+						"x": snappedf(touch_move_origin_bounds.position.x, 0.1), "y": snappedf(touch_move_origin_bounds.position.y, 0.1),
+						"width": snappedf(touch_move_origin_bounds.size.x, 0.1), "height": snappedf(touch_move_origin_bounds.size.y, 0.1),
+					},
+					"ring": {
+						"x": snappedf(touch_move_rect.position.x, 0.1), "y": snappedf(touch_move_rect.position.y, 0.1),
+						"width": snappedf(touch_move_rect.size.x, 0.1), "height": snappedf(touch_move_rect.size.y, 0.1),
+					},
 					"hit": {
 						"x": snappedf(touch_move_hit_rect.position.x, 0.1), "y": snappedf(touch_move_hit_rect.position.y, 0.1),
 						"width": snappedf(touch_move_hit_rect.size.x, 0.1), "height": snappedf(touch_move_hit_rect.size.y, 0.1),
@@ -1696,9 +1830,35 @@ func render_game_to_text() -> String:
 				"attack": {
 					"x": snappedf(touch_attack_rect.position.x, 0.1), "y": snappedf(touch_attack_rect.position.y, 0.1),
 					"width": snappedf(touch_attack_rect.size.x, 0.1), "height": snappedf(touch_attack_rect.size.y, 0.1),
-					"center_x": snappedf(_touch_aim_center().x, 0.1), "center_y": snappedf(_touch_aim_center().y, 0.1),
+					"center_x": snappedf(touch_attack_display_center.x, 0.1), "center_y": snappedf(touch_attack_display_center.y, 0.1),
+					"joystick_mode": "dynamic_origin",
 					"radius": snappedf(touch_radius, 0.1), "pointer": touch_aim_pointer, "held": attack_held,
+					"radius_css": snappedf(touch_radius / touch_scale, 0.1),
+					"origin_x": snappedf(touch_aim_origin.x, 0.1), "origin_y": snappedf(touch_aim_origin.y, 0.1),
+					"origin": {"x": snappedf(touch_aim_origin.x, 0.1), "y": snappedf(touch_aim_origin.y, 0.1)},
+					"vector": {"x": snappedf(touch_aim_vector.x, 0.01), "y": snappedf(touch_aim_vector.y, 0.01)},
+					"active": touch_aim_pointer >= 0,
 					"visible": touch_primary_controls_visible,
+					"visual_visible": touch_primary_controls_visible and touch_aim_pointer >= 0,
+					"base_alpha": TOUCH_STICK_BASE_ALPHA,
+					"ring_alpha": TOUCH_STICK_RING_ALPHA,
+					"knob_alpha": TOUCH_STICK_KNOB_ALPHA,
+					"base_material": "steel",
+					"knob_material": "bronze",
+					"direction_cues": "four_cardinal_chevrons",
+					"direction_cue_count": TOUCH_STICK_DIRECTION_CUE_COUNT,
+					"activation_zone": {
+						"x": snappedf(touch_attack_activation_zone.position.x, 0.1), "y": snappedf(touch_attack_activation_zone.position.y, 0.1),
+						"width": snappedf(touch_attack_activation_zone.size.x, 0.1), "height": snappedf(touch_attack_activation_zone.size.y, 0.1),
+					},
+					"origin_bounds": {
+						"x": snappedf(touch_attack_origin_bounds.position.x, 0.1), "y": snappedf(touch_attack_origin_bounds.position.y, 0.1),
+						"width": snappedf(touch_attack_origin_bounds.size.x, 0.1), "height": snappedf(touch_attack_origin_bounds.size.y, 0.1),
+					},
+					"ring": {
+						"x": snappedf(touch_attack_rect.position.x, 0.1), "y": snappedf(touch_attack_rect.position.y, 0.1),
+						"width": snappedf(touch_attack_rect.size.x, 0.1), "height": snappedf(touch_attack_rect.size.y, 0.1),
+					},
 					"hit": {
 						"x": snappedf(touch_attack_hit_rect.position.x, 0.1), "y": snappedf(touch_attack_hit_rect.position.y, 0.1),
 						"width": snappedf(touch_attack_hit_rect.size.x, 0.1), "height": snappedf(touch_attack_hit_rect.size.y, 0.1),
@@ -2200,11 +2360,7 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	death_timer = 0.0
 	last_recruit_purchase_msec = -10000
 	last_recruit_purchase_type = ""
-	attack_held = false
-	touch_move_pointer = -1
-	touch_aim_pointer = -1
-	touch_move_vector = Vector2.ZERO
-	touch_aim_vector = Vector2.RIGHT
+	_reset_touch_inputs()
 	soldier_command = "跟隨"
 	command_point = player["pos"]
 	command_target_id = -1
@@ -2288,6 +2444,47 @@ func _touch_aim_center() -> Vector2:
 	return Vector2(screen_size.x - horizontal_anchor - radius, screen_size.y - TOUCH_EDGE_MARGIN_CSS * scale - radius)
 
 
+func _touch_move_activation_zone() -> Rect2:
+	return Rect2(0.0, screen_size.y * 0.5, screen_size.x * 0.5, screen_size.y * 0.5)
+
+
+func _touch_aim_activation_zone() -> Rect2:
+	return Rect2(screen_size.x * 0.5, screen_size.y * 0.5, screen_size.x * 0.5, screen_size.y * 0.5)
+
+
+func _touch_origin_bounds(move_stick: bool) -> Rect2:
+	# The entire lower half is an activation surface, while the rendered ring is
+	# clamped far enough inward to remain fully visible at phone edges.
+	var scale := maxf(0.001, touch_ui_coordinate_scale)
+	var radius := _touch_stick_radius()
+	var edge := TOUCH_EDGE_MARGIN_CSS * scale
+	var half_width := screen_size.x * 0.5
+	var minimum := Vector2(edge + radius, screen_size.y * 0.5 + radius)
+	var maximum := Vector2(half_width - radius, screen_size.y - edge - radius)
+	if not move_stick:
+		minimum.x = half_width + radius
+		maximum.x = screen_size.x - edge - radius
+	maximum.x = maxf(minimum.x, maximum.x)
+	maximum.y = maxf(minimum.y, maximum.y)
+	return Rect2(minimum, maximum - minimum)
+
+
+func _clamp_touch_origin(position: Vector2, move_stick: bool) -> Vector2:
+	var bounds := _touch_origin_bounds(move_stick)
+	return Vector2(
+		clampf(position.x, bounds.position.x, bounds.end.x),
+		clampf(position.y, bounds.position.y, bounds.end.y)
+	)
+
+
+func _touch_move_display_center() -> Vector2:
+	return touch_move_origin if touch_move_pointer >= 0 else _touch_move_center()
+
+
+func _touch_aim_display_center() -> Vector2:
+	return touch_aim_origin if touch_aim_pointer >= 0 else _touch_aim_center()
+
+
 func _touch_special_rect() -> Rect2:
 	var scale := touch_ui_coordinate_scale
 	var size := Vector2.ONE * TOUCH_SPECIAL_SIZE_CSS * scale
@@ -2299,9 +2496,9 @@ func _touch_special_rect() -> Rect2:
 
 
 func _touch_gameplay_clear_rect() -> Rect2:
-	# Controls live in two corner clusters. This full-height center corridor is
-	# intentionally free of buttons so the player, enemies and warnings remain
-	# visible even on a 568×320 phone.
+	# Dynamic sticks are constrained to the lower half. This upper-center window
+	# remains free of persistent buttons and active stick visuals, so warnings and
+	# the immediate fight stay readable even on a 568×320 phone.
 	var scale := touch_ui_coordinate_scale
 	var radius := _touch_stick_radius()
 	# Keep a one-CSS-pixel guard band beyond the forgiving stick hit regions.
@@ -2309,7 +2506,7 @@ func _touch_gameplay_clear_rect() -> Rect2:
 	# the Web debug-state coordinates are rounded for browser automation.
 	var left := _touch_move_center().x + radius + 9.0 * scale
 	var right := _touch_aim_center().x - radius - 9.0 * scale
-	return Rect2(left, 0.0, maxf(0.0, right - left), screen_size.y)
+	return Rect2(left, 0.0, maxf(0.0, right - left), screen_size.y * 0.5)
 
 
 func _touch_stick_hit_rect(center: Vector2) -> Rect2:
@@ -2525,25 +2722,68 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 
 
 func _update_touch_move(position: Vector2) -> void:
-	touch_move_position = position
+	if touch_move_pointer < 0 or touch_move_origin.is_zero_approx():
+		return
 	var scale := touch_ui_coordinate_scale
 	var radius := _touch_stick_radius()
 	var deadzone := 10.0 * scale
-	var offset := (position - _touch_move_center()).limit_length(radius)
+	var offset := (position - touch_move_origin).limit_length(radius)
+	touch_move_position = touch_move_origin + offset
 	var magnitude := offset.length()
 	if magnitude <= deadzone:
 		touch_move_vector = Vector2.ZERO
 	else:
 		touch_move_vector = offset.normalized() * clampf((magnitude - deadzone) / maxf(1.0, radius - deadzone), 0.0, 1.0)
+	queue_redraw()
 
 
 func _update_touch_aim(position: Vector2) -> void:
-	touch_aim_position = position
+	if touch_aim_pointer < 0 or touch_aim_origin.is_zero_approx():
+		return
 	var scale := touch_ui_coordinate_scale
-	var offset := (position - _touch_aim_center()).limit_length(_touch_stick_radius())
+	var offset := (position - touch_aim_origin).limit_length(_touch_stick_radius())
+	touch_aim_position = touch_aim_origin + offset
 	if offset.length() >= 8.0 * scale:
 		touch_aim_vector = offset.normalized()
-	attack_held = true
+		attack_held = true
+	else:
+		touch_aim_vector = Vector2.ZERO
+		attack_held = false
+	queue_redraw()
+
+
+func _activate_touch_move(pointer: int, position: Vector2) -> void:
+	touch_move_pointer = pointer
+	touch_move_origin = _clamp_touch_origin(position, true)
+	touch_move_position = touch_move_origin
+	touch_move_vector = Vector2.ZERO
+	queue_redraw()
+
+
+func _activate_touch_aim(pointer: int, position: Vector2) -> void:
+	touch_aim_pointer = pointer
+	touch_aim_origin = _clamp_touch_origin(position, false)
+	touch_aim_position = touch_aim_origin
+	touch_aim_vector = Vector2.ZERO
+	attack_held = false
+	queue_redraw()
+
+
+func _release_touch_move() -> void:
+	touch_move_pointer = -1
+	touch_move_vector = Vector2.ZERO
+	touch_move_position = Vector2.ZERO
+	touch_move_origin = Vector2.ZERO
+	queue_redraw()
+
+
+func _release_touch_aim() -> void:
+	touch_aim_pointer = -1
+	touch_aim_vector = Vector2.ZERO
+	touch_aim_position = Vector2.ZERO
+	touch_aim_origin = Vector2.ZERO
+	attack_held = false
+	queue_redraw()
 
 
 func _handle_screen_touch(event: InputEventScreenTouch) -> void:
@@ -2551,13 +2791,9 @@ func _handle_screen_touch(event: InputEventScreenTouch) -> void:
 	_set_input_scheme(InputScheme.TOUCH)
 	if not event.pressed:
 		if event.index == touch_move_pointer:
-			touch_move_pointer = -1
-			touch_move_vector = Vector2.ZERO
-			touch_move_position = _touch_move_center()
+			_release_touch_move()
 		if event.index == touch_aim_pointer:
-			touch_aim_pointer = -1
-			attack_held = false
-			touch_aim_position = _touch_aim_center()
+			_release_touch_aim()
 		return
 	if _needs_landscape_rotation():
 		return
@@ -2571,19 +2807,20 @@ func _handle_screen_touch(event: InputEventScreenTouch) -> void:
 	if mode != GameMode.PLAYING or active_panel != "":
 		_handle_ui_click(event.position)
 		return
-	var move_hit_rect := _touch_stick_hit_rect(_touch_move_center())
-	var aim_hit_rect := _touch_stick_hit_rect(_touch_aim_center())
-	if python_boss != null and python_boss.is_rooted("player", 0) and aim_hit_rect.has_point(event.position):
+	var move_activation_zone := _touch_move_activation_zone()
+	var aim_activation_zone := _touch_aim_activation_zone()
+	# While constricted, every fresh press in the right activation half counts as
+	# an escape tap. The utility handles and special button were already given
+	# priority above, so this never steals an intentional UI action.
+	if python_boss != null and python_boss.is_rooted("player", 0) and aim_activation_zone.has_point(event.position):
 		python_boss.register_break_click(_player_damage(1.0))
 		_spawn_effect("hit", player["pos"], Color("DDA6FF"), 0.55)
 		return
-	if move_hit_rect.has_point(event.position) and touch_move_pointer < 0:
-		touch_move_pointer = event.index
-		_update_touch_move(event.position)
+	if move_activation_zone.has_point(event.position) and touch_move_pointer < 0:
+		_activate_touch_move(event.index, event.position)
 		return
-	if aim_hit_rect.has_point(event.position) and touch_aim_pointer < 0:
-		touch_aim_pointer = event.index
-		_update_touch_aim(event.position)
+	if aim_activation_zone.has_point(event.position) and touch_aim_pointer < 0:
+		_activate_touch_aim(event.index, event.position)
 		return
 	_handle_ui_click(event.position)
 
@@ -2611,6 +2848,11 @@ func _input(event: InputEvent) -> void:
 				return
 			_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
 		elif event is InputEventMouseMotion:
+			# Browser touch drags can emit a pointer-backed MouseMotion before the
+			# matching ScreenDrag. Never let that compatibility event switch the
+			# whole game to keyboard/mouse while an arena thumb still owns a stick.
+			if arena_view != null and arena_view.has_active_touch_controls():
+				return
 			if Time.get_ticks_msec() - last_touch_event_msec <= 650:
 				return
 			if event.relative.length_squared() > 0.0:
@@ -2631,8 +2873,15 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventScreenDrag:
 		_handle_screen_drag(event)
 		return
-	if event is InputEventMouseMotion and Time.get_ticks_msec() - last_touch_event_msec > 650 and event.relative.length_squared() > 0.0:
-		_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
+	if event is InputEventMouseMotion:
+		# On Chromium, a long-held finger may generate pointermove/MouseMotion
+		# more than 650 ms after touchStart and immediately before ScreenDrag.
+		# Keeping the current owner prevents a real slow thumb drag from being
+		# cancelled by the browser's compatibility mouse stream.
+		if touch_move_pointer >= 0 or touch_aim_pointer >= 0:
+			return
+		if Time.get_ticks_msec() - last_touch_event_msec > 650 and event.relative.length_squared() > 0.0:
+			_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
 	if event is InputEventKey and event.pressed and not event.echo:
 		_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
 		var key: int = event.keycode
@@ -2765,6 +3014,12 @@ func _simulate_game(delta: float) -> void:
 	if mode == GameMode.ARENA:
 		if arena_view != null:
 			arena_view.advance(delta)
+		return
+	# The portrait notice is modal in the campaign too. Besides clearing any
+	# touch owner during resize, stop world time and combat so enemies cannot
+	# attack behind a screen the player is being told to rotate away from.
+	if _needs_landscape_rotation():
+		_reset_touch_inputs()
 		return
 	if ending_pending:
 		_begin_ending()
@@ -3180,10 +3435,7 @@ func _begin_ending() -> void:
 	ending_elapsed = 0.0
 	mode = GameMode.ENDING
 	active_panel = ""
-	attack_held = false
-	touch_move_pointer = -1
-	touch_aim_pointer = -1
-	touch_move_vector = Vector2.ZERO
+	_reset_touch_inputs()
 	chaos_runtime_projectiles.clear()
 	chaos_runtime_hazards.clear()
 	for enemy_index in range(enemies.size() - 1, -1, -1):
@@ -10019,12 +10271,12 @@ func _soldier_upgrade_control_rects(panel: Rect2) -> Dictionary:
 		var touch_tab_gap := 8.0 * scale
 		var touch_tab_width := (panel.size.x - 36.0 * scale - touch_tab_gap) * 0.5
 		return {
-			"type_prev": Rect2(panel.position.x + 18.0 * scale, panel.position.y + 43.0 * scale, 62.0 * scale, 46.0 * scale),
-			"type_next": Rect2(panel.end.x - 150.0 * scale, panel.position.y + 43.0 * scale, 62.0 * scale, 46.0 * scale),
-			"base_tab": Rect2(panel.position.x + 18.0 * scale, panel.position.y + 94.0 * scale, touch_tab_width, 44.0 * scale),
-			"special_tab": Rect2(panel.position.x + 18.0 * scale + touch_tab_width + touch_tab_gap, panel.position.y + 94.0 * scale, touch_tab_width, 44.0 * scale),
-			"page_prev": Rect2(panel.position.x + 18.0 * scale, panel.end.y - 52.0 * scale, 108.0 * scale, 44.0 * scale),
-			"page_next": Rect2(panel.end.x - 126.0 * scale, panel.end.y - 52.0 * scale, 108.0 * scale, 44.0 * scale),
+			"type_prev": Rect2(panel.position.x + 18.0 * scale, panel.position.y + 38.0 * scale, 62.0 * scale, 44.0 * scale),
+			"type_next": Rect2(panel.end.x - 150.0 * scale, panel.position.y + 38.0 * scale, 62.0 * scale, 44.0 * scale),
+			"base_tab": Rect2(panel.position.x + 18.0 * scale, panel.position.y + 84.0 * scale, touch_tab_width, 44.0 * scale),
+			"special_tab": Rect2(panel.position.x + 18.0 * scale + touch_tab_width + touch_tab_gap, panel.position.y + 84.0 * scale, touch_tab_width, 44.0 * scale),
+			"page_prev": Rect2(panel.position.x + 18.0 * scale, panel.end.y - 48.0 * scale, 108.0 * scale, 44.0 * scale),
+			"page_next": Rect2(panel.end.x - 126.0 * scale, panel.end.y - 48.0 * scale, 108.0 * scale, 44.0 * scale),
 		}
 	var side_width := 54.0
 	var type_y := panel.position.y + 46.0
@@ -10050,8 +10302,10 @@ func _soldier_upgrade_rows_per_page(panel: Rect2) -> int:
 
 func _soldier_upgrade_row_rect(row_index: int, panel: Rect2) -> Rect2:
 	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
-	var start_y := (144.0 if _is_touch_scheme() else 134.0) * scale
-	return Rect2(panel.position.x + 18.0 * scale, panel.position.y + start_y + float(row_index) * 60.0 * scale, panel.size.x - 36.0 * scale, 54.0 * scale)
+	var start_y := (132.0 if _is_touch_scheme() else 134.0) * scale
+	var row_pitch := (48.0 if _is_touch_scheme() else 60.0) * scale
+	var row_height := (44.0 if _is_touch_scheme() else 54.0) * scale
+	return Rect2(panel.position.x + 18.0 * scale, panel.position.y + start_y + float(row_index) * row_pitch, panel.size.x - 36.0 * scale, row_height)
 
 
 func _soldier_upgrade_option_ids(type_id: String) -> Array[String]:
@@ -10128,7 +10382,9 @@ func _pause_language_rect() -> Rect2:
 	if _is_touch_scheme():
 		var panel := _pause_panel_rect()
 		var scale := touch_ui_coordinate_scale
-		return Rect2(panel.get_center().x - 110.0 * scale, panel.position.y + 206.0 * scale, 220.0 * scale, 44.0 * scale)
+		var action_rows := ceili(float(_pause_actions().size()) / 2.0)
+		var last_action_bottom := 42.0 + float(maxi(0, action_rows - 1)) * 48.0 + 44.0
+		return Rect2(panel.get_center().x - 110.0 * scale, panel.position.y + (last_action_bottom + 8.0) * scale, 220.0 * scale, 44.0 * scale)
 	var center := screen_size * 0.5
 	return Rect2(center.x - 78.0, center.y + 139.0, 156.0, 42.0)
 
@@ -10158,7 +10414,7 @@ func _pause_panel_rect() -> Rect2:
 		var css_size := screen_size / scale
 		var panel_size := Vector2(
 			minf(380.0, maxf(320.0, css_size.x - 24.0)),
-			minf(366.0, maxf(320.0, css_size.y - 24.0))
+			minf(366.0, maxf(300.0, css_size.y - 12.0))
 		) * scale
 		return Rect2(center - panel_size * 0.5, panel_size)
 	return Rect2(center - Vector2(180.0, 260.0), Vector2(360.0, 520.0))
@@ -10175,7 +10431,7 @@ func _pause_button_rect(index: int) -> Rect2:
 		var side := 12.0 * scale
 		var gap := 6.0 * scale
 		var button_width := (panel.size.x - side * 2.0 - gap) * 0.5
-		return Rect2(panel.position.x + side + float(column) * (button_width + gap), panel.position.y + (44.0 + float(row) * 54.0) * scale, button_width, 48.0 * scale)
+		return Rect2(panel.position.x + side + float(column) * (button_width + gap), panel.position.y + (42.0 + float(row) * 48.0) * scale, button_width, 44.0 * scale)
 	var center := screen_size * 0.5
 	var desktop_start := -136.0 if action_count >= 6 else (-108.0 if action_count >= 5 else -68.0)
 	var desktop_pitch := 43.0 if action_count >= 6 else (47.0 if action_count >= 5 else 51.0)
@@ -10187,7 +10443,7 @@ func _pause_volume_rect(action: String) -> Rect2:
 		var panel := _pause_panel_rect()
 		var center := panel.get_center()
 		var scale := touch_ui_coordinate_scale
-		var top := panel.position.y + 276.0 * scale
+		var top := _pause_language_rect().end.y + 26.0 * scale
 		match action:
 			"down": return Rect2(center.x - 146.0 * scale, top, 50.0 * scale, 44.0 * scale)
 			"mute": return Rect2(center.x - 90.0 * scale, top, 180.0 * scale, 44.0 * scale)
@@ -10277,8 +10533,11 @@ func _draw_cheat_overlay() -> void:
 	var panel_width := minf(740.0, screen_size.x - 48.0)
 	var panel_height := 250.0
 	var panel := Rect2(center - Vector2(panel_width * 0.5, panel_height * 0.5), Vector2(panel_width, panel_height))
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, MAGIC_PURPLE, false, 3.0)
+	_draw_forged_panel(panel, MAGIC_PURPLE, 3.0, true, "canvas")
+	# The LineEdit itself also uses StyleBoxTexture; this inset remains underneath
+	# it as a material frame and focus boundary on browser themes that tint native
+	# controls differently.
+	_draw_forged_inset(_cheat_input_rect().grow(4.0), GOLD, "bronze", 0.82, 2.0)
 	_draw_text("輸入作弊碼", center + Vector2(0.0, -88.0), 27, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
 	_draw_text("gold coins：+100000 金幣　 full upgrade：英雄滿級（不升士兵）", center + Vector2(0.0, -58.0), 14, Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
 	_draw_text("the best：全部兵種永久強化滿級　 change：保留進度切換職業", center + Vector2(0.0, -35.0), 14, Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, panel_width - 40.0)
@@ -10286,12 +10545,11 @@ func _draw_cheat_overlay() -> void:
 
 
 func _draw_rotate_device_overlay() -> void:
-	draw_rect(Rect2(Vector2.ZERO, screen_size), Color(0.025, 0.045, 0.06, 0.985))
+	_draw_ui_backdrop(Color(0.025, 0.045, 0.06, 0.985), MAGIC_PURPLE, "steel")
 	var center := screen_size * 0.5
 	var phone := Rect2(center - Vector2(210.0, 112.0), Vector2(420.0, 224.0))
-	draw_rect(phone, Color("142B35"))
-	draw_rect(phone, Color("7FA7B8"), false, 8.0)
-	draw_rect(Rect2(phone.position + Vector2(32.0, 25.0), phone.size - Vector2(64.0, 50.0)), Color("0C1720"))
+	_draw_forged_panel(phone, Color("7FA7B8"), 8.0, true, "steel")
+	_draw_forged_inset(Rect2(phone.position + Vector2(32.0, 25.0), phone.size - Vector2(64.0, 50.0)), Color("31566A"), "canvas")
 	draw_circle(phone.position + Vector2(phone.size.x - 15.0, phone.size.y * 0.5), 5.5, GOLD)
 	draw_arc(center, 285.0, -2.75, -0.35, 54, MAGIC_PURPLE, 10.0, true)
 	var arrow_tip := center + Vector2.from_angle(-0.35) * 285.0
@@ -10301,7 +10559,7 @@ func _draw_rotate_device_overlay() -> void:
 
 
 func _draw_title_screen() -> void:
-	draw_rect(Rect2(Vector2.ZERO, screen_size), Color("0C1720"))
+	_draw_ui_backdrop(Color("0C1720"), UI_FORGED_BRASS, "steel")
 	for i in 12:
 		var center := Vector2(screen_size.x * (0.05 + 0.09 * i), screen_size.y * (0.18 + 0.055 * sin(i * 1.9)))
 		draw_circle(center, 120.0 + i * 7.0, Color(0.08, 0.23, 0.25, 0.16))
@@ -10329,7 +10587,7 @@ func _draw_title_screen() -> void:
 		vip_label = "繼續 VIP 版"
 	elif str(vip_state.get("state", "not_started")) == "expired" and not bool(vip_state.get("has_access", false)):
 		vip_label = "VIP 試玩已結束"
-	_draw_button(Rect2(title_rects["vip"]), vip_label, Color("D4A72C") if bool(vip_state.get("has_access", false)) or str(vip_state.get("state", "")) == "not_started" else Color("5C5C62"))
+	_draw_button(Rect2(title_rects["vip"]), vip_label, Color("D4A72C") if bool(vip_state.get("has_access", false)) or str(vip_state.get("state", "")) == "not_started" else Color("5C5C62"), 15, 2.0, "bronze")
 	_draw_button(Rect2(title_rects["arena"]), "Arena" if language == "en" else "競技場", Color("8C6AB1"))
 	if GameSaveManager.has_save():
 		_draw_button(Rect2(title_rects["load"]), "讀取免費版進度", Color("466B76"))
@@ -10365,7 +10623,7 @@ func _title_action_rects() -> Dictionary:
 
 
 func _draw_class_select() -> void:
-	draw_rect(Rect2(Vector2.ZERO, screen_size), Color("101E27"))
+	_draw_ui_backdrop(Color("101E27"), Color("5E91A8"), "steel")
 	var edition_label := "VIP 連續世界" if _is_vip_world() else "免費荒原世界"
 	_draw_text("選擇新職業" if class_change_pending else "選擇你的遠征職業・%s" % edition_label, Vector2(screen_size.x * 0.5, 72), 35, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 780)
 	_draw_text("金錢、等級、士兵、城池與 Boss 進度都會保留" if class_change_pending else "職業選定後可用 change 作弊碼保留進度切換", Vector2(screen_size.x * 0.5, 105), 16, Color("91A9B8"), HORIZONTAL_ALIGNMENT_CENTER, 760)
@@ -10377,8 +10635,7 @@ func _draw_class_select() -> void:
 		var id: String = ids[i]
 		var cfg: Dictionary = GameConfig.HERO_CLASSES[id]
 		var rect := Rect2(start_x + i * (card_width + 24.0), screen_size.y * 0.24, card_width, min(430.0, screen_size.y * 0.62))
-		draw_rect(rect, Color(0.055, 0.095, 0.12, 0.98), true)
-		draw_rect(rect, Color(cfg["color"]), false, 3.0)
+		_draw_forged_panel(rect, Color(cfg["color"]), 3.0, true, "canvas")
 		_draw_character_icon(id, rect.position + Vector2(rect.size.x * 0.5, 72), 2.25)
 		_draw_text("%d　%s" % [i + 1, cfg["name"]], rect.position + Vector2(rect.size.x * 0.5, 126), 25, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 30)
 		_draw_text(str(cfg["description"]), rect.position + Vector2(20, 157), 14, Color("B7CBD7"), HORIZONTAL_ALIGNMENT_LEFT, rect.size.x - 40)
@@ -10402,6 +10659,7 @@ func _draw_world() -> void:
 		var triangle_count := 0
 		var feature_count := 0
 		var resource_count := 0
+		var surface_detail_result: Dictionary = {}
 		for vip_chunk_value in vip_terrain_chunks.values():
 			var vip_chunk: Dictionary = vip_chunk_value
 			var draw_result: Dictionary = VipTerrainRenderer.draw_chunk(
@@ -10414,6 +10672,10 @@ func _draw_world() -> void:
 				triangle_count += int(vip_chunk.get("triangle_count", 0))
 				for terrain_value in Array(draw_result.get("terrain_types", [])):
 					rendered_terrain_set[str(terrain_value)] = true
+		# A deterministic stipple pass breaks up the remaining low-resolution mesh
+		# diagonals and feathers primary-biome changes without another texture or
+		# per-pixel shader. It is drawn before props, so trees/resources stay crisp.
+		surface_detail_result = _draw_vip_terrain_surface_details(viewport_rect)
 		for vip_chunk_value in vip_terrain_chunks.values():
 			var prop_result: Dictionary = VipTerrainRenderer.draw_chunk(
 				self, Dictionary(vip_chunk_value), camera_pos, screen_size * 0.5 + camera_shake_offset,
@@ -10433,6 +10695,10 @@ func _draw_world() -> void:
 			"triangle_count": triangle_count,
 			"feature_count": feature_count,
 			"resource_count": resource_count,
+			"surface_detail_profile": str(surface_detail_result.get("profile", "")),
+			"surface_detail_count": int(surface_detail_result.get("detail_count", 0)),
+			"transition_feather_count": int(surface_detail_result.get("transition_count", 0)),
+			"road_profile": "meandering_layered_earth_v2",
 		}
 		_draw_vip_reserved_clearings()
 	else:
@@ -10452,15 +10718,169 @@ func _draw_world() -> void:
 		var safe := _world_to_screen(HOUSE_POS)
 		draw_circle(safe, HOUSE_SAFE_RADIUS, Color(0.36, 0.83, 0.58, 0.08))
 		draw_arc(safe, HOUSE_SAFE_RADIUS, 0, TAU, 96, Color(0.78, 0.96, 0.84, 0.48), 3.0)
-		var road_a := _world_to_screen(Vector2(-400, HOUSE_POS.y + 95))
-		var road_b := _world_to_screen(Vector2(1360, HOUSE_POS.y + 95))
-		draw_line(road_a, road_b, Color("80633F"), 104.0)
-		draw_line(road_a, road_b, Color("B88B55"), 78.0)
-		draw_line(road_a + Vector2(0, -19), road_b + Vector2(0, -19), Color(0.46, 0.34, 0.22, 0.4), 2.0)
-		draw_line(road_a + Vector2(0, 19), road_b + Vector2(0, 19), Color(0.46, 0.34, 0.22, 0.4), 2.0)
+		_draw_expedition_road()
 	_draw_house(HOUSE_POS)
 	for camp in camps.values(): _draw_camp(camp)
 	for castle in castles.values(): _draw_castle(castle)
+
+
+func _vip_scene_visual_contract() -> Dictionary:
+	return {
+		"profile": "vip_organic_surface_v2",
+		"deterministic": true,
+		"surface_detail": "terrain_tinted_flecks",
+		"transition_edges": "jittered_dual_color_feather",
+		"reserved_clearings": "irregular_multi_ring_feather",
+		"road": "meandering_layered_earth_v2",
+		"details_per_cell": VIP_TERRAIN_DETAIL_FLECKS_PER_CELL,
+		"transition_samples": VIP_TERRAIN_TRANSITION_SAMPLES,
+	}
+
+
+func _vip_visual_hash_unit(grid_x: int, grid_y: int, salt: int) -> float:
+	# Keep the visual layer stable across frame rate, chunk load order and device.
+	# All products remain far below signed 64-bit range at supported world sizes.
+	var value := (
+		(int(grid_x) & 0x7FFFFFFF) * 374761393
+		+ (int(grid_y) & 0x7FFFFFFF) * 668265263
+		+ (world_seed & 0x7FFFFFFF) * 69069
+		+ (salt & 0x7FFFFFFF) * 104729
+	) & 0x7FFFFFFF
+	value = ((value ^ (value >> 13)) * 1274126177) & 0x7FFFFFFF
+	value = ((value ^ (value >> 16)) * 374761393) & 0x7FFFFFFF
+	return float(value) / float(0x7FFFFFFF)
+
+
+func _vip_grid_key(grid: Vector2i) -> String:
+	return "%d,%d" % [grid.x, grid.y]
+
+
+func _draw_vip_terrain_surface_details(viewport_rect: Rect2) -> Dictionary:
+	var visible_cells: Array[Dictionary] = []
+	var cells_by_grid: Dictionary = {}
+	var chunk_keys: Array = vip_terrain_chunks.keys()
+	chunk_keys.sort()
+	var cull_rect := viewport_rect.grow(96.0)
+	for chunk_key_value in chunk_keys:
+		var chunk := Dictionary(vip_terrain_chunks[chunk_key_value])
+		for cell_value in Array(chunk.get("cells", [])):
+			if not cell_value is Dictionary:
+				continue
+			var cell := Dictionary(cell_value)
+			var world_rect := Rect2(cell.get("rect", Rect2()))
+			var screen_rect := Rect2(_world_to_screen(world_rect.position), world_rect.size)
+			if not screen_rect.intersects(cull_rect, true):
+				continue
+			visible_cells.append(cell)
+			cells_by_grid[_vip_grid_key(Vector2i(cell.get("global_grid", Vector2i.ZERO)))] = cell
+	visible_cells.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		var a_grid := Vector2i(a.get("global_grid", Vector2i.ZERO))
+		var b_grid := Vector2i(b.get("global_grid", Vector2i.ZERO))
+		return a_grid.y < b_grid.y or (a_grid.y == b_grid.y and a_grid.x < b_grid.x)
+	)
+
+	var detail_count := 0
+	var transition_count := 0
+	for cell in visible_cells:
+		var grid := Vector2i(cell.get("global_grid", Vector2i.ZERO))
+		var world_rect := Rect2(cell.get("rect", Rect2()))
+		var terrain_id := str(cell.get("terrain", "plains"))
+		var terrain_color := Color(cell.get("color", VipTerrainCatalog.color_for(terrain_id)))
+		var is_water := terrain_id in ["ocean", "lake", "river"]
+		for detail_index in VIP_TERRAIN_DETAIL_FLECKS_PER_CELL:
+			var u := lerpf(0.14, 0.86, _vip_visual_hash_unit(grid.x, grid.y, 701 + detail_index * 17))
+			var v := lerpf(0.14, 0.86, _vip_visual_hash_unit(grid.x, grid.y, 733 + detail_index * 29))
+			var world_position := world_rect.position + Vector2(u * world_rect.size.x, v * world_rect.size.y)
+			var point := _world_to_screen(world_position)
+			var length := lerpf(5.0, 13.0, _vip_visual_hash_unit(grid.x, grid.y, 769 + detail_index * 37))
+			var angle := (-0.10 if is_water else -0.72) + _vip_visual_hash_unit(grid.x, grid.y, 811 + detail_index * 43) * (0.20 if is_water else 1.44)
+			var direction := Vector2.from_angle(angle)
+			var detail_color := terrain_color.lightened(0.26) if detail_index % 2 == 0 else terrain_color.darkened(0.28)
+			draw_line(point - direction * length * 0.5, point + direction * length * 0.5, Color(detail_color, 0.16 if is_water else 0.14), 1.1)
+			if not is_water:
+				draw_circle(point, 1.2 + float(detail_index % 2), Color(detail_color, 0.14))
+			detail_count += 1
+
+		# Only right and lower neighbors are visited, so every organic seam is
+		# emitted once even when multiple chunks overlap the culling margin.
+		for neighbor_delta in [Vector2i.RIGHT, Vector2i.DOWN]:
+			var neighbor_key := _vip_grid_key(grid + neighbor_delta)
+			if not cells_by_grid.has(neighbor_key):
+				continue
+			var neighbor := Dictionary(cells_by_grid[neighbor_key])
+			if terrain_id == str(neighbor.get("terrain", "plains")):
+				continue
+			_draw_vip_transition_feather(cell, neighbor, neighbor_delta)
+			transition_count += 1
+	var contract := _vip_scene_visual_contract()
+	return {
+		"profile": str(contract["profile"]),
+		"detail_count": detail_count,
+		"transition_count": transition_count,
+	}
+
+
+func _draw_vip_transition_feather(cell: Dictionary, neighbor: Dictionary, neighbor_delta: Vector2i) -> void:
+	var world_rect := Rect2(cell.get("rect", Rect2()))
+	var start := Vector2(world_rect.end.x, world_rect.position.y) if neighbor_delta == Vector2i.RIGHT else Vector2(world_rect.position.x, world_rect.end.y)
+	var finish := Vector2(world_rect.end.x, world_rect.end.y) if neighbor_delta == Vector2i.RIGHT else Vector2(world_rect.end.x, world_rect.end.y)
+	var normal := Vector2(neighbor_delta)
+	var cell_color := Color(cell.get("color", VipTerrainCatalog.color_for(str(cell.get("terrain", "plains")))))
+	var neighbor_color := Color(neighbor.get("color", VipTerrainCatalog.color_for(str(neighbor.get("terrain", "plains")))))
+	var grid := Vector2i(cell.get("global_grid", Vector2i.ZERO))
+	for sample_index in VIP_TERRAIN_TRANSITION_SAMPLES:
+		var amount := (float(sample_index) + 0.5) / float(VIP_TERRAIN_TRANSITION_SAMPLES)
+		var offset := lerpf(-30.0, 30.0, _vip_visual_hash_unit(grid.x, grid.y, 907 + sample_index * 53 + neighbor_delta.x * 11 + neighbor_delta.y * 19))
+		var point := _world_to_screen(start.lerp(finish, amount) + normal * offset)
+		var radius := lerpf(15.0, 27.0, _vip_visual_hash_unit(grid.x, grid.y, 941 + sample_index * 31))
+		# Cross the two terrain colors over the mathematical cell edge. The
+		# overlapping, offset discs form irregular tongues rather than reinforcing
+		# the original straight mesh boundary.
+		draw_circle(point - normal * 9.0, radius * 1.05, Color(neighbor_color, 0.22))
+		draw_circle(point + normal * 9.0, radius, Color(cell_color, 0.22))
+		draw_circle(point, radius * 0.56, Color(cell_color.lerp(neighbor_color, 0.5), 0.32))
+
+
+func _draw_expedition_road() -> void:
+	var world_points := PackedVector2Array()
+	for point_index in range(VIP_ROAD_PATH_SAMPLES + 1):
+		var amount := float(point_index) / float(VIP_ROAD_PATH_SAMPLES)
+		var x := lerpf(-400.0, 1360.0, amount)
+		var broad_wave := sin((x + float(world_seed % 997)) / 238.0) * 7.0
+		var fine_wave := sin((x - float(world_seed % 431)) / 91.0) * 2.8
+		var jitter := (_vip_visual_hash_unit(point_index, 19, 1201) - 0.5) * 5.0
+		world_points.append(Vector2(x, HOUSE_POS.y + 95.0 + broad_wave + fine_wave + jitter))
+	var screen_points := PackedVector2Array()
+	for world_point in world_points:
+		screen_points.append(_world_to_screen(world_point))
+	draw_polyline(screen_points, Color(0.20, 0.15, 0.10, 0.58), 84.0, true)
+	draw_polyline(screen_points, Color("866844", 0.90), 66.0, true)
+	draw_polyline(screen_points, Color("B18A59", 0.72), 48.0, true)
+
+	var left_rut := PackedVector2Array()
+	var right_rut := PackedVector2Array()
+	for point_index in screen_points.size():
+		var previous := screen_points[maxi(0, point_index - 1)]
+		var following := screen_points[mini(screen_points.size() - 1, point_index + 1)]
+		var tangent := (following - previous).normalized()
+		var normal := Vector2(-tangent.y, tangent.x)
+		left_rut.append(screen_points[point_index] - normal * 14.0)
+		right_rut.append(screen_points[point_index] + normal * 14.0)
+		if point_index % 2 == 0:
+			var patch_shift := lerpf(-18.0, 18.0, _vip_visual_hash_unit(point_index, 23, 1277))
+			var patch_radius := lerpf(3.5, 8.5, _vip_visual_hash_unit(point_index, 29, 1301))
+			var patch_color := Color("5E4932", 0.19) if point_index % 4 == 0 else Color("DEC08A", 0.13)
+			draw_circle(screen_points[point_index] + normal * patch_shift, patch_radius, patch_color)
+	draw_polyline(left_rut, Color(0.30, 0.22, 0.14, 0.34), 2.2, true)
+	draw_polyline(right_rut, Color(0.30, 0.22, 0.14, 0.34), 2.2, true)
+	for point_index in range(2, screen_points.size() - 2, 3):
+		var previous := screen_points[point_index - 1]
+		var following := screen_points[point_index + 1]
+		var tangent := (following - previous).normalized()
+		var normal := Vector2(-tangent.y, tangent.x)
+		for side in [-1.0, 1.0]:
+			var edge: Vector2 = screen_points[point_index] + normal * float(side) * lerpf(29.0, 34.0, _vip_visual_hash_unit(point_index, int(side), 1361))
+			draw_line(edge - tangent * 4.0, edge + tangent * 4.0, Color("5B713F", 0.40), 1.4)
 
 
 func _draw_vip_reserved_clearings() -> void:
@@ -10472,12 +10892,45 @@ func _draw_vip_reserved_clearings() -> void:
 	for nest_value in snake_nests.values():
 		clearings.append({"position": Vector2(Dictionary(nest_value).get("pos", Vector2.ZERO)), "radius": 285.0})
 	for clearing in clearings:
-		var center := _world_to_screen(Vector2(clearing["position"]))
+		var world_position := Vector2(clearing["position"])
+		var center := _world_to_screen(world_position)
 		var radius := float(clearing["radius"])
 		if not _on_screen(center, radius + 24.0):
 			continue
-		draw_circle(center, radius + 20.0, Color(VipTerrainCatalog.color_for("plains"), 0.28))
-		draw_circle(center, radius, Color(VipTerrainCatalog.color_for("plains"), 0.82))
+		_draw_vip_irregular_clearing(center, radius, world_position)
+
+
+func _vip_irregular_ring(center: Vector2, radius: float, seed_grid: Vector2i, salt: int, variation: float = 0.04) -> PackedVector2Array:
+	var points := PackedVector2Array()
+	var segment_count := 40
+	for segment_index in segment_count:
+		var angle := TAU * float(segment_index) / float(segment_count)
+		var ripple := sin(angle * 5.0 + float(seed_grid.x % 31) * 0.17) * variation * 0.45
+		var jitter := (_vip_visual_hash_unit(seed_grid.x + segment_index, seed_grid.y - segment_index, salt) - 0.5) * variation
+		points.append(center + Vector2.from_angle(angle) * radius * (1.0 + ripple + jitter))
+	return points
+
+
+func _draw_vip_irregular_clearing(center: Vector2, radius: float, world_position: Vector2) -> void:
+	var plains := VipTerrainCatalog.color_for("plains")
+	var seed_grid := Vector2i(roundi(world_position.x / 8.0), roundi(world_position.y / 8.0))
+	# Multiple independently perturbed silhouettes turn the gameplay-safe plains
+	# patch into a natural clearing. The outside rings are deliberately faint so
+	# forest/water colors remain visible through the transition instead of ending
+	# on a mathematically perfect edge.
+	var outer := _vip_irregular_ring(center, radius + 24.0, seed_grid, 1433, 0.055)
+	var middle := _vip_irregular_ring(center, radius + 12.0, seed_grid, 1459, 0.045)
+	var inner := _vip_irregular_ring(center, radius, seed_grid, 1481, 0.035)
+	draw_colored_polygon(outer, Color(plains, 0.10))
+	draw_colored_polygon(middle, Color(plains, 0.20))
+	draw_colored_polygon(inner, Color(plains, 0.66))
+	var closed_inner := PackedVector2Array(inner)
+	closed_inner.append(inner[0])
+	draw_polyline(closed_inner, Color(plains.lightened(0.18), 0.16), 2.0, true)
+	for edge_index in range(0, inner.size(), 4):
+		var edge_point := inner[edge_index]
+		var inward := (center - edge_point).normalized()
+		draw_line(edge_point, edge_point + inward * 9.0, Color(plains.darkened(0.25), 0.15), 1.2)
 
 
 func _draw_aionis_arena_environment() -> void:
@@ -12633,8 +13086,7 @@ func _draw_hud() -> void:
 
 	if _is_near_recruitment() and active_panel == "" and not _is_touch_scheme():
 		var prompt_rect := Rect2(screen_size.x * 0.5 - 175, screen_size.y - 118, 350, 38)
-		draw_rect(prompt_rect, Color(0.02, 0.05, 0.07, 0.88))
-		draw_rect(prompt_rect, HEAL_GREEN, false, 2.0)
+		_draw_forged_panel(prompt_rect, HEAL_GREEN, 2.0, false, "canvas", 0.92)
 		_draw_text("按 E 或 B 開啟招募介面", prompt_rect.position + Vector2(prompt_rect.size.x * 0.5, 25), 15, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, prompt_rect.size.x - 16)
 
 	var visible_notification_count := mini(2, notifications.size()) if _is_touch_scheme() else notifications.size()
@@ -12652,6 +13104,7 @@ func _draw_hud() -> void:
 		var notice_height := 34.0
 		var notice_pitch := 42.0
 		var notice_font := 15
+		var notice_max_lines := 1
 		if _is_touch_scheme():
 			# Touch shows only the two newest messages between the two side rails.
 			# Combat telegraphs remain world-space cues and are never hidden here.
@@ -12660,23 +13113,28 @@ func _draw_hud() -> void:
 			var safe_right := screen_size.x - 230.0 - 10.0 * scale
 			notice_x = safe_left
 			notice_width = maxf(180.0 * scale, safe_right - safe_left)
-			notice_y = 68.0 * scale
-			notice_height = 30.0 * scale
-			notice_pitch = 34.0 * scale
-			notice_font = roundi(13.0 * scale)
+			# The middle of the top edge is intentionally free between the compact
+			# player HUD and minimap. Use it for toasts instead of covering combat.
+			notice_y = (62.0 if boss_hud_visible else 8.0) * scale
+			notice_height = 40.0 * scale
+			notice_pitch = 44.0 * scale
+			notice_font = roundi(12.0 * scale)
+			notice_max_lines = 2
 		var rect := Rect2(notice_x, notice_y + i * notice_pitch, notice_width, notice_height)
-		draw_rect(rect, Color(0.015, 0.03, 0.045, 0.76 * alpha))
-		_draw_text(str(notice["text"]), rect.position + Vector2(notice_width * 0.5, notice_height * 0.68), notice_font, Color(Color(notice["color"]), alpha), HORIZONTAL_ALIGNMENT_CENTER, notice_width - 20.0 * (touch_ui_coordinate_scale if _is_touch_scheme() else 1.0))
+		_draw_forged_inset(rect, Color(notice["color"]), "canvas", 0.78 * alpha, 1.0)
+		var text_width := notice_width - 20.0 * (touch_ui_coordinate_scale if _is_touch_scheme() else 1.0)
+		var notice_lines := _notification_display_lines(str(notice["text"]), text_width, notice_font, notice_max_lines)
+		for line_index in notice_lines.size():
+			var baseline_ratio := 0.66 if notice_lines.size() == 1 else 0.40 + float(line_index) * 0.36
+			_draw_text(str(notice_lines[line_index]), rect.position + Vector2(notice_width * 0.5, notice_height * baseline_ratio), notice_font, Color(Color(notice["color"]), alpha), HORIZONTAL_ALIGNMENT_CENTER, text_width)
 
 	if tutorial_visible and mode == GameMode.PLAYING and active_panel == "":
 		var tutorial := _tutorial_panel_rect()
-		draw_rect(tutorial, Color(0.03, 0.055, 0.07, 0.85))
-		draw_rect(tutorial, Color("668B9E"), false, 1.5)
+		_draw_forged_panel(tutorial, Color("668B9E"), 1.5, true, "canvas", 0.90)
 		if _is_touch_scheme():
 			_draw_text("新手指南（點 × 隱藏）", tutorial.position + Vector2(14, 25), 15, GOLD)
 			var close_rect := _tutorial_close_rect()
-			draw_rect(close_rect, Color(0.025, 0.045, 0.06, 0.86))
-			draw_rect(close_rect, PANEL_EDGE, false, 1.5)
+			_draw_forged_panel(close_rect, PANEL_EDGE, 1.5, false, "steel", 0.92)
 			_draw_text("×", close_rect.get_center() + Vector2(0.0, 7.0), 22, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, close_rect.size.x)
 			_draw_text("左搖桿移動　右搖桿瞄準並攻擊", tutorial.position + Vector2(14, 50), 13, Color("C8DBE5"))
 			_draw_text("技能鈕施放絕招；左右兩側按鈕開啟功能", tutorial.position + Vector2(14, 72), 13, Color("C8DBE5"))
@@ -12711,8 +13169,7 @@ func _draw_aionis_boss_hud() -> void:
 	var gold := Color(GameConfig.AIONIS_BOSS_CONFIG["vfx"]["gold"])
 	var time_color := Color(GameConfig.AIONIS_BOSS_CONFIG["vfx"]["time"])
 	var core := Color(GameConfig.AIONIS_BOSS_CONFIG["vfx"]["core"])
-	draw_rect(panel, Color("071020", 0.96))
-	draw_rect(panel, Color(gold, 0.94), false, 3.0)
+	_draw_forged_panel(panel, gold, 3.0, true, "bronze", 0.97)
 	_draw_text(str(state.get("name", "諸界終時者・艾歐尼斯")), panel.position + Vector2(panel.size.x * 0.5, 22.0), 19, Color("FFF5D9"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 34.0)
 	var hp_ratio := clampf(float(state.get("hp_ratio", 0.0)), 0.0, 1.0)
 	var bar_position := panel.position + Vector2(20.0, 34.0)
@@ -12764,8 +13221,7 @@ func _draw_chaos_boss_hud() -> void:
 	var core := Color(GameConfig.CHAOS_BOSS_CONFIG["vfx"]["core"])
 	var energy := Color(GameConfig.CHAOS_BOSS_CONFIG["vfx"]["energy"])
 	var rift := Color(GameConfig.CHAOS_BOSS_CONFIG["vfx"]["rift"])
-	draw_rect(panel, Color(0.020, 0.010, 0.035, 0.96))
-	draw_rect(panel, Color(rift, 0.94), false, 3.0)
+	_draw_forged_panel(panel, rift, 3.0, true, "canvas", 0.97)
 	_draw_text(str(state.get("name", "萬象崩滅者・卡厄隆")), panel.position + Vector2(panel.size.x * 0.5, 23.0), 19, Color("F8EFFF"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 32.0)
 	var hp_ratio := clampf(float(state.get("hp_ratio", 0.0)), 0.0, 1.0)
 	var bar_position := panel.position + Vector2(20.0, 36.0)
@@ -12815,8 +13271,7 @@ func _draw_python_boss_hud() -> void:
 	var width: float = minf(640.0, maxf(430.0, screen_size.x - 700.0))
 	var panel := Rect2(screen_size.x * 0.5 - width * 0.5, 14.0, width, 86.0)
 	var poison := Color(GameConfig.PYTHON_BOSS_CONFIG["vfx"]["poison_color"])
-	draw_rect(panel, Color(0.025, 0.018, 0.035, 0.94))
-	draw_rect(panel, Color(poison.lightened(0.25), 0.92), false, 2.5)
+	_draw_forged_panel(panel, poison.lightened(0.25), 2.5, true, "canvas", 0.96)
 	_draw_text(str(state.get("name", "腐沼蟒皇・薩迦")), panel.position + Vector2(panel.size.x * 0.5, 23), 18, Color("F4EFFF"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 30.0)
 	var hp_ratio: float = clampf(float(state.get("hp_ratio", 0.0)), 0.0, 1.0)
 	var bar_position := panel.position + Vector2(18, 34)
@@ -12846,36 +13301,31 @@ func _draw_python_boss_hud() -> void:
 	var poison_stacks := int(player_status.get("poison_stacks", 0))
 	if poison_stacks > 0:
 		var poison_badge := Rect2(badge_x, badge_y, 96, 25)
-		draw_rect(poison_badge, Color(0.20, 0.05, 0.26, 0.92))
-		draw_rect(poison_badge, poison, false, 1.5)
+		_draw_forged_inset(poison_badge, poison, "canvas", 0.94, 1.5)
 		_draw_text("毒素 ×%d" % poison_stacks, poison_badge.position + Vector2(48, 18), 12, Color("F0CFFF"), HORIZONTAL_ALIGNMENT_CENTER, 88)
 		badge_x += 103.0
 	if float(player_status.get("pool_slow_ttl", 0.0)) > 0.0:
 		var slow_badge := Rect2(badge_x, badge_y, 82, 25)
-		draw_rect(slow_badge, Color(0.12, 0.07, 0.16, 0.92))
-		draw_rect(slow_badge, Color("B985D6"), false, 1.5)
+		_draw_forged_inset(slow_badge, Color("B985D6"), "canvas", 0.94, 1.5)
 		_draw_text("毒潭減速", slow_badge.position + Vector2(41, 18), 12, Color("E8D1F4"), HORIZONTAL_ALIGNMENT_CENTER, 76)
 		badge_x += 89.0
 	if float(player_status.get("control_immunity", 0.0)) > 0.0:
 		var immune_badge := Rect2(badge_x, badge_y, 92, 25)
-		draw_rect(immune_badge, Color(0.15, 0.13, 0.04, 0.92))
-		draw_rect(immune_badge, GOLD, false, 1.5)
+		_draw_forged_inset(immune_badge, GOLD, "bronze", 0.94, 1.5)
 		_draw_text("纏繞免疫", immune_badge.position + Vector2(46, 18), 12, Color("FFF2B6"), HORIZONTAL_ALIGNMENT_CENTER, 86)
 
 	if float(player_status.get("constricted", 0.0)) > 0.0:
 		var break_max: float = float(GameConfig.PYTHON_BOSS_CONFIG["skills"]["constrict"]["break_gauge"])
 		var remaining: float = float(state.get("break_gauge", 0.0))
 		var break_panel := Rect2(screen_size.x * 0.5 - 210.0, screen_size.y - 164.0, 420.0, 58.0)
-		draw_rect(break_panel, Color(0.10, 0.02, 0.13, 0.94))
-		draw_rect(break_panel, Color("F06AD8"), false, 2.5)
+		_draw_forged_panel(break_panel, Color("F06AD8"), 2.5, true, "canvas", 0.96)
 		var escape_hint := "連點右側攻擊區掙脫" if _is_touch_scheme() else "連點左鍵掙脫"
 		_draw_text("遭到絞蟒纏縛！%s／友軍攻擊發光蛇身" % escape_hint, break_panel.position + Vector2(210, 23), 14, Color("FFE6FB"), HORIZONTAL_ALIGNMENT_CENTER, 400)
 		_draw_bar(break_panel.position + Vector2(18, 34), Vector2(384, 12), 1.0 - clampf(remaining / maxf(break_max, 1.0), 0.0, 1.0), Color("F06AD8"), Color("351035"))
 
 
 func _draw_skill_icon(rect: Rect2, key_name: String, label: String, cooldown: float, max_cooldown: float, color: Color, enabled: bool) -> void:
-	draw_rect(rect, Color(0.025, 0.045, 0.06, 0.94))
-	draw_rect(rect, color, false, 2.0)
+	_draw_forged_panel(rect, color, 2.0, false, "steel", 0.96)
 	_draw_text(key_name, rect.position + Vector2(rect.size.x * 0.5, 21), 13, color, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8)
 	_draw_text(label, rect.position + Vector2(rect.size.x * 0.5, 47), 12, Color("EAF6FF") if enabled else Color("7B878D"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 6)
 	if cooldown > 0.0:
@@ -12894,43 +13344,49 @@ func _draw_touch_round_button(rect: Rect2, label: String, color: Color, pressed:
 	var center := rect.get_center()
 	var radius := minf(rect.size.x, rect.size.y) * 0.5
 	var base_color := color if enabled else Color("596168")
-	_draw_forged_circle(center, radius, base_color, 0.88 if enabled else 0.62)
+	var material := "bronze" if enabled and base_color.r > 0.72 and base_color.g > 0.52 and base_color.b < 0.55 else "steel"
+	_draw_forged_circle(center, radius, base_color, 0.78 if enabled else 0.54, material)
 	if pressed:
-		draw_circle(center, radius - 7.0 * scale, Color(base_color, 0.30))
+		draw_circle(center, radius - 7.0 * scale, Color(base_color, 0.24))
 	draw_arc(center, radius - 3.0 * scale, -2.80, -0.34, 22, Color(base_color.lightened(0.32), 0.82), 1.3 * scale, true)
-	_draw_text(label, center + Vector2(0.0, 6.0 * scale), maxi(12, roundi(14.0 * scale)), Color("F5FAFF") if enabled else Color("A2ABB0"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0 * scale)
+	var available_width := rect.size.x - 4.0 * scale
+	var label_size := _fit_text_size(label, available_width, maxi(12, roundi(14.0 * scale)), maxi(10, roundi(10.0 * scale)))
+	_draw_text(label, center + Vector2(0.0, 6.0 * scale), label_size, Color("F5FAFF") if enabled else Color("A2ABB0"), HORIZONTAL_ALIGNMENT_CENTER, available_width)
 
 
-func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color: Color, active: bool) -> void:
+func _draw_touch_joystick(center: Vector2, vector: Vector2, _label: String, color: Color, active: bool) -> void:
+	if not active:
+		return
 	var scale := touch_ui_coordinate_scale
 	var radius := _touch_stick_radius()
-	var marker_distance := radius * 0.69
-	var marker_radius := maxf(8.0 * scale, radius * 0.155)
-	var knob_radius := maxf(19.0 * scale, radius * 0.33)
-	# Keep the generated steel readable even at rest; the compact corner size is
-	# what protects the battlefield, so the material no longer needs to disappear.
-	var alpha := 0.88 if active else 0.72
-	_draw_forged_circle(center, radius + 2.0 * scale, color, alpha)
-	draw_arc(center, radius - 4.0 * scale, 0.0, TAU, 42, Color(UI_FORGED_BRASS, 0.82), 1.4 * scale, true)
-	for direction_value in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
-		var direction := Vector2(direction_value)
-		var marker_center: Vector2 = center + direction * marker_distance
-		var perpendicular := Vector2(-direction.y, direction.x)
-		var selected := active and vector.length_squared() > 0.04 and vector.normalized().dot(direction) > 0.55
-		draw_circle(marker_center, marker_radius, Color(color.darkened(0.62), 0.84 if selected else 0.58))
-		draw_arc(marker_center, marker_radius, 0.0, TAU, 20, Color(color, 0.95 if selected else 0.62), 1.8 * scale, true)
-		var arrow := PackedVector2Array([
-			marker_center + direction * marker_radius * 0.68,
-			marker_center - direction * marker_radius * 0.42 + perpendicular * marker_radius * 0.50,
-			marker_center - direction * marker_radius * 0.42 - perpendicular * marker_radius * 0.50,
-		])
-		draw_colored_polygon(arrow, Color("F5FAFF") if selected else Color(color.lightened(0.30), 0.92))
+	var knob_radius := maxf(12.0 * scale, radius * 0.35)
+	# The thumb surface only appears while owned by a pointer. Its material cues
+	# remain legible without turning the lower half of a phone into two opaque
+	# plates; these alpha values are also published through the Web QA bridge.
+	draw_circle(center + Vector2(0.0, 2.0 * scale), radius + 1.0 * scale, Color(0.0, 0.0, 0.0, 0.13))
+	draw_circle(center, radius, Color(UI_FORGED_INK, TOUCH_STICK_BASE_ALPHA))
+	draw_circle(center, radius - 3.0 * scale, Color(color.darkened(0.45), 0.10))
+	_draw_textured_circle(center, radius - 3.5 * scale, UI_STEEL_TEXTURE, Color(0.78, 0.86, 0.92, 0.15), 40)
+	draw_arc(center, radius, 0.0, TAU, 40, Color(color, TOUCH_STICK_RING_ALPHA), 1.8 * scale, true)
+	draw_arc(center, radius - 3.0 * scale, -2.75, -0.45, 22, Color(UI_FORGED_BRASS_LIGHT, 0.32), 1.0 * scale, true)
+	# Four compact cardinal chevrons restore an explicit direction cue without
+	# increasing the control footprint or placing labels over the battlefield.
+	for direction_index in TOUCH_STICK_DIRECTION_CUE_COUNT:
+		var direction := Vector2.from_angle(-PI * 0.5 + TAU * float(direction_index) / float(TOUCH_STICK_DIRECTION_CUE_COUNT))
+		var side := Vector2(-direction.y, direction.x)
+		var tip := center + direction * radius * 0.76
+		var base := center + direction * radius * 0.60
+		draw_colored_polygon(PackedVector2Array([
+			tip,
+			base + side * 3.2 * scale,
+			base - side * 3.2 * scale,
+		]), Color(color.lightened(0.38), 0.34))
 	var knob_position := center + vector.limit_length(1.0) * (radius * 0.62)
-	draw_circle(knob_position + Vector2(0.0, 3.0 * scale), knob_radius + 2.0 * scale, Color(0.01, 0.02, 0.03, 0.62))
-	draw_circle(knob_position, knob_radius, Color(color.darkened(0.48), 0.98))
-	draw_arc(knob_position, knob_radius, 0.0, TAU, 28, Color(UI_FORGED_BRASS_LIGHT, 0.92), 2.0 * scale, true)
-	draw_arc(knob_position, knob_radius - 3.0 * scale, -2.7, -0.45, 18, Color(color.lightened(0.45), 0.72), 1.2 * scale, true)
-	_draw_text(label, center + Vector2(0.0, -radius - 9.0 * scale), maxi(10, roundi(11.0 * scale)), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, radius * 2.0)
+	draw_circle(knob_position + Vector2(0.0, 2.0 * scale), knob_radius + 1.0 * scale, Color(0.0, 0.0, 0.0, 0.20))
+	draw_circle(knob_position, knob_radius, Color(color.darkened(0.38), TOUCH_STICK_KNOB_ALPHA))
+	_draw_textured_circle(knob_position, knob_radius - 1.0 * scale, UI_BRONZE_TEXTURE, Color(0.94, 0.82, 0.60, 0.24), 28)
+	draw_arc(knob_position, knob_radius, 0.0, TAU, 28, Color(UI_FORGED_BRASS_LIGHT, TOUCH_STICK_RING_ALPHA), 1.5 * scale, true)
+	draw_circle(knob_position - Vector2(2.0, 3.0) * scale, maxf(1.5 * scale, knob_radius * 0.12), Color(1.0, 1.0, 1.0, 0.34))
 
 
 func _draw_touch_controls() -> void:
@@ -12940,14 +13396,13 @@ func _draw_touch_controls() -> void:
 		var close_rect := _touch_panel_close_rect()
 		if close_rect.size.x > 0.0:
 			var close_scale := touch_ui_coordinate_scale
-			draw_rect(close_rect, Color(0.025, 0.045, 0.06, 0.96))
-			draw_rect(close_rect, Color("E6B8F7") if _touch_feedback_active("close") else PANEL_EDGE, false, 2.0 * close_scale)
+			_draw_forged_panel(close_rect, Color("E6B8F7") if _touch_feedback_active("close") else PANEL_EDGE, 2.0 * close_scale, false, "steel", 0.96)
 			_draw_text("Close" if language == "en" else "關閉", close_rect.get_center() + Vector2(0.0, 6.0 * close_scale), maxi(12, roundi(14.0 * close_scale)), Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, close_rect.size.x - 8.0 * close_scale)
 		return
 
 	if not touch_utility_drawer_open:
-		_draw_touch_joystick(_touch_move_center(), touch_move_vector, "Move" if language == "en" else "移動", FRIEND_BLUE, touch_move_pointer >= 0)
-		_draw_touch_joystick(_touch_aim_center(), touch_aim_vector, "Aim & Attack" if language == "en" else "瞄準攻擊", FIRE_ORANGE, touch_aim_pointer >= 0)
+		_draw_touch_joystick(touch_move_origin, touch_move_vector, "Move" if language == "en" else "移動", FRIEND_BLUE, touch_move_pointer >= 0)
+		_draw_touch_joystick(touch_aim_origin, touch_aim_vector, "Aim & Attack" if language == "en" else "瞄準攻擊", FIRE_ORANGE, touch_aim_pointer >= 0)
 
 		var unlocked := int(player.get("level", 1)) >= 10
 		var special_rect := _touch_special_rect()
@@ -13100,8 +13555,7 @@ func _draw_aionis_map_label(rect: Rect2, center: Vector2, marker: Vector2, large
 		baseline.x = clampf(baseline.x, rect.position.x + label_width * 0.5 + 4.0, rect.end.x - label_width * 0.5 - 4.0)
 		baseline.y = clampf(baseline.y, rect.position.y + 17.0, rect.end.y - 6.0)
 		var badge := Rect2(baseline - Vector2(label_width * 0.5, 14.0), Vector2(label_width, 20.0))
-		draw_rect(badge, Color(0.025, 0.035, 0.06, 0.92))
-		draw_rect(badge, Color(color, 0.58), false, 1.0)
+		_draw_forged_inset(badge, Color(color, 0.58), "canvas", 0.92, 1.0)
 		_draw_text(label, baseline, 11, color, HORIZONTAL_ALIGNMENT_CENTER, label_width)
 		return
 	var inward := (center - marker).normalized()
@@ -13112,7 +13566,7 @@ func _draw_aionis_map_label(rect: Rect2, center: Vector2, marker: Vector2, large
 	small_baseline.x = clampf(small_baseline.x, rect.position.x + small_width * 0.5 + 3.0, rect.end.x - small_width * 0.5 - 3.0)
 	small_baseline.y = clampf(small_baseline.y, rect.position.y + 13.0, rect.end.y - 5.0)
 	var small_badge := Rect2(small_baseline - Vector2(small_width * 0.5, 12.0), Vector2(small_width, 17.0))
-	draw_rect(small_badge, Color(0.025, 0.035, 0.06, 0.90))
+	_draw_forged_inset(small_badge, Color(color, 0.48), "canvas", 0.90, 1.0)
 	_draw_text("無時之門" if locked else "艾歐尼斯", small_baseline, 9, color, HORIZONTAL_ALIGNMENT_CENTER, small_width)
 
 
@@ -13290,8 +13744,7 @@ func _draw_minimap(rect: Rect2, large: bool) -> void:
 
 func _draw_command_panel() -> void:
 	var panel := _command_panel_rect()
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0)
+	_draw_forged_panel(panel, PANEL_EDGE, 3.0, true, "steel")
 	_draw_text("軍令中心", panel.position + Vector2(panel.size.x * 0.5, 35.0), 25, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 40.0)
 	_draw_text("選擇命令；駐守與攻城會自動鎖定距離玩家最近的對應城堡", panel.position + Vector2(panel.size.x * 0.5, 61.0), 13, Color("AFC7D6"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 40.0)
 	var commands := ["跟隨", "防守", "攻擊", "撤退", "駐守", "攻城"]
@@ -13300,16 +13753,15 @@ func _draw_command_panel() -> void:
 	for index in commands.size():
 		var rect := _command_button_rect(index, panel)
 		var selected := soldier_command == str(commands[index])
-		draw_rect(rect, Color(colors[index]).darkened(0.62))
-		draw_rect(rect, GOLD if selected else Color(colors[index]), false, 3.0 if selected else 2.0)
+		_draw_forged_panel(rect, GOLD if selected else Color(colors[index]), 3.0 if selected else 2.0, false, "canvas")
+		draw_rect(rect.grow(-5.0), Color(Color(colors[index]).darkened(0.62), 0.25))
 		_draw_text("%d　%s" % [index + 1, commands[index]], rect.position + Vector2(rect.size.x * 0.5, 31.0), 18, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 14.0)
 		_draw_text(str(descriptions[index]), rect.position + Vector2(rect.size.x * 0.5, 57.0), 12, Color("C5D7E0"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 16.0)
 
 
 func _draw_skills_panel() -> void:
 	var panel := _skills_panel_rect()
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0)
+	_draw_forged_panel(panel, PANEL_EDGE, 3.0, true, "steel")
 	_draw_text("角色能力", panel.position + Vector2(26, 37), 25, Color("EAF6FF"))
 	_draw_text("剩餘技能點：%d" % int(player["skill_points"]), panel.position + Vector2(panel.size.x - 200, 36), 18, GOLD)
 	var stats := ["attack", "defense", "max_hp", "speed", "attack_speed"]
@@ -13317,7 +13769,7 @@ func _draw_skills_panel() -> void:
 	var details := ["每點 +5% 傷害", "每點 +2 防禦（最高減傷 70%）", "每點 +8% 最大生命", "每點 +2.5%（上限 +30%）", "每點 +6% 攻速（最低冷卻 0.16 秒）"]
 	for i in stats.size():
 		var y := panel.position.y + 102 + i * 53
-		draw_rect(Rect2(panel.position.x + 24, y - 24, panel.size.x - 48, 45), Color(0.07, 0.11, 0.14, 0.82))
+		_draw_forged_inset(Rect2(panel.position.x + 24, y - 24, panel.size.x - 48, 45), Color("41667A"), "canvas", 0.94)
 		_draw_text("%s　Lv.%d" % [labels[i], int(player["upgrades"][stats[i]])], Vector2(panel.position.x + 38, y + 3), 16, Color("EAF6FF"))
 		_draw_text(details[i], Vector2(panel.position.x + 190, y + 2), 13, Color("9BB4C3"))
 		_draw_button(Rect2(panel.end.x - 72, y - 24, 42, 36), "+", FRIEND_BLUE)
@@ -13330,8 +13782,7 @@ func _draw_skills_panel() -> void:
 func _draw_soldier_upgrade_panel() -> void:
 	var panel := _soldier_upgrade_panel_rect()
 	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, Color("62B7D6"), false, 2.0 * scale)
+	_draw_forged_panel(panel, Color("62B7D6"), 2.0 * scale, true, "steel")
 	var compact := _is_touch_scheme() or panel.size.y < 470.0
 	var selected_type := _selected_soldier_upgrade_type()
 	var soldier_cfg: Dictionary = GameConfig.SOLDIERS.get(selected_type, {})
@@ -13370,9 +13821,8 @@ func _draw_soldier_upgrade_panel() -> void:
 		var cost := SoldierUpgradeCatalog.next_rank_cost(selected_type, upgrade_id, soldier_research)
 		var preview := SoldierUpgradeCatalog.purchase_preview(selected_type, upgrade_id, soldier_research, int(player.get("money", 0)), unlocked)
 		var allowed := bool(preview.get("allowed", false))
-		var row_color := Color("173B4A") if allowed else (Color("3A3434") if cost >= 0 else Color("31434A"))
-		draw_rect(row, row_color)
-		draw_rect(row, Color("63BCD7") if allowed else Color("596A72"), false, 1.5 * scale)
+		var row_color := Color("63BCD7") if allowed else (Color("9A6E62") if cost >= 0 else Color("596A72"))
+		_draw_forged_inset(row, row_color, "canvas", 0.94, 1.5 * scale)
 		var cost_text := "MAX" if cost < 0 else "$%s" % _format_integer(cost)
 		var display_rank := rank if rank >= max_rank else rank + 1
 		var effect_text := SoldierUpgradeCatalog.localized_effect_text(upgrade_id, display_rank, language)
@@ -13388,7 +13838,7 @@ func _draw_soldier_upgrade_panel() -> void:
 	_draw_button(Rect2(controls["page_next"]), "Next ▶" if language == "en" else "下頁 ▶", Color("4A6673"), button_font, 2.0 * scale)
 	if _is_touch_scheme():
 		var touch_hint := "Specials trigger automatically · recruit this troop again after purchase" if language == "en" else "特殊能力會自動觸發；購買後請重新招募此兵種"
-		_draw_text(touch_hint, Vector2(panel.get_center().x, panel.end.y - 78.0 * scale), roundi(11.0 * scale), Color("A9D9E7"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 48.0 * scale)
+		_draw_text(touch_hint, Vector2(panel.get_center().x, panel.end.y - 60.0 * scale), roundi(11.0 * scale), Color("A9D9E7"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 48.0 * scale)
 	var page_text := "Page %d/%d · Gold $%s" % [soldier_upgrade_page + 1, page_count, _format_integer(int(player.get("money", 0)))] if language == "en" else "第 %d/%d 頁・金幣 $%s" % [soldier_upgrade_page + 1, page_count, _format_integer(int(player.get("money", 0)))]
 	_draw_text(page_text, Vector2(panel.get_center().x, panel.end.y - 17.0 * scale), roundi(12.0 * scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 240.0 * scale)
 
@@ -13396,8 +13846,7 @@ func _draw_soldier_upgrade_panel() -> void:
 func _draw_recruit_panel() -> void:
 	var panel := _recruit_panel_rect()
 	var ui_scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0 * ui_scale)
+	_draw_forged_panel(panel, PANEL_EDGE, 3.0 * ui_scale, true, "steel")
 	var touch_compact := _is_touch_scheme()
 	_draw_text("據點招募", panel.position + Vector2(26.0, 30.0 if touch_compact else 35.0) * ui_scale, roundi(float(22 if touch_compact else 24) * ui_scale), Color("EAF6FF"))
 	var buy_hint := "金幣 %d　軍隊 %d / %d" % [int(player["money"]), soldiers.size(), _army_limit()] if touch_compact else "金幣 %d　軍隊 %d / %d　Shift 點擊可購買 5 名" % [int(player["money"]), soldiers.size(), _army_limit()]
@@ -13412,8 +13861,7 @@ func _draw_recruit_panel() -> void:
 		var base_recruit_cost := int(cfg["recruit_cost"]["gold"])
 		var item := _recruit_item_rect(i, panel)
 		var compact_row := item.size.y / ui_scale < 48.0
-		draw_rect(item, Color(0.065, 0.10, 0.13, 0.90))
-		draw_rect(item, Color(cfg["color"]).lightened(0.08), false, 1.5 * ui_scale)
+		_draw_forged_inset(item, Color(cfg["color"]).lightened(0.08), "canvas", 0.94, 1.5 * ui_scale)
 		var icon_center := item.position + Vector2(22.0 * ui_scale, item.size.y * 0.5)
 		if touch_compact:
 			draw_set_transform(icon_center, 0.0, Vector2.ONE * ui_scale)
@@ -13499,8 +13947,7 @@ func _draw_recruit_icon(type_id: String, center: Vector2) -> void:
 
 func _draw_map_panel() -> void:
 	var panel := _map_panel_rect()
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0)
+	_draw_forged_panel(panel, PANEL_EDGE, 3.0, true, "steel")
 	_draw_text("遠征地圖（M 關閉）", panel.position + Vector2(26, 38), 23, Color("EAF6FF"))
 	_draw_minimap(Rect2(panel.position + Vector2(26, 58), panel.size - Vector2(52, 86)), true)
 
@@ -13510,8 +13957,7 @@ func _draw_pause_menu() -> void:
 	var center := screen_size * 0.5
 	var panel := _pause_panel_rect()
 	var ui_scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, PANEL_EDGE, false, 3.0 * ui_scale)
+	_draw_forged_panel(panel, PANEL_EDGE, 3.0 * ui_scale, true, "canvas")
 	if _is_touch_scheme():
 		_draw_text("遊戲暫停", Vector2(panel.get_center().x, panel.position.y + 31.0 * ui_scale), roundi(22.0 * ui_scale), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 24.0 * ui_scale)
 	else:
@@ -13527,19 +13973,20 @@ func _draw_pause_menu() -> void:
 		var color := Color("8B4B45") if action == "restart" else (Color("7B6224") if action == "summon_aionis" else (Color("6D3FA0") if action == "summon_chaos" else Color("466B76")))
 		_draw_button(_pause_button_rect(index), label, color, roundi(14.0 * ui_scale), 2.0 * ui_scale)
 	_draw_button(_pause_language_rect(), "English" if language != "en" else "中文", Color("5B6F8F"), roundi(14.0 * ui_scale), 2.0 * ui_scale)
-	var volume_label_position := Vector2(panel.get_center().x, panel.position.y + 270.0 * ui_scale) if _is_touch_scheme() else center + Vector2(0, 207)
+	var volume_label_position := Vector2(panel.get_center().x, _pause_volume_rect("mute").position.y - 7.0 * ui_scale) if _is_touch_scheme() else center + Vector2(0, 207)
 	_draw_text("音量 %d%%" % int(master_volume * 100.0), volume_label_position, roundi(15.0 * ui_scale), Color("C8DBE5"), HORIZONTAL_ALIGNMENT_CENTER, 150.0 * ui_scale)
 	_draw_button(_pause_volume_rect("down"), "−", Color("466B76"), roundi(16.0 * ui_scale), 2.0 * ui_scale)
 	_draw_button(_pause_volume_rect("up"), "+", Color("466B76"), roundi(16.0 * ui_scale), 2.0 * ui_scale)
 	_draw_button(_pause_volume_rect("mute"), "靜音" if not sound_muted else "取消靜音", Color("5A6870"), roundi(14.0 * ui_scale), 2.0 * ui_scale)
-	var footer := "點擊按鈕操作" if _is_touch_scheme() else "Esc 返回　F 全螢幕"
-	var footer_position := Vector2(panel.get_center().x, panel.end.y - 10.0 * ui_scale) if _is_touch_scheme() else center + Vector2(0, 255)
-	_draw_text(footer, footer_position, roundi(12.0 * ui_scale), Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, panel.size.x - 24.0 * ui_scale if _is_touch_scheme() else 260.0)
+	if not _is_touch_scheme():
+		_draw_text("Esc 返回　F 全螢幕", center + Vector2(0, 255), 12, Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, 260.0)
 
 
 func _draw_death_overlay() -> void:
 	draw_rect(Rect2(Vector2.ZERO, screen_size), Color(0.16, 0.01, 0.02, 0.55))
 	var center := screen_size * 0.5
+	var death_panel := Rect2(center - Vector2(330.0, 92.0), Vector2(660.0, 168.0))
+	_draw_forged_panel(death_panel, Color("A65A52"), 3.0, true, "canvas", 0.94)
 	_draw_text("遠征失敗", center + Vector2(0, -40), 40, Color("FFB0A9"), HORIZONTAL_ALIGNMENT_CENTER, 500)
 	_draw_text("將在 %.1f 秒後於最近的友方據點復活" % max(0.0, death_timer), center + Vector2(0, 8), 18, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 620)
 	_draw_text("已扣除目前金幣的 10%，等級與存檔進度不受影響", center + Vector2(0, 40), 14, Color("C8B8B5"), HORIZONTAL_ALIGNMENT_CENTER, 620)
@@ -13549,11 +13996,10 @@ func _draw_confirm_restart() -> void:
 	draw_rect(Rect2(Vector2.ZERO, screen_size), Color(0, 0, 0, 0.66))
 	var center := screen_size * 0.5
 	var panel := Rect2(center - Vector2(190, 100), Vector2(380, 200))
-	draw_rect(panel, PANEL_BG)
-	draw_rect(panel, Color("A65A52"), false, 3.0)
+	_draw_forged_panel(panel, Color("A65A52"), 3.0, true, "bronze")
 	_draw_text("確定重新開始？", center + Vector2(0, -47), 25, Color("FFCEC8"), HORIZONTAL_ALIGNMENT_CENTER, 320)
 	_draw_text("未儲存的進度將遺失。", center + Vector2(0, -12), 14, Color("C8B8B5"), HORIZONTAL_ALIGNMENT_CENTER, 320)
-	_draw_button(Rect2(center.x - 125, center.y + 42, 115, 44), "確定", Color("9A4D45"))
+	_draw_button(Rect2(center.x - 125, center.y + 42, 115, 44), "確定", Color("9A4D45"), 15, 2.0, "bronze")
 	_draw_button(Rect2(center.x + 10, center.y + 42, 115, 44), "取消", Color("466B76"))
 
 
@@ -13583,32 +14029,137 @@ func _draw_text(text: String, baseline: Vector2, size: int, color: Color, alignm
 	draw_string(ui_font, draw_position, _localized(text), alignment, width, size, color)
 
 
-func _draw_forged_panel(rect: Rect2, edge_color: Color = UI_FORGED_BRASS, border_width: float = 2.0, rivets: bool = true) -> void:
+func _raw_text_width(text: String, size: int) -> float:
+	if ui_font == null or text.is_empty():
+		return 0.0
+	return ui_font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size).x
+
+
+func _ellipsize_raw_text(text: String, max_width: float, size: int) -> String:
+	if _raw_text_width(text, size) <= max_width:
+		return text
+	var suffix := "…"
+	var result := text
+	while not result.is_empty() and _raw_text_width(result + suffix, size) > max_width:
+		result = result.left(result.length() - 1)
+	return result.strip_edges() + suffix
+
+
+func _notification_display_lines(text: String, max_width: float, size: int, max_lines: int = 2) -> Array[String]:
+	var lines: Array[String] = []
+	var remaining := _localized(text).strip_edges()
+	max_lines = maxi(1, max_lines)
+	max_width = maxf(1.0, max_width)
+	while not remaining.is_empty() and lines.size() < max_lines:
+		if _raw_text_width(remaining, size) <= max_width:
+			lines.append(remaining)
+			break
+		if lines.size() == max_lines - 1:
+			lines.append(_ellipsize_raw_text(remaining, max_width, size))
+			break
+		var fit_count := 1
+		for character_count in range(1, remaining.length() + 1):
+			if _raw_text_width(remaining.left(character_count), size) > max_width:
+				break
+			fit_count = character_count
+		var break_count := fit_count
+		# Prefer a nearby word/punctuation boundary for Latin text, but do not
+		# require spaces: Chinese notifications remain naturally breakable.
+		for cursor in range(fit_count - 1, maxi(-1, fit_count - 16), -1):
+			var character := remaining.substr(cursor, 1)
+			if character in [" ", "·", "，", "。", "；", "：", "/", "-"]:
+				break_count = cursor + 1
+				break
+		var line := remaining.left(break_count).strip_edges()
+		if line.is_empty():
+			line = remaining.left(fit_count)
+			break_count = fit_count
+		lines.append(line)
+		remaining = remaining.substr(break_count).strip_edges()
+	return lines
+
+
+func _fit_text_size(text: String, max_width: float, preferred_size: int, minimum_size: int) -> int:
+	var localized := _localized(text)
+	for candidate in range(preferred_size, minimum_size - 1, -1):
+		if _raw_text_width(localized, candidate) <= max_width:
+			return candidate
+	return minimum_size
+
+
+func _ui_material_texture(material: String) -> Texture2D:
+	match material:
+		"bronze": return UI_BRONZE_TEXTURE
+		"canvas": return UI_CANVAS_TEXTURE
+		_: return UI_STEEL_TEXTURE
+
+
+func _draw_ui_backdrop(base_color: Color, accent: Color = UI_FORGED_BRASS, material: String = "steel") -> void:
+	var rect := Rect2(Vector2.ZERO, screen_size)
+	draw_rect(rect, base_color)
+	draw_texture_rect(_ui_material_texture(material), rect, false, Color(0.72, 0.78, 0.84, 0.26))
+	draw_rect(rect, Color(base_color.darkened(0.42), 0.48))
+	for band in 8:
+		var y := screen_size.y * float(band + 1) / 9.0
+		draw_line(Vector2(0.0, y), Vector2(screen_size.x, y), Color(accent, 0.035), 1.0)
+	# Thin edge rails make the full-screen material read as an intentional
+	# command-board surface instead of a stretched background photograph.
+	draw_line(Vector2(8.0, 7.0), Vector2(screen_size.x - 8.0, 7.0), Color(accent, 0.34), 2.0)
+	draw_line(Vector2(8.0, screen_size.y - 7.0), Vector2(screen_size.x - 8.0, screen_size.y - 7.0), Color(0.0, 0.0, 0.0, 0.48), 2.0)
+
+
+func _draw_forged_inset(rect: Rect2, edge_color: Color, material: String = "canvas", opacity: float = 1.0, border_width: float = 1.5) -> void:
+	opacity = clampf(opacity, 0.0, 1.0)
+	draw_rect(rect, Color(UI_FORGED_INK, 0.90 * opacity))
+	draw_texture_rect(_ui_material_texture(material), rect.grow(-1.0), false, Color(0.78, 0.84, 0.90, 0.52 * opacity))
+	draw_rect(rect.grow(-2.0), Color(edge_color.darkened(0.58), 0.25 * opacity))
+	draw_rect(rect, Color(edge_color, 0.82 * opacity), false, border_width)
+	draw_line(rect.position + Vector2(5.0, 3.0), Vector2(rect.end.x - 5.0, rect.position.y + 3.0), Color(0.90, 0.94, 0.98, 0.12 * opacity), 1.0)
+
+
+func _draw_forged_panel(rect: Rect2, edge_color: Color = UI_FORGED_BRASS, border_width: float = 2.0, rivets: bool = true, material: String = "steel", opacity: float = 1.0) -> void:
 	# A quiet material layer gives panels physical depth without reducing text
-	# contrast. The generated steel asset is deliberately low-contrast.
-	draw_rect(Rect2(rect.position + Vector2(3.0, 5.0), rect.size), Color(0.0, 0.0, 0.0, 0.36))
-	draw_rect(rect, UI_FORGED_INK)
-	draw_texture_rect(UI_STEEL_TEXTURE, rect.grow(-3.0), false, Color(0.78, 0.84, 0.92, 0.70))
-	draw_rect(rect.grow(-3.0), Color(0.01, 0.02, 0.03, 0.38))
-	draw_rect(rect, Color(edge_color, 0.94), false, border_width)
-	draw_rect(rect.grow(-5.0), Color(UI_FORGED_BRASS_LIGHT, 0.26), false, maxf(1.0, border_width * 0.45))
-	draw_line(rect.position + Vector2(7.0, 4.0), Vector2(rect.end.x - 7.0, rect.position.y + 4.0), Color(0.86, 0.92, 0.96, 0.20), 1.0)
-	draw_line(Vector2(rect.position.x + 7.0, rect.end.y - 4.0), rect.end - Vector2(7.0, 4.0), Color(0.0, 0.0, 0.0, 0.45), 1.0)
+	# contrast. Steel is the shell, canvas is for dense content, and bronze is
+	# reserved for primary/VIP/confirmation surfaces.
+	opacity = clampf(opacity, 0.0, 1.0)
+	draw_rect(Rect2(rect.position + Vector2(3.0, 5.0), rect.size), Color(0.0, 0.0, 0.0, 0.36 * opacity))
+	draw_rect(rect, Color(UI_FORGED_INK, opacity))
+	draw_texture_rect(_ui_material_texture(material), rect.grow(-3.0), false, Color(0.78, 0.84, 0.92, 0.70 * opacity))
+	draw_rect(rect.grow(-3.0), Color(0.01, 0.02, 0.03, 0.38 * opacity))
+	draw_rect(rect, Color(edge_color, 0.94 * opacity), false, border_width)
+	draw_rect(rect.grow(-5.0), Color(UI_FORGED_BRASS_LIGHT, 0.26 * opacity), false, maxf(1.0, border_width * 0.45))
+	draw_line(rect.position + Vector2(7.0, 4.0), Vector2(rect.end.x - 7.0, rect.position.y + 4.0), Color(0.86, 0.92, 0.96, 0.20 * opacity), 1.0)
+	draw_line(Vector2(rect.position.x + 7.0, rect.end.y - 4.0), rect.end - Vector2(7.0, 4.0), Color(0.0, 0.0, 0.0, 0.45 * opacity), 1.0)
 	if not rivets or rect.size.x < 52.0 or rect.size.y < 28.0:
 		return
 	for rivet_center in [
 		rect.position + Vector2(8.0, 8.0), Vector2(rect.end.x - 8.0, rect.position.y + 8.0),
 		Vector2(rect.position.x + 8.0, rect.end.y - 8.0), rect.end - Vector2(8.0, 8.0),
 	]:
-		draw_circle(rivet_center + Vector2(0.8, 1.2), 3.3, Color(0.0, 0.0, 0.0, 0.62))
-		draw_circle(rivet_center, 3.1, Color("6E5732"))
-		draw_circle(rivet_center - Vector2(0.8, 0.8), 1.35, UI_FORGED_BRASS_LIGHT)
+		draw_circle(rivet_center + Vector2(0.8, 1.2), 3.3, Color(0.0, 0.0, 0.0, 0.62 * opacity))
+		draw_circle(rivet_center, 3.1, Color(Color("6E5732"), opacity))
+		draw_circle(rivet_center - Vector2(0.8, 0.8), 1.35, Color(UI_FORGED_BRASS_LIGHT, opacity))
 
 
-func _draw_forged_circle(center: Vector2, radius: float, accent: Color, alpha: float = 0.82) -> void:
+func _draw_textured_circle(center: Vector2, radius: float, texture: Texture2D, tint: Color, segment_count: int = 36) -> void:
+	if texture == null or radius <= 0.0:
+		return
+	segment_count = maxi(12, segment_count)
+	var points := PackedVector2Array()
+	var uvs := PackedVector2Array()
+	for segment_index in segment_count:
+		var angle := TAU * float(segment_index) / float(segment_count)
+		var radial := Vector2.from_angle(angle)
+		points.append(center + radial * radius)
+		uvs.append(Vector2(0.5, 0.5) + radial * 0.5)
+	draw_polygon(points, PackedColorArray([tint]), uvs, texture)
+
+
+func _draw_forged_circle(center: Vector2, radius: float, accent: Color, alpha: float = 0.82, material: String = "steel") -> void:
 	draw_circle(center + Vector2(0.0, 4.0), radius + 1.0, Color(0.0, 0.0, 0.0, 0.48))
 	draw_circle(center, radius, Color(UI_FORGED_INK, alpha))
 	draw_circle(center, radius - 3.0, Color("18222B", alpha))
+	_draw_textured_circle(center, radius - 3.0, _ui_material_texture(material), Color(0.82, 0.88, 0.92, alpha * 0.42), 40)
 	for grain_index in range(-4, 5):
 		var y := float(grain_index) * radius * 0.16
 		var half_width := sqrt(maxf(0.0, radius * radius - y * y)) * 0.82
@@ -13617,8 +14168,8 @@ func _draw_forged_circle(center: Vector2, radius: float, accent: Color, alpha: f
 	draw_arc(center, radius - 3.0, -2.82, -0.30, 24, Color(accent.lightened(0.30), 0.72), 1.4, true)
 
 
-func _draw_button(rect: Rect2, label: String, color: Color, text_size: int = 15, border_width: float = 2.0) -> void:
-	_draw_forged_panel(rect, color.lightened(0.18), border_width, false)
+func _draw_button(rect: Rect2, label: String, color: Color, text_size: int = 15, border_width: float = 2.0, material: String = "steel") -> void:
+	_draw_forged_panel(rect, color.lightened(0.18), border_width, false, material)
 	draw_rect(rect.grow(-5.0), Color(color.darkened(0.42), 0.22))
 	_draw_text(label, rect.position + Vector2(rect.size.x * 0.5, rect.size.y * 0.67), text_size, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x)
 
@@ -13679,6 +14230,16 @@ func _run_self_test() -> void:
 	var origin_b := wg.generate_chunk(Vector2i.ZERO)
 	_test_assert(str(origin_a) == str(origin_b), "deterministic_chunk")
 	_test_assert(origin_a["house"] != null and origin_a["enemy_spawns"].is_empty(), "origin_safe_zone")
+	var ui_material_contract := _ui_visual_contract()
+	var ui_material_textures: Dictionary = ui_material_contract.get("textures", {})
+	_test_assert(
+		bool(ui_material_contract.get("complete", false))
+		and int(ui_material_contract.get("textured_region_count", 0)) >= 29
+		and bool(Dictionary(ui_material_textures.get("steel", {})).get("loaded", false))
+		and bool(Dictionary(ui_material_textures.get("canvas", {})).get("loaded", false))
+		and bool(Dictionary(ui_material_textures.get("bronze", {})).get("loaded", false)),
+		"all_interactive_ui_regions_use_loaded_role_specific_material_textures"
+	)
 	var vip_access_test := VipAccessManagerScript.self_test()
 	_test_assert(int(vip_access_test.get("failed", 1)) == 0 and int(vip_access_test.get("passed", 0)) == 12, "vip_access_trial_paid_expiry_and_clock_rollback_contract")
 	var vip_catalog_test := VipTerrainCatalog.catalog_self_test()
@@ -13804,10 +14365,12 @@ func _run_self_test() -> void:
 	_test_assert(_web_test_showcase_active and not _can_persist_to_path(GameSaveManager.SAVE_PATH), "web_showcase_cannot_overwrite_default_save")
 	input_scheme = InputScheme.TOUCH
 	touch_move_pointer = 7
+	touch_move_origin = _clamp_touch_origin(_touch_move_center(), true)
+	touch_move_position = touch_move_origin
 	touch_move_vector = Vector2.RIGHT
 	attack_held = true
 	var touch_showcase_ok := _web_force_heavy_cannon_combat_showcase_for_test(["impact", true, "en"])
-	_test_assert(touch_showcase_ok and language == "en" and input_scheme == InputScheme.TOUCH and touch_move_pointer == -1 and touch_move_vector.is_zero_approx() and not attack_held and camera_shake_offset.is_zero_approx(), "heavy_cannon_touch_showcase_resets_transient_input")
+	_test_assert(touch_showcase_ok and language == "en" and input_scheme == InputScheme.TOUCH and touch_move_pointer == -1 and touch_move_origin.is_zero_approx() and touch_move_position.is_zero_approx() and touch_move_vector.is_zero_approx() and not attack_held and camera_shake_offset.is_zero_approx(), "heavy_cannon_touch_showcase_resets_transient_input")
 	var soldier_vfx_combat_ok := _web_force_soldier_vfx_showcase_for_test(["combat", true, "zh_TW", false])
 	var showcase_projectile_layers_ok := projectiles.size() == 4
 	for showcase_projectile in projectiles:
@@ -14965,6 +15528,44 @@ func _run_self_test() -> void:
 		arena_compatibility_mouse.position = arena_type_point
 		_input(arena_compatibility_mouse)
 		_test_assert(selected_after_touch and "ufo" in arena_view.controller.selected_types_for(arena_view.controller.active_team) and arena_view.touch_mode, "arena_touch_compatibility_mouse_cannot_double_toggle_or_hide_virtual_controls")
+		arena_view.size = Vector2(844.0, 390.0)
+		var arena_dynamic_ready := arena_view.force_test_scene("battle", "challenge", "en", true)
+		var arena_dynamic_layout := Dictionary(arena_view.render_state().get("layout", {}))
+		var arena_move_stick := Dictionary(arena_dynamic_layout.get("move_stick", {}))
+		var arena_move_zone := Dictionary(arena_move_stick.get("activation_zone", {}))
+		var arena_dynamic_press := InputEventScreenTouch.new()
+		arena_dynamic_press.index = 73
+		arena_dynamic_press.pressed = true
+		arena_dynamic_press.position = Vector2(float(arena_move_zone.get("x", 0.0)) + float(arena_move_zone.get("width", 0.0)) * 0.62, float(arena_move_zone.get("y", 0.0)) + float(arena_move_zone.get("height", 0.0)) * 0.58)
+		_input(arena_dynamic_press)
+		last_touch_event_msec = Time.get_ticks_msec() - 900
+		var arena_pointer_motion := InputEventMouseMotion.new()
+		arena_pointer_motion.position = arena_dynamic_press.position + Vector2(4.0, 0.0)
+		arena_pointer_motion.relative = Vector2(4.0, 0.0)
+		_input(arena_pointer_motion)
+		var arena_dynamic_pressed_state := Dictionary(Dictionary(arena_view.render_state().get("layout", {})).get("move_stick", {}))
+		var arena_dynamic_drag := InputEventScreenDrag.new()
+		arena_dynamic_drag.index = 73
+		arena_dynamic_drag.position = arena_dynamic_press.position + Vector2.RIGHT * float(arena_dynamic_pressed_state.get("radius", 0.0))
+		_input(arena_dynamic_drag)
+		var arena_dynamic_dragged_state := Dictionary(Dictionary(arena_view.render_state().get("layout", {})).get("move_stick", {}))
+		var arena_dynamic_vector := Dictionary(arena_dynamic_dragged_state.get("vector", {}))
+		var arena_dynamic_release := InputEventScreenTouch.new()
+		arena_dynamic_release.index = 73
+		arena_dynamic_release.pressed = false
+		arena_dynamic_release.position = arena_dynamic_drag.position
+		_input(arena_dynamic_release)
+		var arena_dynamic_released_state := Dictionary(Dictionary(arena_view.render_state().get("layout", {})).get("move_stick", {}))
+		_test_assert(
+			arena_dynamic_ready
+			and int(arena_dynamic_pressed_state.get("pointer", -1)) == 73
+			and float(arena_dynamic_pressed_state.get("radius", 0.0)) > 0.0
+			and bool(arena_dynamic_pressed_state.get("active", false))
+			and float(arena_dynamic_vector.get("x", 0.0)) > 0.75
+			and int(arena_dynamic_released_state.get("pointer", 0)) == -1
+			and not arena_view.has_active_touch_controls(),
+			"arena_dynamic_stick_schema_and_long_hold_pointermove_guard"
+		)
 		arena_view.configure_campaign_world(world_seed, HOUSE_POS)
 		var campaign_arena_ready := arena_view.force_test_scene("battle", "spectator", "zh_TW", false)
 		var campaign_visual_contract := arena_view.visual_contract()
@@ -15219,6 +15820,67 @@ func _run_self_test() -> void:
 	var collapsed_controls := Dictionary(Dictionary(Dictionary(collapsed_state_value).get("input", {})).get("virtual_controls", {})) if collapsed_state_value is Dictionary else {}
 	var collapsed_utilities := Dictionary(collapsed_controls.get("utility", {}))
 	var collapsed_handles := Dictionary(collapsed_controls.get("utility_handles", {}))
+	var collapsed_move_control := Dictionary(collapsed_controls.get("move", {}))
+	var collapsed_attack_control := Dictionary(collapsed_controls.get("attack", {}))
+	var dynamic_stick_contract_ok := (
+		int(collapsed_controls.get("layout_version", 0)) == 4
+		and str(collapsed_controls.get("joystick_mode", "")) == "dynamic_origin"
+		and Dictionary(collapsed_move_control.get("activation_zone", {})).size() == 4
+		and Dictionary(collapsed_attack_control.get("activation_zone", {})).size() == 4
+		and Dictionary(collapsed_move_control.get("origin_bounds", {})).size() == 4
+		and Dictionary(collapsed_attack_control.get("origin_bounds", {})).size() == 4
+		and not bool(collapsed_move_control.get("active", true))
+		and not bool(collapsed_attack_control.get("active", true))
+		and not bool(collapsed_move_control.get("visual_visible", true))
+		and not bool(collapsed_attack_control.get("visual_visible", true))
+		and float(collapsed_move_control.get("radius_css", 0.0)) >= TOUCH_STICK_MIN_RADIUS_CSS
+		and float(collapsed_move_control.get("radius_css", 99.0)) <= TOUCH_STICK_MAX_RADIUS_CSS
+		and float(collapsed_move_control.get("base_alpha", 1.0)) <= 0.24
+		and float(collapsed_move_control.get("ring_alpha", 1.0)) <= 0.48
+		and float(collapsed_move_control.get("knob_alpha", 1.0)) <= 0.58
+		and str(collapsed_move_control.get("base_material", "")) == "steel"
+		and str(collapsed_move_control.get("knob_material", "")) == "bronze"
+		and int(collapsed_move_control.get("direction_cue_count", 0)) == TOUCH_STICK_DIRECTION_CUE_COUNT
+		and str(collapsed_attack_control.get("direction_cues", "")) == "four_cardinal_chevrons"
+	)
+	_test_assert(dynamic_stick_contract_ok, "touch_dynamic_joystick_debug_contract_is_small_translucent_and_idle_hidden")
+	var touch_material_contract := _ui_visual_contract()
+	var cheat_normal_style := cheat_input.get_theme_stylebox("normal") if cheat_input != null else null
+	var cheat_focus_style := cheat_input.get_theme_stylebox("focus") if cheat_input != null else null
+	var cheat_normal_texture := cheat_normal_style as StyleBoxTexture
+	var cheat_focus_texture := cheat_focus_style as StyleBoxTexture
+	var material_surface_contract_ok := (
+		str(touch_material_contract.get("round_control_material_clip", "")) == "convex_uv_texture_polygon"
+		and str(touch_material_contract.get("mobile_notification_overflow", "")) == "two_line_wrap_then_ellipsis"
+		and cheat_normal_texture != null and cheat_normal_texture.texture == UI_CANVAS_TEXTURE
+		and cheat_focus_texture != null and cheat_focus_texture.texture == UI_BRONZE_TEXTURE
+	)
+	_test_assert(material_surface_contract_ok, "touch_round_controls_and_cheat_input_use_real_loaded_material_textures")
+	var narrow_notice_width := 236.0 * touch_scale
+	var narrow_notice_font := roundi(12.0 * touch_scale)
+	var narrow_notice_lines := _notification_display_lines("Enemy reinforcements are crossing the northern ridge; defend the allied castle before the outer wall falls.", narrow_notice_width, narrow_notice_font, 2)
+	var narrow_notice_fits := narrow_notice_lines.size() == 2 and str(narrow_notice_lines.back()).ends_with("…")
+	for narrow_notice_line in narrow_notice_lines:
+		narrow_notice_fits = narrow_notice_fits and _raw_text_width(str(narrow_notice_line), narrow_notice_font) <= narrow_notice_width + 0.1
+	var menu_available_width := 40.0 * touch_scale
+	var fitted_menu_size := _fit_text_size("Menu", menu_available_width, roundi(14.0 * touch_scale), roundi(10.0 * touch_scale))
+	var narrow_text_contract_ok := narrow_notice_fits and _raw_text_width("Menu", fitted_menu_size) <= menu_available_width + 0.1
+	_test_assert(narrow_text_contract_ok, "narrow_touch_notifications_wrap_then_ellipsis_and_english_menu_fits")
+	var vip_visual_contract := _vip_scene_visual_contract()
+	var vip_hash_a := _vip_visual_hash_unit(17, -23, 701)
+	var vip_hash_b := _vip_visual_hash_unit(17, -23, 701)
+	var vip_hash_neighbor := _vip_visual_hash_unit(18, -23, 701)
+	_test_assert(
+		str(vip_visual_contract.get("profile", "")) == "vip_organic_surface_v2"
+		and str(vip_visual_contract.get("transition_edges", "")) == "jittered_dual_color_feather"
+		and str(vip_visual_contract.get("reserved_clearings", "")) == "irregular_multi_ring_feather"
+		and str(vip_visual_contract.get("road", "")) == "meandering_layered_earth_v2"
+		and int(vip_visual_contract.get("details_per_cell", 0)) >= 3
+		and is_equal_approx(vip_hash_a, vip_hash_b)
+		and vip_hash_a >= 0.0 and vip_hash_a <= 1.0
+		and not is_equal_approx(vip_hash_a, vip_hash_neighbor),
+		"vip_scene_uses_deterministic_surface_texture_feathered_boundaries_and_layered_road"
+	)
 	var rails_collapsed := collapsed_utilities.size() == 10 and str(collapsed_controls.get("utility_layout", "")) == "collapsible_dual_side_rails" and not bool(collapsed_controls.get("utility_drawer_open", true))
 	for rail_state_value in collapsed_utilities.values():
 		if bool(Dictionary(rail_state_value).get("visible", true)):
@@ -15307,7 +15969,7 @@ func _run_self_test() -> void:
 			var compact_clear_touch := InputEventScreenTouch.new()
 			compact_clear_touch.index = 90
 			compact_clear_touch.pressed = true
-			compact_clear_touch.position = compact_clear.get_center()
+			compact_clear_touch.position = Vector2(compact_clear.get_center().x, screen_size.y * 0.25)
 			_handle_screen_touch(compact_clear_touch)
 			if touch_move_pointer >= 0 or touch_aim_pointer >= 0 or attack_held or touch_move_vector.length_squared() > 0.0:
 				compact_touch_layouts_ok = false
@@ -15696,25 +16358,81 @@ func _run_self_test() -> void:
 	_test_assert(selected_touch_classes == ["archer", "mage", "warrior"] and touch_move_pointer < 0 and touch_aim_pointer < 0 and not attack_held, "touch_can_select_each_class_without_residual_action")
 	_start_new_game("warrior")
 	_set_input_scheme(InputScheme.KEYBOARD_MOUSE)
+	var requested_move_origin := _touch_origin_bounds(true).get_center()
 	var touch_move_press := InputEventScreenTouch.new()
 	touch_move_press.index = 41
 	touch_move_press.pressed = true
-	touch_move_press.position = _touch_move_center() + Vector2.RIGHT * _touch_stick_radius()
+	touch_move_press.position = requested_move_origin
 	_input(touch_move_press)
-	_test_assert(_is_touch_scheme() and touch_move_pointer == 41 and touch_move_vector.x > 0.95, "touch_event_selects_virtual_joystick")
+	var touch_move_press_starts_neutral := _is_touch_scheme() and touch_move_pointer == 41 and touch_move_origin.is_equal_approx(requested_move_origin) and touch_move_vector.is_zero_approx()
+	var active_stick_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var active_stick_controls := Dictionary(Dictionary(Dictionary(active_stick_state_value).get("input", {})).get("virtual_controls", {})) if active_stick_state_value is Dictionary else {}
+	var active_move_stick := Dictionary(active_stick_controls.get("move", {}))
+	_test_assert(bool(active_move_stick.get("active", false)) and bool(active_move_stick.get("visual_visible", false)) and int(active_move_stick.get("direction_cue_count", 0)) == 4 and str(active_move_stick.get("direction_cues", "")) == "four_cardinal_chevrons", "active_dynamic_joystick_restores_four_direction_cues")
+	# Chromium can deliver a pointer-backed MouseMotion immediately before the
+	# matching ScreenDrag, even after a deliberate long hold. That compatibility
+	# stream must never revoke the finger which owns the dynamic stick.
+	last_touch_event_msec = Time.get_ticks_msec() - 900
+	var long_hold_pointer_motion := InputEventMouseMotion.new()
+	long_hold_pointer_motion.position = requested_move_origin + Vector2(4.0, 0.0)
+	long_hold_pointer_motion.relative = Vector2(4.0, 0.0)
+	_input(long_hold_pointer_motion)
+	var long_hold_pointer_motion_preserves_touch := _is_touch_scheme() and touch_move_pointer == 41 and touch_move_origin.is_equal_approx(requested_move_origin)
+	var touch_move_drag := InputEventScreenDrag.new()
+	touch_move_drag.index = 41
+	touch_move_drag.position = touch_move_origin + Vector2.RIGHT * _touch_stick_radius() * 1.2
+	_input(touch_move_drag)
+	var touch_move_cross_drag := InputEventScreenDrag.new()
+	touch_move_cross_drag.index = 41
+	touch_move_cross_drag.position = Vector2(screen_size.x * 0.72, touch_move_origin.y)
+	_input(touch_move_cross_drag)
+	var touch_move_keeps_owner_across_midline := touch_move_pointer == 41 and touch_aim_pointer < 0 and touch_move_vector.x > 0.95 and touch_move_origin.is_equal_approx(requested_move_origin)
+	var requested_dual_aim_origin := _touch_origin_bounds(false).get_center()
+	var touch_dual_aim_press := InputEventScreenTouch.new()
+	touch_dual_aim_press.index = 61
+	touch_dual_aim_press.pressed = true
+	touch_dual_aim_press.position = requested_dual_aim_origin
+	_input(touch_dual_aim_press)
+	var touch_dual_press_is_independent := touch_move_pointer == 41 and touch_aim_pointer == 61 and touch_aim_origin.is_equal_approx(requested_dual_aim_origin) and touch_aim_vector.is_zero_approx() and not attack_held
+	var touch_dual_aim_drag := InputEventScreenDrag.new()
+	touch_dual_aim_drag.index = 61
+	touch_dual_aim_drag.position = touch_aim_origin + Vector2.UP * _touch_stick_radius()
+	_input(touch_dual_aim_drag)
+	var touch_dual_drag_is_independent := touch_move_pointer == 41 and touch_aim_pointer == 61 and touch_move_vector.x > 0.95 and touch_aim_vector.is_equal_approx(Vector2.UP) and attack_held
+	var touch_dual_aim_release := InputEventScreenTouch.new()
+	touch_dual_aim_release.index = 61
+	touch_dual_aim_release.pressed = false
+	touch_dual_aim_release.position = touch_dual_aim_drag.position
+	_input(touch_dual_aim_release)
+	_test_assert(touch_move_press_starts_neutral and long_hold_pointer_motion_preserves_touch and touch_move_keeps_owner_across_midline and touch_dual_press_is_independent and touch_dual_drag_is_independent and touch_aim_origin.is_zero_approx(), "touch_dynamic_origins_survive_long_hold_pointermove_keep_owner_and_support_two_fingers")
 	var touch_move_start: Vector2 = player["pos"]
 	_update_player(0.20)
 	_test_assert(Vector2(player["pos"]).x > touch_move_start.x + 10.0, "virtual_joystick_moves_player")
 	var touch_move_release := InputEventScreenTouch.new()
 	touch_move_release.index = 41
 	touch_move_release.pressed = false
-	touch_move_release.position = touch_move_press.position
+	touch_move_release.position = touch_move_cross_drag.position
 	_input(touch_move_release)
+	var touch_move_release_clears_origin := touch_move_pointer < 0 and touch_move_origin.is_zero_approx() and touch_move_position.is_zero_approx() and touch_move_vector.is_zero_approx()
+	var edge_touch_origin_bounds := _touch_origin_bounds(true)
+	var touch_edge_press := InputEventScreenTouch.new()
+	touch_edge_press.index = 62
+	touch_edge_press.pressed = true
+	touch_edge_press.position = Vector2(1.0, screen_size.y - 1.0)
+	_input(touch_edge_press)
+	var edge_touch_expected := _clamp_touch_origin(touch_edge_press.position, true)
+	var touch_edge_clamped := touch_move_pointer == 62 and touch_move_origin.is_equal_approx(edge_touch_expected) and is_equal_approx(touch_move_origin.x, edge_touch_origin_bounds.position.x) and is_equal_approx(touch_move_origin.y, edge_touch_origin_bounds.end.y) and touch_move_vector.is_zero_approx()
+	var touch_edge_release := InputEventScreenTouch.new()
+	touch_edge_release.index = 62
+	touch_edge_release.pressed = false
+	touch_edge_release.position = touch_edge_press.position
+	_input(touch_edge_release)
+	_test_assert(touch_move_release_clears_origin and touch_edge_clamped and touch_move_origin.is_zero_approx(), "touch_dynamic_origin_release_and_edge_clamp_are_deterministic")
 	var keyboard_event := InputEventKey.new()
 	keyboard_event.keycode = KEY_W
 	keyboard_event.pressed = true
 	_input(keyboard_event)
-	_test_assert(input_scheme == InputScheme.KEYBOARD_MOUSE and touch_move_pointer < 0 and touch_move_vector == Vector2.ZERO, "keyboard_event_restores_desktop_controls")
+	_test_assert(input_scheme == InputScheme.KEYBOARD_MOUSE and touch_move_pointer < 0 and touch_move_vector == Vector2.ZERO and touch_move_origin.is_zero_approx() and touch_aim_origin.is_zero_approx(), "keyboard_event_restores_desktop_controls")
 	player["level"] = 10
 	player["special_cd"] = 0.0
 	_set_input_scheme(InputScheme.TOUCH)
@@ -15746,28 +16464,33 @@ func _run_self_test() -> void:
 	var touch_attack_press := InputEventScreenTouch.new()
 	touch_attack_press.index = 51
 	touch_attack_press.pressed = true
-	touch_attack_press.position = _touch_aim_center() + Vector2.UP * _touch_stick_radius()
+	touch_attack_press.position = _touch_origin_bounds(false).get_center()
 	_input(touch_attack_press)
+	var touch_attack_press_origin_ok := touch_aim_pointer == 51 and touch_aim_origin.is_equal_approx(touch_attack_press.position) and touch_aim_vector.is_zero_approx() and not attack_held
+	var touch_attack_drag := InputEventScreenDrag.new()
+	touch_attack_drag.index = 51
+	touch_attack_drag.position = touch_aim_origin + Vector2.UP * _touch_stick_radius() * 1.2
+	_input(touch_attack_drag)
 	var touch_attack_pressed_state_value: Variant = JSON.parse_string(render_game_to_text())
 	var touch_attack_pressed_input := Dictionary(Dictionary(touch_attack_pressed_state_value).get("input", {})) if touch_attack_pressed_state_value is Dictionary else {}
 	var touch_attack_pressed_controls := Dictionary(touch_attack_pressed_input.get("virtual_controls", {}))
 	var touch_attack_pressed_control := Dictionary(touch_attack_pressed_controls.get("attack", {}))
-	var touch_attack_render_pressed_ok := bool(touch_attack_pressed_input.get("attack_held", false)) and bool(touch_attack_pressed_control.get("held", false)) and int(touch_attack_pressed_control.get("pointer", -1)) == 51 and Dictionary(touch_attack_pressed_controls.get("utility", {})).size() == 10
+	var touch_attack_render_pressed_ok := bool(touch_attack_pressed_input.get("attack_held", false)) and bool(touch_attack_pressed_control.get("held", false)) and bool(touch_attack_pressed_control.get("active", false)) and bool(touch_attack_pressed_control.get("visual_visible", false)) and int(touch_attack_pressed_control.get("pointer", -1)) == 51 and float(Dictionary(touch_attack_pressed_control.get("origin", {})).get("x", 0.0)) > screen_size.x * 0.5 and Dictionary(touch_attack_pressed_controls.get("utility", {})).size() == 10
 	var touch_attack_aim_ok := attack_held and touch_aim_pointer == 51 and touch_aim_vector.is_equal_approx(Vector2.UP)
 	_update_player(0.02)
 	var touch_attack_executed := float(player["attack_cd"]) > 0.0 and Vector2(player["facing"]).dot(Vector2.UP) > 0.99
 	var touch_attack_release := InputEventScreenTouch.new()
 	touch_attack_release.index = 51
 	touch_attack_release.pressed = false
-	touch_attack_release.position = touch_attack_press.position
+	touch_attack_release.position = touch_attack_drag.position
 	_input(touch_attack_release)
 	var touch_attack_released_state_value: Variant = JSON.parse_string(render_game_to_text())
 	var touch_attack_released_input := Dictionary(Dictionary(touch_attack_released_state_value).get("input", {})) if touch_attack_released_state_value is Dictionary else {}
 	var touch_attack_released_control := Dictionary(Dictionary(touch_attack_released_input.get("virtual_controls", {})).get("attack", {}))
 	player["attack_cd"] = 0.0
 	_update_player(0.02)
-	var touch_attack_stopped := not attack_held and touch_aim_pointer < 0 and not bool(touch_attack_released_input.get("attack_held", true)) and not bool(touch_attack_released_control.get("held", true)) and is_zero_approx(float(player["attack_cd"]))
-	_test_assert(touch_attack_render_pressed_ok and touch_attack_aim_ok and touch_attack_executed and touch_attack_stopped, "touch_attack_stick_holds_aims_attacks_and_stops_on_release")
+	var touch_attack_stopped := not attack_held and touch_aim_pointer < 0 and touch_aim_origin.is_zero_approx() and touch_aim_vector.is_zero_approx() and not bool(touch_attack_released_input.get("attack_held", true)) and not bool(touch_attack_released_control.get("held", true)) and not bool(touch_attack_released_control.get("active", true)) and not bool(touch_attack_released_control.get("visual_visible", true)) and is_zero_approx(float(player["attack_cd"]))
+	_test_assert(touch_attack_press_origin_ok and touch_attack_render_pressed_ok and touch_attack_aim_ok and touch_attack_executed and touch_attack_stopped, "touch_attack_dynamic_stick_starts_neutral_then_aims_attacks_and_clears_on_release")
 
 	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["left"]).get_center())
 	var touch_command_entry := InputEventScreenTouch.new()
@@ -15887,7 +16610,16 @@ func _run_self_test() -> void:
 	_test_assert(_recruitable_soldier_order().size() == 16 and mobile_last_recruit.end.x <= unlocked_mobile_panel.end.x + 0.1 and mobile_last_recruit.end.y <= unlocked_mobile_panel.end.y + 0.1 and _recruit_buy_rect(15, unlocked_mobile_panel).size.y >= 36.0, "mobile_landscape_all_sixteen_unlocked_recruits_fit")
 	all_soldiers_unlocked = unlock_before_mobile_layout
 	screen_size = Vector2(720.0, 1280.0)
-	_test_assert(_needs_landscape_rotation(), "portrait_touch_requests_landscape_rotation")
+	touch_move_pointer = 701
+	touch_aim_pointer = 702
+	touch_move_vector = Vector2.RIGHT
+	touch_aim_vector = Vector2.UP
+	touch_move_origin = Vector2(120.0, 980.0)
+	touch_aim_origin = Vector2(600.0, 980.0)
+	attack_held = true
+	var portrait_rotation_requested := _needs_landscape_rotation()
+	var portrait_touch_reset := _enforce_touch_orientation_safety()
+	_test_assert(portrait_rotation_requested and portrait_touch_reset and touch_move_pointer < 0 and touch_aim_pointer < 0 and touch_move_vector.is_zero_approx() and touch_aim_vector.is_zero_approx() and touch_move_origin.is_zero_approx() and touch_aim_origin.is_zero_approx() and not attack_held, "portrait_touch_resize_clears_active_owners_vectors_and_attack")
 	screen_size = landscape_screen
 	tutorial_visible = false
 	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["right"]).get_center())
@@ -16655,8 +17387,13 @@ func _run_visual_smoke() -> void:
 	tutorial_visible = false
 	touch_move_pointer = 71
 	touch_aim_pointer = 72
+	touch_move_origin = _clamp_touch_origin(_touch_move_center(), true)
+	touch_aim_origin = _clamp_touch_origin(_touch_aim_center(), false)
 	touch_move_vector = Vector2(-0.72, -0.69)
 	touch_aim_vector = Vector2(0.78, -0.63)
+	touch_move_position = touch_move_origin + touch_move_vector.limit_length(1.0) * _touch_stick_radius()
+	touch_aim_position = touch_aim_origin + touch_aim_vector.limit_length(1.0) * _touch_stick_radius()
+	attack_held = true
 	queue_redraw()
 	var touch_controls_ok: bool = await _capture_visual_frame("/tmp/infinite-legion-touch-virtual-controls.png")
 	_reset_touch_inputs()
