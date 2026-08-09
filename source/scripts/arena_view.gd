@@ -1001,8 +1001,8 @@ func _draw_type_selection() -> void:
 		var chosen := type_id in selected
 		var unit_color := Color(GameConfig.SOLDIERS[type_id]["color"])
 		_draw_card(rect, Color(unit_color, 0.22 if chosen else 0.09), unit_color if chosen else Color(unit_color, 0.42))
-		_draw_unit_badge(type_id, rect.position + Vector2(24.0 * ui_scale, rect.size.y * 0.5), 13.0 * ui_scale, controller.active_team)
-		_draw_text(("✓ " if chosen else "") + _soldier_name(type_id), rect.get_center() + Vector2(12.0 * ui_scale, 5.0 * ui_scale), roundi(13.0 * ui_scale), TEXT if chosen else MUTED, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 54.0 * ui_scale)
+		_draw_unit_badge(type_id, rect.position + Vector2(28.0 * ui_scale, rect.size.y * 0.5), 20.0 * ui_scale, controller.active_team)
+		_draw_text(("✓ " if chosen else "") + _soldier_name(type_id), rect.get_center() + Vector2(17.0 * ui_scale, 5.0 * ui_scale), roundi(13.0 * ui_scale), TEXT if chosen else MUTED, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 62.0 * ui_scale)
 	if controller.mode == "challenge":
 		for class_id in ["archer", "mage", "warrior"]:
 			_draw_button(_hero_class_rect(class_id), ("✓ " if hero_class == class_id else "") + _hero_name(class_id), BLUE if hero_class == class_id else Color("405866"), 12)
@@ -1016,8 +1016,8 @@ func _draw_count_selection() -> void:
 		var data: Dictionary = _count_rects()[type_id]
 		var row := Rect2(data["row"])
 		_draw_card(row, Color("142833"), Color("456D7E"))
-		_draw_unit_badge(type_id, row.position + Vector2(28.0 * ui_scale, row.size.y * 0.5), 13.0 * ui_scale, controller.active_team)
-		_draw_text(_soldier_name(type_id), row.position + Vector2(52.0 * ui_scale, row.size.y * 0.5 + 5.0 * ui_scale), roundi(14.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_LEFT, row.size.x * 0.42)
+		_draw_unit_badge(type_id, row.position + Vector2(34.0 * ui_scale, row.size.y * 0.5), 20.0 * ui_scale, controller.active_team)
+		_draw_text(_soldier_name(type_id), row.position + Vector2(62.0 * ui_scale, row.size.y * 0.5 + 5.0 * ui_scale), roundi(14.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_LEFT, row.size.x * 0.42)
 		_draw_button(Rect2(data["minus"]), "−", Color("6D4650"), 22)
 		_draw_text("×%d" % controller.count_for(controller.active_team, type_id), Rect2(data["minus"]).position + Vector2(-78.0 * ui_scale, 29.0 * ui_scale), roundi(17.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, 70.0 * ui_scale)
 		_draw_button(Rect2(data["plus"]), "+", Color("3F8068"), 22)
@@ -1148,7 +1148,9 @@ func _draw_arena_unit(unit: Dictionary) -> void:
 	var team := str(unit["team"])
 	var team_color := BLUE if team == "blue" else RED
 	var visual_scale := _battle_visual_scale()
-	var sprite_scale := maxf(camera_zoom, 0.46 if controller.mode == "spectator" else camera_zoom)
+	var humanoid := type_id in CampaignVisualRenderer.HUMANOID_SOLDIER_TYPES
+	var minimum_sprite_scale := 0.64 if humanoid else (0.46 if controller.mode == "spectator" else camera_zoom)
+	var sprite_scale := maxf(camera_zoom, minimum_sprite_scale)
 	var body_position := position
 	if str(unit.get("domain", "ground")) == "air":
 		body_position -= Vector2(0.0, 14.0 + sin(game_time * 3.4 + int(unit.get("id", 0))) * 2.5) * sprite_scale
@@ -1162,10 +1164,13 @@ func _draw_arena_unit(unit: Dictionary) -> void:
 			rendered_types.append(type_id)
 		_last_draw_trace["rendered_unit_types"] = rendered_types
 	draw_arc(body_position, radius + 3.0 * sprite_scale, 0.0, TAU, 22, team_color, maxf(1.2, 1.8 * sprite_scale))
-	_draw_unit_upgrade_orbits(unit, body_position, radius)
-	_draw_unit_statuses(unit, body_position, radius)
+	var visual_extent := CampaignVisualRenderer.soldier_visual_extent(type_id, float(unit["radius"]), sprite_scale)
+	var overlay_radius := maxf(radius, visual_extent * 0.68) if humanoid else radius
+	_draw_unit_upgrade_orbits(unit, body_position, overlay_radius)
+	_draw_unit_statuses(unit, body_position, overlay_radius)
 	if float(unit["hp"]) < float(unit["max_hp"]):
-		_draw_bar(Rect2(body_position + Vector2(-radius - 2.0 * visual_scale, -radius - 5.0 * visual_scale), Vector2((radius + 2.0 * visual_scale) * 2.0, 2.4 * visual_scale)), float(unit["hp"]) / maxf(1.0, float(unit["max_hp"])), team_color)
+		var bar_half_width := maxf(radius + 2.0 * visual_scale, visual_extent * 0.54) if humanoid else radius + 2.0 * visual_scale
+		_draw_bar(Rect2(body_position + Vector2(-bar_half_width, -visual_extent - 5.0 * visual_scale), Vector2(bar_half_width * 2.0, 2.4 * visual_scale)), float(unit["hp"]) / maxf(1.0, float(unit["max_hp"])), team_color)
 
 
 func _draw_unit_upgrade_orbits(unit: Dictionary, position: Vector2, radius: float) -> void:
@@ -1540,7 +1545,9 @@ func _draw_arena_hero(hero: Dictionary) -> void:
 	draw_circle(position, radius + 3.5 * visual_scale, Color(BLUE, 0.22))
 	_last_draw_trace["hero_rendered"] = CampaignVisualRenderer.draw_hero(self, hero, position, game_time, "blue", sprite_scale, true)
 	draw_arc(position, radius + 3.5 * visual_scale, 0.0, TAU, 24, BLUE, 1.8 * visual_scale)
-	_draw_bar(Rect2(position + Vector2(-18.0 * visual_scale, -radius - 7.0 * visual_scale), Vector2(36.0 * visual_scale, 3.0 * visual_scale)), float(hero["hp"]) / maxf(1.0, float(hero["max_hp"])), BLUE)
+	var hero_extent := CampaignVisualRenderer.hero_visual_extent(sprite_scale)
+	var hero_bar_half_width := maxf(18.0 * visual_scale, hero_extent * 0.52)
+	_draw_bar(Rect2(position + Vector2(-hero_bar_half_width, -hero_extent - 6.0 * visual_scale), Vector2(hero_bar_half_width * 2.0, 3.0 * visual_scale)), float(hero["hp"]) / maxf(1.0, float(hero["max_hp"])), BLUE)
 
 
 func _draw_battle_hud() -> void:
@@ -1597,7 +1604,10 @@ func _draw_unit_badge(type_id: String, center: Vector2, radius: float, team: Str
 		"domain": str(combat.get("domain", "ground")), "aim_dir": Vector2.RIGHT if team == "blue" else Vector2.LEFT,
 		"flash": 0.0,
 	}
-	CampaignVisualRenderer.draw_soldier(self, badge_unit, center + Vector2(0.0, radius * 0.08), game_time, team, radius / 48.0, false)
+	var humanoid := type_id in CampaignVisualRenderer.HUMANOID_SOLDIER_TYPES
+	var badge_ground := center + Vector2(0.0, radius * (0.70 if humanoid else 0.08))
+	var badge_scale := radius / (24.0 if humanoid else 48.0)
+	CampaignVisualRenderer.draw_soldier(self, badge_unit, badge_ground, game_time, team, badge_scale, false)
 	draw_arc(center, radius, 0.0, TAU, 18, team_color, 2.0)
 
 

@@ -43,8 +43,8 @@ function assertCampaignArenaVisuals(state, { expectHero = false } = {}) {
   assert.ok(arena?.visuals, "arena must expose its actual visual draw contract");
   const visuals = arena.visuals;
   assert.equal(visuals.profile, "campaign");
-  assert.equal(visuals.soldier_renderer_id, "campaign_soldier_v1");
-  assert.equal(visuals.hero_renderer_id, "campaign_hero_v1");
+  assert.equal(visuals.soldier_renderer_id, "campaign_soldier_v2");
+  assert.equal(visuals.hero_renderer_id, "campaign_hero_v2");
   assert.equal(visuals.map_renderer_id, "campaign_wildland_v1");
   assert.equal(visuals.map_source, "WorldGenerator");
   assert.equal(visuals.map_style, "campaign_wildland");
@@ -261,7 +261,9 @@ await runCase(
     assert.equal(state.player.class, "warrior");
     assert.equal(state.vip.continuous_world, true);
     assert.equal(state.vip.visuals.renderer_id, "vip_continuous_terrain_v1");
-    assert.equal(state.vip.animation.profile_id, "procedural_stick_motion_v1");
+    assert.equal(state.vip.animation.profile_id, "procedural_upright_stick_motion_v2");
+    assert.equal(state.vip.animation.model_id, "readable_stick_army_v2");
+    assert.equal(state.vip.animation.upright, true);
   },
 );
 
@@ -314,10 +316,12 @@ await runCase(
     assert.ok(state.vip.visuals.mesh_draw_count > 0);
     assert.ok(state.vip.visuals.triangle_count >= state.vip.visuals.mesh_draw_count * 288);
     assert.ok(state.vip.visuals.rendered_terrain_ids.length > 0);
-    assert.equal(state.vip.animation.profile_id, "procedural_stick_motion_v1");
+    assert.equal(state.vip.animation.profile_id, "procedural_upright_stick_motion_v2");
+    assert.equal(state.vip.animation.model_id, "readable_stick_army_v2");
+    assert.equal(state.vip.animation.upright, true);
     assert.ok(state.vip.animation.soldiers.some((unit) => unit.action === "attack"));
     assert.ok(state.vip.animation.soldiers.some((unit) => unit.action === "support"));
-    assert.ok(state.vip.animation.soldiers.every((unit) => Object.keys(unit.joints).length === 7));
+    assert.ok(state.vip.animation.soldiers.every((unit) => unit.model_id === "readable_stick_army_v2" && unit.upright === true && Object.keys(unit.joints).length === 7));
     assert.deepEqual(Object.keys(state.vip.resource_wallet).sort(), ["crystal", "fish", "gold", "herbs", "iron", "salt", "stone", "wood"]);
 
     const controls = state.input.virtual_controls;
@@ -338,6 +342,13 @@ await runCase(
     assert.equal(state.input.attack_held, true, `attack stick must remain held during the action: ${JSON.stringify({ pointer: state.input.virtual_controls.attack.pointer, movePointer: state.input.virtual_controls.move.pointer, attackHeld: state.input.attack_held })}`);
     assert.equal(state.vip.animation.hero.action, "attack");
     assert.ok(state.player.attack_cooldown > 0 || state.projectiles.length > 0);
+
+    state = await withTouchDrag(page, state, state.input.virtual_controls.attack, { x: 0, y: -state.input.virtual_controls.attack.height * 0.34 }, async () => {
+      await page.evaluate(() => window.advanceTime(180));
+      return await readState(page);
+    });
+    const aimedUpJoints = state.vip.animation.hero.joints;
+    assert.ok(aimedUpJoints.head.y < Math.max(aimedUpJoints.left_foot.y, aimedUpJoints.right_foot.y) - 12, "aiming upward must move the weapon without overturning the character body");
   },
 );
 

@@ -1403,7 +1403,7 @@ func _vip_text_state() -> Dictionary:
 	} if _web_test_showcase_active and _is_vip_world() else _vip_snapshot()
 	var hero_animation := {}
 	if not str(player.get("class_id", "")).is_empty():
-		hero_animation = CampaignVisualRenderer.humanoid_animation_contract(player, game_time, true, 1.38)
+		hero_animation = CampaignVisualRenderer.humanoid_animation_contract(player, game_time, true, 1.52)
 	var soldier_animation_samples: Array[Dictionary] = []
 	for soldier in soldiers:
 		if str(soldier.get("type", "")) not in CampaignVisualRenderer.HUMANOID_SOLDIER_TYPES:
@@ -1430,6 +1430,8 @@ func _vip_text_state() -> Dictionary:
 		"visuals": vip_last_draw_trace.duplicate(true),
 		"animation": {
 			"profile_id": CampaignVisualRenderer.STICK_ANIMATION_PROFILE_ID,
+			"model_id": CampaignVisualRenderer.HUMANOID_MODEL_ID,
+			"upright": true,
 			"hero": hero_animation,
 			"soldiers": soldier_animation_samples,
 		},
@@ -4802,6 +4804,7 @@ func _spawn_enemy(type_id: String, position: Vector2, level: int, home: Vector2,
 		"enhancement": {"version": 1, "castle_level": 0, "seed": 0, "points": 0, "tracks": {}, "special_count": 0},
 		"enhancement_points": 0, "enhancement_cursor": 0, "enhancement_attack_sequence": 0,
 		"enhancement_stun": 0.0, "enhancement_reactive_timer": 0.0,
+		"animation_action": "", "animation_action_ttl": 0.0,
 	}
 	if not guard_castle.is_empty():
 		var source_castle_level := maxi(1, rank - 1)
@@ -4836,6 +4839,7 @@ func _update_enemies(delta: float) -> void:
 	for enemy in enemies:
 		enemy["cooldown"] = max(0.0, float(enemy["cooldown"]) - delta)
 		enemy["flash"] = max(0.0, float(enemy["flash"]) - delta)
+		enemy["animation_action_ttl"] = maxf(0.0, float(enemy.get("animation_action_ttl", 0.0)) - delta)
 		enemy["slow"] = max(0.0, float(enemy["slow"]) - delta)
 		if float(enemy["slow"]) <= 0.0:
 			enemy["slow_factor"] = 0.0
@@ -4946,6 +4950,8 @@ func _update_single_enemy(enemy: Dictionary, delta: float) -> void:
 		if buffed_count > 0:
 			_spawn_effect("heal", enemy["pos"], Color("94D46C"), 1.0)
 		if wounded != null or buffed_count > 0:
+			enemy["animation_action"] = "support"
+			enemy["animation_action_ttl"] = 0.62
 			enemy["cooldown"] = 4.8
 			return
 
@@ -5158,6 +5164,8 @@ func _execute_enemy_attack(enemy: Dictionary) -> void:
 	var direction := (target_pos - origin).normalized()
 	if direction == Vector2.ZERO: direction = Vector2.RIGHT
 	enemy["aim_dir"] = direction
+	enemy["animation_action"] = "attack"
+	enemy["animation_action_ttl"] = 0.38 if str(enemy.get("attack_style", "melee")) != "melee" else 0.46
 	enemy["enhancement_attack_sequence"] = int(enemy.get("enhancement_attack_sequence", 0)) + 1
 	var base_attack := float(enemy["attack"])
 	var crit_chance := float(enemy.get("enhancement_crit_chance", 0.0))
@@ -11227,13 +11235,20 @@ func _draw_soldier(soldier: Dictionary) -> void:
 	# branch below remains only as a defensive fallback for an unknown future
 	# troop id; every current campaign troop returns true here.
 	if CampaignVisualRenderer.draw_soldier(self, soldier, ground_p, game_time, "blue", 1.0, true):
-		_draw_soldier_upgrade_overlays(soldier, p, r)
+		var shared_humanoid := type_id in CampaignVisualRenderer.HUMANOID_SOLDIER_TYPES
+		var shared_visual_extent := CampaignVisualRenderer.soldier_visual_extent(type_id, r, 1.0)
+		var shared_overlay_radius := maxf(r, shared_visual_extent * 0.68) if shared_humanoid else r
+		var shared_bar_half_width := maxf(r + 4.0, shared_visual_extent * 0.54) if shared_humanoid else r + 4.0
+		_draw_soldier_upgrade_overlays(soldier, p, shared_overlay_radius)
 		var shared_charge_seconds := _soldier_charge_seconds(type_id)
 		if float(soldier["charge"]) > 0.0 and shared_charge_seconds > 0.0:
 			var shared_charge_ratio := 1.0 - float(soldier["charge"]) / shared_charge_seconds
-			_draw_bar(p + Vector2(-r - 5.0, -r - 20.0), Vector2((r + 5.0) * 2.0, 5.0), shared_charge_ratio, GOLD, Color("18242A"))
+			var charge_half_width := shared_bar_half_width if shared_humanoid else r + 5.0
+			var charge_bar_y := -shared_visual_extent - 14.0 if shared_humanoid else -r - 20.0
+			_draw_bar(p + Vector2(-charge_half_width, charge_bar_y), Vector2(charge_half_width * 2.0, 5.0), shared_charge_ratio, GOLD, Color("18242A"))
 		if float(soldier["hp"]) < float(soldier["max_hp"]):
-			_draw_bar(p + Vector2(-r - 4, -r - 11), Vector2((r + 4) * 2, 4), float(soldier["hp"]) / float(soldier["max_hp"]), HEAL_GREEN, Color("18242A"))
+			var hp_bar_y := -shared_visual_extent - 7.0 if shared_humanoid else -r - 11.0
+			_draw_bar(p + Vector2(-shared_bar_half_width, hp_bar_y), Vector2(shared_bar_half_width * 2.0, 4.0), float(soldier["hp"]) / float(soldier["max_hp"]), HEAL_GREEN, Color("18242A"))
 		if type_id in ["cannon", "musketeer", "rifleman", "tank", "rocket", "gatling", "helicopter", "bomber", "ufo"]:
 			_draw_text(str(GameConfig.SOLDIERS[type_id]["name"]), p + Vector2(0, r + 18.0), 10, Color("C9EDFF"), HORIZONTAL_ALIGNMENT_CENTER, 104.0)
 		return
@@ -11443,6 +11458,21 @@ func _draw_enemy(enemy: Dictionary) -> void:
 			var target_warning_radius := clampf(13.0 + float(enemy.get("aoe", 0.0)) * 0.12, 13.0, 42.0)
 			draw_circle(target_screen, target_warning_radius, Color(1.0, 0.24, 0.12, 0.12))
 			draw_arc(target_screen, target_warning_radius, 0, TAU, 32, Color("FF6B42"), 2.0)
+	if CampaignVisualRenderer.draw_enemy_humanoid(self, enemy, ground_p, game_time, 1.0, true):
+		var enemy_visual_extent := CampaignVisualRenderer.enemy_visual_extent(type_id, r, 1.0)
+		var enemy_overlay_radius := maxf(r, enemy_visual_extent * 0.68)
+		var enemy_bar_half_width := maxf(r + 5.0, enemy_visual_extent * 0.54)
+		_draw_enemy_soldier_status_vfx(enemy, ground_p, enemy_overlay_radius)
+		_draw_bar(
+			ground_p + Vector2(-enemy_bar_half_width, -enemy_visual_extent - 7.0),
+			Vector2(enemy_bar_half_width * 2.0, 5.0),
+			float(enemy["hp"]) / float(enemy["max_hp"]), ENEMY_RED, Color("231A1A")
+		)
+		_draw_enemy_enhancement_badge(ground_p, enemy_overlay_radius, enemy)
+		if type_id in ["musketeer", "rifleman"]:
+			var shared_tech_label := str(GameConfig.ENEMIES[type_id]["name"]).replace("敵軍", "")
+			_draw_text(shared_tech_label, ground_p + Vector2(0, r + 19.0), 10, Color("FFE9D3"), HORIZONTAL_ALIGNMENT_CENTER, 92.0)
+		return
 	var color := Color("FFF2E6") if float(enemy["flash"]) > 0.0 else Color(GameConfig.ENEMIES[type_id]["color"])
 	if airborne:
 		_draw_ellipse_shadow(ground_p + Vector2(18, 28), Vector2(r * 1.25, r * 0.52))
@@ -13479,7 +13509,29 @@ func _run_self_test() -> void:
 	var idle_animation := CampaignVisualRenderer.humanoid_animation_contract({"id": 7, "state": "idle", "vel": Vector2.ZERO, "facing": Vector2.RIGHT}, 1.0)
 	var walk_animation := CampaignVisualRenderer.humanoid_animation_contract({"id": 7, "state": "move", "vel": Vector2(120.0, 0.0), "facing": Vector2.RIGHT}, 1.0)
 	var attack_animation := CampaignVisualRenderer.humanoid_animation_contract({"id": 7, "state": "idle", "animation_action": "attack", "animation_action_ttl": 0.2, "facing": Vector2.RIGHT}, 1.0)
-	_test_assert(str(idle_animation.get("action", "")) == "idle" and str(walk_animation.get("action", "")) == "walk" and str(attack_animation.get("action", "")) == "attack" and Dictionary(walk_animation.get("joints", {})).size() == 7, "procedural_stick_rig_exposes_idle_walk_attack_and_seven_joints")
+	_test_assert(str(idle_animation.get("action", "")) == "idle" and str(walk_animation.get("action", "")) == "walk" and str(attack_animation.get("action", "")) == "attack" and Dictionary(walk_animation.get("joints", {})).size() == 7 and str(attack_animation.get("model_id", "")) == CampaignVisualRenderer.HUMANOID_MODEL_ID, "upright_stick_rig_exposes_idle_walk_attack_seven_joints_and_model_revision")
+	var upward_attack := CampaignVisualRenderer.humanoid_animation_contract({"id": 8, "state": "telegraph", "aim_dir": Vector2.UP}, 1.0)
+	var downward_attack := CampaignVisualRenderer.humanoid_animation_contract({"id": 9, "state": "telegraph", "aim_dir": Vector2.DOWN}, 1.0)
+	var upward_joints: Dictionary = Dictionary(upward_attack.get("joints", {}))
+	var downward_joints: Dictionary = Dictionary(downward_attack.get("joints", {}))
+	var upward_head_y := float(Dictionary(upward_joints.get("head", {})).get("y", 0.0))
+	var downward_head_y := float(Dictionary(downward_joints.get("head", {})).get("y", 0.0))
+	var upward_feet_y := maxf(float(Dictionary(upward_joints.get("left_foot", {})).get("y", 0.0)), float(Dictionary(upward_joints.get("right_foot", {})).get("y", 0.0)))
+	var downward_feet_y := maxf(float(Dictionary(downward_joints.get("left_foot", {})).get("y", 0.0)), float(Dictionary(downward_joints.get("right_foot", {})).get("y", 0.0)))
+	_test_assert(bool(upward_attack.get("upright", false)) and bool(downward_attack.get("upright", false)) and upward_head_y < upward_feet_y - 12.0 and downward_head_y < downward_feet_y - 12.0, "north_and_south_aim_keep_head_above_feet_without_model_rollover")
+	var readable_roles: Array[String] = []
+	readable_roles.append_array(CampaignVisualRenderer.HUMANOID_SOLDIER_TYPES)
+	for enemy_role in CampaignVisualRenderer.HUMANOID_ENEMY_TYPES:
+		readable_roles.append("enemy_%s" % enemy_role)
+	var equipment_ids: Dictionary = {}
+	var all_role_contracts_valid := true
+	for readable_role in readable_roles:
+		var role_team := "red" if readable_role.begins_with("enemy_") else "blue"
+		var role_contract := CampaignVisualRenderer.humanoid_role_contract(readable_role, role_team)
+		var equipment_id := str(role_contract.get("equipment_id", ""))
+		all_role_contracts_valid = all_role_contracts_valid and not equipment_id.is_empty() and equipment_id != "unarmed_stick_rig" and bool(role_contract.get("upright", false))
+		equipment_ids[equipment_id] = true
+	_test_assert(readable_roles.size() == 18 and equipment_ids.size() == readable_roles.size() and all_role_contracts_valid and str(CampaignVisualRenderer.humanoid_role_contract("enemy_grunt", "red").get("team_marker", "")) == "red_diamond", "all_friendly_and_enemy_people_have_unique_readable_equipment_silhouettes")
 	var edition_before_path_test := world_edition
 	world_edition = WORLD_EDITION_FREE
 	var free_path_test := _current_save_path()
