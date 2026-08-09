@@ -16,6 +16,9 @@ const WorldGenerator = preload("res://scripts/world_generator.gd")
 const CampaignVisualRenderer = preload("res://scripts/campaign_visual_renderer.gd")
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
 const SoldierUpgradeVfxCatalog = preload("res://scripts/soldier_upgrade_vfx_catalog.gd")
+const UI_STEEL_TEXTURE = preload("res://assets/ui/textures/dark_blued_steel.png")
+const UI_BRONZE_TEXTURE = preload("res://assets/ui/textures/aged_hammered_bronze.png")
+const UI_CANVAS_TEXTURE = preload("res://assets/ui/textures/tactical_waxed_canvas.png")
 const UI_FONT_PATH := "res://assets/fonts/NotoSansTC-Regular.otf"
 
 const BLUE := Color("3B82F6")
@@ -27,7 +30,21 @@ const INK := Color("111C24")
 const PANEL := Color(0.025, 0.045, 0.060, 0.97)
 const PANEL_EDGE := Color(0.30, 0.48, 0.62, 0.92)
 const TEXT := Color("EAF6FF")
-const MUTED := Color("9CB4C2")
+const MUTED := Color("B9CDD7")
+const FORGED_BRASS := Color("B9904F")
+const FORGED_BRASS_LIGHT := Color("E0C27A")
+const FORGED_INK := Color("091016")
+const TOUCH_STICK_RADIUS_CSS := 36.0
+const TOUCH_STICK_DEADZONE_CSS := 8.0
+const TOUCH_STICK_BASE_ALPHA := 0.22
+const TOUCH_STICK_RING_ALPHA := 0.46
+const TOUCH_STICK_KNOB_ALPHA := 0.56
+const TOUCH_STICK_CUE_ALPHA := 0.28
+const MIN_TOUCH_TARGET_CSS := 44.0
+const MIN_BODY_FONT_CSS := 13.0
+const MIN_SECONDARY_FONT_CSS := 12.0
+const COMPACT_TOUCH_MAX_WIDTH_CSS := 700.0
+const COMPACT_TOUCH_MAX_HEIGHT_CSS := 420.0
 const MIN_BATTLE_CAMERA_ZOOM := 0.20
 const CAMPAIGN_MAP_DRAW_MARGIN := 180.0
 const CAMPAIGN_COVERAGE_EPSILON := 0.5
@@ -37,6 +54,7 @@ var language := "zh_TW"
 var ui_scale := 1.0
 var touch_mode := false
 var hero_class := "archer"
+var type_pages := {"blue": 0, "red": 0}
 var count_pages := {"blue": 0, "red": 0}
 var game_time := 0.0
 var camera_position := Vector2.ZERO
@@ -51,7 +69,9 @@ var _last_draw_trace: Dictionary = {}
 var move_pointer := -1
 var aim_pointer := -1
 var move_vector := Vector2.ZERO
-var aim_vector := Vector2.RIGHT
+var aim_vector := Vector2.ZERO
+var move_origin := Vector2.ZERO
+var aim_origin := Vector2.ZERO
 var mouse_attack_held := false
 var touch_attack_held := false
 var _font: Font
@@ -86,6 +106,7 @@ func open(requested_language: String, requested_touch_mode: bool, requested_scal
 	touch_mode = requested_touch_mode
 	ui_scale = maxf(1.0, requested_scale)
 	hero_class = "archer"
+	type_pages = {"blue": 0, "red": 0}
 	count_pages = {"blue": 0, "red": 0}
 	game_time = 0.0
 	camera_position = Vector2.ZERO
@@ -110,6 +131,10 @@ func set_presentation(requested_language: String, requested_touch_mode: bool, re
 	touch_mode = requested_touch_mode
 	ui_scale = maxf(1.0, requested_scale)
 	queue_redraw()
+
+
+func has_active_touch_controls() -> bool:
+	return move_pointer >= 0 or aim_pointer >= 0
 
 
 func advance(delta: float) -> void:
@@ -156,6 +181,7 @@ func advance(delta: float) -> void:
 		if not controller.winner.is_empty() and controller.winner != _last_winner:
 			sound_requested.emit("level_up", 0.55, 0.92 if controller.winner == "red" else 1.08)
 			_last_winner = controller.winner
+			_reset_transient_input()
 		_update_battle_camera()
 	queue_redraw()
 
@@ -187,22 +213,18 @@ func handle_input(event: InputEvent) -> bool:
 		var touch := event as InputEventScreenTouch
 		if not touch.pressed:
 			if touch.index == move_pointer:
-				move_pointer = -1
-				move_vector = Vector2.ZERO
+				_end_touch_move()
 			if touch.index == aim_pointer:
-				aim_pointer = -1
-				touch_attack_held = false
+				_end_touch_aim()
 			return true
 		if _activate_at(touch.position):
 			sound_requested.emit("ui", 0.38, 1.0)
 			return true
 		if controller.phase == "battle" and controller.mode == "challenge":
-			if touch.position.x < size.x * 0.48 and touch.position.y > size.y * 0.42 and move_pointer < 0:
-				move_pointer = touch.index
-				_update_touch_move(touch.position)
-			else:
-				aim_pointer = touch.index
-				_update_touch_aim(touch.position)
+			if _move_activation_zone().has_point(touch.position) and move_pointer < 0:
+				_begin_touch_move(touch.index, touch.position)
+			elif _aim_activation_zone().has_point(touch.position) and aim_pointer < 0:
+				_begin_touch_aim(touch.index, touch.position)
 			return true
 		return true
 	if event is InputEventScreenDrag:
@@ -248,6 +270,8 @@ func render_state() -> Dictionary:
 	state["hero_class"] = hero_class
 	state["touch"] = touch_mode
 	state["ui_scale"] = snappedf(ui_scale, 0.001)
+	state["layout_version"] = 5
+	state["joystick_mode"] = "dynamic_origin"
 	state["camera"] = {"x": snappedf(camera_position.x, 0.1), "y": snappedf(camera_position.y, 0.1), "zoom": snappedf(camera_zoom, 0.001)}
 	state["selection_flow"] = ["types", "counts", "upgrades", "battle"]
 	state["layout"] = _layout_state()
@@ -263,6 +287,15 @@ func visual_contract() -> Dictionary:
 		"map_renderer_id": CampaignVisualRenderer.MAP_RENDERER_ID,
 		"map_source": "WorldGenerator",
 		"map_style": "campaign_wildland",
+		"ui_material_id": "forged_blued_steel_v1",
+		"ui_textures": ["dark_blued_steel.png", "aged_hammered_bronze.png", "tactical_waxed_canvas.png"],
+		"ui_texture_status": {
+			"steel": _texture_status(UI_STEEL_TEXTURE),
+			"bronze": _texture_status(UI_BRONZE_TEXTURE),
+			"canvas": _texture_status(UI_CANVAS_TEXTURE),
+		},
+		"ui_material_roles": {"shell": "steel", "cards": "canvas", "primary": "bronze"},
+		"textured_regions": ["setup_background", "header", "footer", "cards", "buttons", "battle_hud", "battle_dynamic_sticks", "result_panel"],
 		"world_seed": campaign_world_seed,
 		"map_anchor": {"x": snappedf(campaign_map_anchor.x, 0.1), "y": snappedf(campaign_map_anchor.y, 0.1)},
 		"chunk_keys": Array(campaign_map_summary.get("chunk_keys", [])).duplicate(),
@@ -280,6 +313,12 @@ func visual_contract() -> Dictionary:
 		"coverage": campaign_coverage_contract(),
 	}
 	return result
+
+
+func _texture_status(texture: Texture2D) -> Dictionary:
+	var width := texture.get_width() if texture != null else 0
+	var height := texture.get_height() if texture != null else 0
+	return {"loaded": texture != null and width > 0 and height > 0, "width": width, "height": height}
 
 
 func campaign_coverage_contract() -> Dictionary:
@@ -339,7 +378,9 @@ func _reset_transient_input() -> void:
 	move_pointer = -1
 	aim_pointer = -1
 	move_vector = Vector2.ZERO
-	aim_vector = Vector2.RIGHT
+	aim_vector = Vector2.ZERO
+	move_origin = Vector2.ZERO
+	aim_origin = Vector2.ZERO
 	mouse_attack_held = false
 	touch_attack_held = false
 
@@ -348,20 +389,89 @@ func _portrait_rotation_required() -> bool:
 	return touch_mode and size.y > size.x
 
 
+func _touch_stick_radius() -> float:
+	return TOUCH_STICK_RADIUS_CSS * ui_scale
+
+
+func _move_activation_zone() -> Rect2:
+	return Rect2(0.0, size.y * 0.5, size.x * 0.5, size.y * 0.5)
+
+
+func _aim_activation_zone() -> Rect2:
+	return Rect2(size.x * 0.5, size.y * 0.5, size.x * 0.5, size.y * 0.5)
+
+
+func _origin_bounds(activation_zone: Rect2) -> Rect2:
+	var radius := _touch_stick_radius()
+	var inset := Vector2.ONE * radius
+	return Rect2(activation_zone.position + inset, (activation_zone.size - inset * 2.0).max(Vector2.ZERO))
+
+
+func _clamp_touch_origin(position: Vector2, activation_zone: Rect2) -> Vector2:
+	var bounds := _origin_bounds(activation_zone)
+	return Vector2(
+		clampf(position.x, bounds.position.x, bounds.end.x),
+		clampf(position.y, bounds.position.y, bounds.end.y)
+	)
+
+
+func _begin_touch_move(pointer_index: int, position: Vector2) -> void:
+	move_pointer = pointer_index
+	move_origin = _clamp_touch_origin(position, _move_activation_zone())
+	# Dynamic sticks spawn under the finger. Do not create a movement impulse on
+	# the press frame; only a later drag supplies direction.
+	move_vector = Vector2.ZERO
+
+
+func _begin_touch_aim(pointer_index: int, position: Vector2) -> void:
+	aim_pointer = pointer_index
+	aim_origin = _clamp_touch_origin(position, _aim_activation_zone())
+	aim_vector = Vector2.ZERO
+	touch_attack_held = false
+
+
+func _end_touch_move() -> void:
+	move_pointer = -1
+	move_vector = Vector2.ZERO
+	move_origin = Vector2.ZERO
+
+
+func _end_touch_aim() -> void:
+	aim_pointer = -1
+	aim_vector = Vector2.ZERO
+	aim_origin = Vector2.ZERO
+	touch_attack_held = false
+
+
 func _update_touch_move(position: Vector2) -> void:
-	var center := _move_center()
-	var radius := 66.0 * ui_scale
-	var offset := (position - center).limit_length(radius)
-	move_vector = Vector2.ZERO if offset.length() < 10.0 * ui_scale else offset / radius
+	if move_pointer < 0:
+		return
+	var radius := _touch_stick_radius()
+	var offset := (position - move_origin).limit_length(radius)
+	move_vector = _remap_stick_offset(offset, radius)
+
+
+func _remap_stick_offset(offset: Vector2, radius: float) -> Vector2:
+	var deadzone := TOUCH_STICK_DEADZONE_CSS * ui_scale
+	var magnitude := offset.length()
+	if magnitude <= deadzone:
+		return Vector2.ZERO
+	# Start the useful range at zero immediately after the deadzone. Dividing
+	# the raw offset by the full radius caused a visible ~0.22 speed jump.
+	return offset.normalized() * clampf((magnitude - deadzone) / maxf(1.0, radius - deadzone), 0.0, 1.0)
 
 
 func _update_touch_aim(position: Vector2) -> void:
-	var center := _aim_center()
-	var radius := 66.0 * ui_scale
-	var offset := (position - center).limit_length(radius)
-	if offset.length() > 8.0 * ui_scale:
+	if aim_pointer < 0:
+		return
+	var radius := _touch_stick_radius()
+	var offset := (position - aim_origin).limit_length(radius)
+	if offset.length() > TOUCH_STICK_DEADZONE_CSS * ui_scale:
 		aim_vector = offset.normalized()
-	touch_attack_held = true
+		touch_attack_held = true
+	else:
+		aim_vector = Vector2.ZERO
+		touch_attack_held = false
 
 
 func _activate_at(position: Vector2) -> bool:
@@ -393,6 +503,13 @@ func _activate_at(position: Vector2) -> bool:
 		"types":
 			if _activate_team_tabs(position):
 				return true
+			if _compact_type_pagination_enabled():
+				if _page_rect("prev").has_point(position):
+					type_pages[controller.active_team] = maxi(0, int(type_pages.get(controller.active_team, 0)) - 1)
+					return true
+				if _page_rect("next").has_point(position):
+					type_pages[controller.active_team] = mini(_type_page_count() - 1, int(type_pages.get(controller.active_team, 0)) + 1)
+					return true
 			var type_rects := _type_rects()
 			for type_id_value in type_rects.keys():
 				var type_id := str(type_id_value)
@@ -474,6 +591,17 @@ func _activate_team_tabs(position: Vector2) -> bool:
 
 
 func _activate_battle_at(position: Vector2) -> bool:
+	if controller.phase == "result":
+		var result_actions := _result_action_rects()
+		if Rect2(result_actions["rematch"]).has_point(position):
+			if controller.restart_battle():
+				_prepare_campaign_battlefield()
+			_last_winner = ""
+			_reset_transient_input()
+			return true
+		if Rect2(result_actions["leave"]).has_point(position):
+			close_requested.emit()
+			return true
 	var controls := _battle_control_rects()
 	if Rect2(controls["exit"]).has_point(position):
 		close_requested.emit()
@@ -726,28 +854,107 @@ func _team_tab_rects() -> Dictionary:
 
 
 func _all_soldier_types() -> Array[String]:
-	return CampaignVisualRenderer.supported_soldier_types()
+	var types := CampaignVisualRenderer.supported_soldier_types()
+	if not _compact_type_pagination_enabled():
+		return types
+	# Keep familiar campaign roles on page one while retaining UFO in the first
+	# compact page for backwards-compatible arena QA and quick VFX comparisons.
+	var compact_priority: Array[String] = ["swordsman", "archer", "heavy", "healer", "mage", "cannon", "tank", "ufo"]
+	var ordered: Array[String] = []
+	for preferred in compact_priority:
+		if preferred in types:
+			ordered.append(preferred)
+	for type_id in types:
+		if type_id not in ordered:
+			ordered.append(type_id)
+	return ordered
+
+
+func _viewport_css_size() -> Vector2:
+	return size / maxf(1.0, ui_scale)
+
+
+func _compact_touch_landscape() -> bool:
+	var css_size := _viewport_css_size()
+	return touch_mode and css_size.x >= css_size.y and css_size.x <= COMPACT_TOUCH_MAX_WIDTH_CSS and css_size.y <= COMPACT_TOUCH_MAX_HEIGHT_CSS
+
+
+func _compact_type_pagination_enabled() -> bool:
+	return _compact_touch_landscape()
+
+
+func _type_columns() -> int:
+	return 2 if _compact_type_pagination_enabled() else 4
+
+
+func _type_rows() -> int:
+	if not _compact_type_pagination_enabled():
+		return 4
+	# Challenge mode reserves a full 44 CSS-pixel hero row below the soldier
+	# cards; spectator mode can use the fourth soldier row.
+	return 3 if controller != null and controller.mode == "challenge" else 4
+
+
+func _type_grid_rect() -> Rect2:
+	var content := _content_rect()
+	if _compact_type_pagination_enabled() and controller != null and controller.mode == "challenge":
+		content.size.y = maxf(MIN_TOUCH_TARGET_CSS * ui_scale, content.size.y - 50.0 * ui_scale)
+	return content
+
+
+func _type_page_size() -> int:
+	return _type_columns() * _type_rows()
+
+
+func _type_page_count() -> int:
+	return maxi(1, ceili(float(_all_soldier_types().size()) / float(maxi(1, _type_page_size()))))
+
+
+func _current_type_page() -> int:
+	if not _compact_type_pagination_enabled() or controller == null:
+		return 0
+	var page := clampi(int(type_pages.get(controller.active_team, 0)), 0, _type_page_count() - 1)
+	type_pages[controller.active_team] = page
+	return page
+
+
+func _visible_soldier_types() -> Array[String]:
+	var types := _all_soldier_types()
+	if not _compact_type_pagination_enabled():
+		return types
+	var first := _current_type_page() * _type_page_size()
+	var last := mini(types.size(), first + _type_page_size())
+	return types.slice(first, last)
 
 
 func _type_rects() -> Dictionary:
 	var result := {}
-	var content := _content_rect()
-	var gap := 6.0 * ui_scale
-	var columns := 4
-	var rows := 4
-	var cell_width := (content.size.x - gap * float(columns - 1)) / float(columns)
-	var cell_height := (content.size.y - gap * float(rows - 1)) / float(rows)
-	var types := _all_soldier_types()
+	var content := _type_grid_rect()
+	# A wider gutter helps two-column phone cards read as separate choices and
+	# keeps their centers stable when the host switches input presentation.
+	var horizontal_gap := (16.0 if _compact_type_pagination_enabled() else 6.0) * ui_scale
+	var vertical_gap := 6.0 * ui_scale
+	var columns := _type_columns()
+	var rows := _type_rows()
+	var cell_width := (content.size.x - horizontal_gap * float(columns - 1)) / float(columns)
+	var cell_height := (content.size.y - vertical_gap * float(rows - 1)) / float(rows)
+	var types := _visible_soldier_types()
 	for index in types.size():
 		var column := index % columns
 		var row := index / columns
-		result[types[index]] = Rect2(content.position + Vector2(float(column) * (cell_width + gap), float(row) * (cell_height + gap)), Vector2(cell_width, cell_height))
+		result[types[index]] = Rect2(content.position + Vector2(float(column) * (cell_width + horizontal_gap), float(row) * (cell_height + vertical_gap)), Vector2(cell_width, cell_height))
 	return result
 
 
 func _hero_class_rect(class_id: String) -> Rect2:
 	var index := ["archer", "mage", "warrior"].find(class_id)
 	var s := ui_scale
+	if _compact_type_pagination_enabled():
+		var content := _content_rect()
+		var gap := 5.0 * s
+		var height := MIN_TOUCH_TARGET_CSS * s
+		var width := (content.size.x - gap * 2.0) / 3.0
+		return Rect2(content.position + Vector2(float(index) * (width + gap), content.size.y - height), Vector2(width, height))
 	var footer_y := size.y - _footer_height() + 8.0 * s
 	var width := minf(110.0 * s, (size.x * 0.58 - 24.0 * s) / 3.0)
 	return Rect2(10.0 * s + float(index) * (width + 5.0 * s), footer_y, width, 44.0 * s)
@@ -838,7 +1045,7 @@ func _page_rect(direction: String) -> Rect2:
 
 func _battle_control_rects() -> Dictionary:
 	var s := ui_scale
-	var button_height := 44.0 * s
+	var button_height := MIN_TOUCH_TARGET_CSS * s
 	return {
 		"setup": Rect2(8.0 * s, 8.0 * s, 104.0 * s, button_height),
 		"restart": Rect2(118.0 * s, 8.0 * s, 104.0 * s, button_height),
@@ -846,15 +1053,46 @@ func _battle_control_rects() -> Dictionary:
 	}
 
 
+func _result_panel_rect() -> Rect2:
+	var s := ui_scale
+	var panel_size := Vector2(minf(440.0 * s, size.x - 24.0 * s), minf(180.0 * s, size.y - 76.0 * s))
+	return Rect2(size * 0.5 - panel_size * 0.5 + Vector2(0.0, 12.0 * s), panel_size)
+
+
+func _result_action_rects() -> Dictionary:
+	var s := ui_scale
+	var panel := _result_panel_rect()
+	var gap := 10.0 * s
+	var margin := 12.0 * s
+	var height := MIN_TOUCH_TARGET_CSS * s
+	var width := (panel.size.x - margin * 2.0 - gap) * 0.5
+	var y := panel.end.y - margin - height
+	return {
+		"rematch": Rect2(panel.position.x + margin, y, width, height),
+		"leave": Rect2(panel.position.x + margin + width + gap, y, width, height),
+	}
+
+
 func _layout_state() -> Dictionary:
 	var common := _common_rects()
+	var css_viewport := _viewport_css_size()
 	var result := {
+		"layout_version": 5,
+		"joystick_mode": "dynamic_origin",
 		"coordinate_space": "logical_viewport_pixels",
+		"viewport_css": {"width": snappedf(css_viewport.x, 0.1), "height": snappedf(css_viewport.y, 0.1)},
+		"compact_touch_landscape": _compact_touch_landscape(),
 		"exit": _rect_state(Rect2(common["exit"])),
 		"back": _rect_state(Rect2(common["back"])),
 		"language": _rect_state(Rect2(common["language"])),
 		"primary": _rect_state(_footer_primary_rect()),
-		"minimum_touch_css": 44.0,
+		"minimum_touch_css": MIN_TOUCH_TARGET_CSS,
+		"typography": {
+			"minimum_body_css": MIN_BODY_FONT_CSS,
+			"minimum_secondary_css": MIN_SECONDARY_FONT_CSS,
+			"text_color": TEXT.to_html(true),
+			"secondary_color": MUTED.to_html(true),
+		},
 		"rotation_required": _portrait_rotation_required(),
 		"controls_visible": not _portrait_rotation_required(),
 	}
@@ -872,11 +1110,24 @@ func _layout_state() -> Dictionary:
 				"spectator": _rect_state(Rect2(_mode_rects()["spectator"])),
 			}
 		"types":
+			var visible_type_ids := _visible_soldier_types()
+			result["type_layout"] = {
+				"columns": _type_columns(),
+				"rows": _type_rows(),
+				"page": _current_type_page(),
+				"page_count": _type_page_count(),
+				"page_size": _type_page_size(),
+				"visible_ids": visible_type_ids,
+				"catalog_size": _all_soldier_types().size(),
+			}
 			var type_states := {}
 			var type_rectangles := _type_rects()
 			for key in type_rectangles.keys():
 				type_states[str(key)] = _rect_state(Rect2(type_rectangles[key]))
 			result["type_buttons"] = type_states
+			if _compact_type_pagination_enabled():
+				result["page_prev"] = _rect_state(_page_rect("prev"))
+				result["page_next"] = _rect_state(_page_rect("next"))
 			if controller.mode == "challenge":
 				var hero_states := {}
 				for class_id in ["archer", "mage", "warrior"]:
@@ -917,15 +1168,159 @@ func _layout_state() -> Dictionary:
 			for control_key in _battle_control_rects().keys():
 				battle_states[str(control_key)] = _rect_state(Rect2(_battle_control_rects()[control_key]))
 			result["battle_controls"] = battle_states
+			if controller.phase == "result":
+				result["result_panel"] = _rect_state(_result_panel_rect())
+				var result_action_states := {}
+				for action_key in _result_action_rects().keys():
+					result_action_states[str(action_key)] = _rect_state(Rect2(_result_action_rects()[action_key]))
+				result["result_actions"] = result_action_states
 			if touch_mode and controller.mode == "challenge":
-				var radius := 66.0 * ui_scale
-				result["move_stick"] = _rect_state(Rect2(_move_center() - Vector2.ONE * radius, Vector2.ONE * radius * 2.0))
-				result["aim_stick"] = _rect_state(Rect2(_aim_center() - Vector2.ONE * radius, Vector2.ONE * radius * 2.0))
+				result["move_stick"] = _touch_stick_layout_state(true)
+				result["aim_stick"] = _touch_stick_layout_state(false)
+	result["self_test"] = layout_self_test()
+	return result
+
+
+func layout_self_test() -> Dictionary:
+	var failures: Array[String] = []
+	var targets := {}
+	var scale := maxf(1.0, ui_scale)
+	var material_textures_loaded := true
+	for texture in [UI_STEEL_TEXTURE, UI_BRONZE_TEXTURE, UI_CANVAS_TEXTURE]:
+		var texture_state := _texture_status(texture)
+		if not bool(texture_state["loaded"]) or int(texture_state["width"]) < 256 or int(texture_state["height"]) < 256:
+			material_textures_loaded = false
+	if not material_textures_loaded:
+		failures.append("ui_material_texture_missing_or_too_small")
+	var compact_columns_ok := not _compact_type_pagination_enabled() or _type_columns() <= 2
+	if not compact_columns_ok:
+		failures.append("compact_type_columns_exceed_two")
+
+	var result_geometry_ok := true
+	for action_key in _result_action_rects().keys():
+		var action_rect := Rect2(_result_action_rects()[action_key])
+		if action_rect.size.x / scale < MIN_TOUCH_TARGET_CSS or action_rect.size.y / scale < MIN_TOUCH_TARGET_CSS:
+			result_geometry_ok = false
+	if not result_geometry_ok:
+		failures.append("result_action_below_44_css")
+
+	var radius := _touch_stick_radius()
+	var deadzone := TOUCH_STICK_DEADZONE_CSS * scale
+	var deadzone_zero := _remap_stick_offset(Vector2(deadzone, 0.0), radius).is_zero_approx()
+	var just_after := _remap_stick_offset(Vector2(deadzone + 0.01 * scale, 0.0), radius).length()
+	var full_range := _remap_stick_offset(Vector2(radius, 0.0), radius).length()
+	var deadzone_continuous := deadzone_zero and just_after < 0.01 and is_equal_approx(full_range, 1.0)
+	if not deadzone_continuous:
+		failures.append("joystick_deadzone_not_zero_based")
+
+	if touch_mode and controller != null:
+		var common := _common_rects()
+		if controller.phase in ["battle", "result"]:
+			for control_key in _battle_control_rects().keys():
+				targets["battle_%s" % str(control_key)] = Rect2(_battle_control_rects()[control_key])
+			if controller.phase == "result":
+				for action_key in _result_action_rects().keys():
+					targets["result_%s" % str(action_key)] = Rect2(_result_action_rects()[action_key])
+		else:
+			targets["exit"] = Rect2(common["exit"])
+			targets["language"] = Rect2(common["language"])
+			if controller.phase != "mode":
+				targets["back"] = Rect2(common["back"])
+			if controller.mode == "spectator" and controller.phase != "mode":
+				for team in ["blue", "red"]:
+					targets["team_%s" % team] = Rect2(_team_tab_rects()[team])
+			match controller.phase:
+				"mode":
+					for mode_key in _mode_rects().keys():
+						targets["mode_%s" % str(mode_key)] = Rect2(_mode_rects()[mode_key])
+				"types":
+					for type_id in _type_rects().keys():
+						targets["type_%s" % str(type_id)] = Rect2(_type_rects()[type_id])
+					if controller.mode == "challenge":
+						for class_id in ["archer", "mage", "warrior"]:
+							targets["hero_%s" % class_id] = _hero_class_rect(class_id)
+					if _compact_type_pagination_enabled():
+						targets["type_page_prev"] = _page_rect("prev")
+						targets["type_page_next"] = _page_rect("next")
+					targets["types_confirm"] = _footer_primary_rect()
+				"counts":
+					for count_id in _count_rects().keys():
+						var count_data: Dictionary = _count_rects()[count_id]
+						targets["count_minus_%s" % str(count_id)] = Rect2(count_data["minus"])
+						targets["count_plus_%s" % str(count_id)] = Rect2(count_data["plus"])
+					targets["count_page_prev"] = _page_rect("prev")
+					targets["count_page_next"] = _page_rect("next")
+					targets["counts_confirm"] = _footer_primary_rect()
+				"upgrades":
+					var toolbar := _upgrade_toolbar_rects()
+					for toolbar_key in ["type_prev", "type_next", "base", "special"]:
+						targets["upgrade_%s" % toolbar_key] = Rect2(toolbar[toolbar_key])
+					for option in _upgrade_option_rects():
+						targets["upgrade_minus_%s" % str(option["id"])] = Rect2(option["minus"])
+						targets["upgrade_plus_%s" % str(option["id"])] = Rect2(option["plus"])
+					targets["upgrade_page_prev"] = _page_rect("prev")
+					targets["upgrade_page_next"] = _page_rect("next")
+					targets["upgrade_confirm"] = _footer_primary_rect()
+
+	var all_targets_ok := true
+	for target_name in targets.keys():
+		var rect := Rect2(targets[target_name])
+		if rect.size.x / scale + 0.01 < MIN_TOUCH_TARGET_CSS or rect.size.y / scale + 0.01 < MIN_TOUCH_TARGET_CSS:
+			all_targets_ok = false
+			failures.append("touch_target_%s_below_44_css" % str(target_name))
+
+	return {
+		"passed": failures.is_empty(),
+		"failures": failures,
+		"checks": {
+			"material_textures_loaded": material_textures_loaded,
+			"compact_type_columns_at_most_two": compact_columns_ok,
+			"visible_touch_targets_at_least_44_css": all_targets_ok,
+			"result_has_two_44_css_actions": result_geometry_ok,
+			"joystick_deadzone_zero_based": deadzone_continuous,
+			"four_way_direction_cues": true,
+			"minimum_body_font_css": MIN_BODY_FONT_CSS,
+			"minimum_secondary_font_css": MIN_SECONDARY_FONT_CSS,
+		},
+		"evaluated_touch_targets": targets.size(),
+	}
+
+
+func _touch_stick_layout_state(is_move_stick: bool) -> Dictionary:
+	var active := move_pointer >= 0 if is_move_stick else aim_pointer >= 0
+	var origin := move_origin if is_move_stick else aim_origin
+	var vector := move_vector if is_move_stick else aim_vector
+	var activation_zone := _move_activation_zone() if is_move_stick else _aim_activation_zone()
+	var radius := _touch_stick_radius()
+	var visual_rect := Rect2(origin - Vector2.ONE * radius, Vector2.ONE * radius * 2.0) if active else Rect2()
+	var result := _rect_state(visual_rect)
+	result.merge({
+		"activation_zone": _rect_state(activation_zone),
+		"origin_bounds": _rect_state(_origin_bounds(activation_zone)),
+		"origin": _point_state(origin),
+		"vector": _point_state(vector),
+		"pointer": move_pointer if is_move_stick else aim_pointer,
+		"active": active,
+		"visual_visible": active,
+		"radius": radius,
+		"radius_css": TOUCH_STICK_RADIUS_CSS,
+		"deadzone_css": TOUCH_STICK_DEADZONE_CSS,
+		"deadzone_mapping": "zero_based_linear",
+		"direction_cues": "four_way_translucent",
+		"base_alpha": TOUCH_STICK_BASE_ALPHA,
+		"ring_alpha": TOUCH_STICK_RING_ALPHA,
+		"knob_alpha": TOUCH_STICK_KNOB_ALPHA,
+		"direction_cue_alpha": TOUCH_STICK_CUE_ALPHA,
+	})
 	return result
 
 
 func _rect_state(rect: Rect2) -> Dictionary:
 	return {"x": snappedf(rect.position.x, 0.1), "y": snappedf(rect.position.y, 0.1), "width": snappedf(rect.size.x, 0.1), "height": snappedf(rect.size.y, 0.1)}
+
+
+func _point_state(point: Vector2) -> Dictionary:
+	return {"x": snappedf(point.x, 0.001), "y": snappedf(point.y, 0.001)}
 
 
 # -----------------------------------------------------------------------------
@@ -936,11 +1331,10 @@ func _draw() -> void:
 	if not visible or controller == null:
 		return
 	if _portrait_rotation_required():
-		draw_rect(Rect2(Vector2.ZERO, size), Color("09151C"))
+		_draw_forged_background(Rect2(Vector2.ZERO, size))
 		var center := size * 0.5
 		var phone := Rect2(center - Vector2(110.0, 62.0) * ui_scale, Vector2(220.0, 124.0) * ui_scale)
-		draw_rect(phone, Color("142B35"))
-		draw_rect(phone, Color("7FA7B8"), false, 4.0 * ui_scale)
+		_draw_forged_panel(phone, Color("7FA7B8"), 4.0 * ui_scale, true, Color("142B35"))
 		draw_arc(center, 145.0 * ui_scale, -2.7, -0.4, 36, GOLD, 5.0 * ui_scale)
 		_draw_text(_t("請旋轉裝置", "ROTATE DEVICE"), center + Vector2(0.0, 150.0 * ui_scale), roundi(28.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, minf(size.x - 20.0 * ui_scale, 360.0 * ui_scale))
 		return
@@ -951,10 +1345,9 @@ func _draw() -> void:
 
 
 func _draw_setup() -> void:
-	draw_rect(Rect2(Vector2.ZERO, size), Color("0B161D"))
-	for band in 9:
-		var y := size.y * float(band) / 8.0
-		draw_line(Vector2(0.0, y), Vector2(size.x, y), Color(0.10, 0.30, 0.32, 0.10), 2.0)
+	_draw_forged_background(Rect2(Vector2.ZERO, size))
+	_draw_forged_panel(Rect2(4.0 * ui_scale, 4.0 * ui_scale, size.x - 8.0 * ui_scale, _header_height()), FORGED_BRASS, 1.5 * ui_scale, false, Color("101B23"))
+	_draw_forged_panel(Rect2(4.0 * ui_scale, size.y - _footer_height(), size.x - 8.0 * ui_scale, _footer_height() - 4.0 * ui_scale), FORGED_BRASS, 1.5 * ui_scale, false, Color("101B23"))
 	_draw_setup_header()
 	match controller.phase:
 		"mode": _draw_mode_selection()
@@ -1002,10 +1395,17 @@ func _draw_type_selection() -> void:
 		var unit_color := Color(GameConfig.SOLDIERS[type_id]["color"])
 		_draw_card(rect, Color(unit_color, 0.22 if chosen else 0.09), unit_color if chosen else Color(unit_color, 0.42))
 		_draw_unit_badge(type_id, rect.position + Vector2(28.0 * ui_scale, rect.size.y * 0.5), 20.0 * ui_scale, controller.active_team)
-		_draw_text(("✓ " if chosen else "") + _soldier_name(type_id), rect.get_center() + Vector2(17.0 * ui_scale, 5.0 * ui_scale), roundi(13.0 * ui_scale), TEXT if chosen else MUTED, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 62.0 * ui_scale)
+		var label_css := 14.0 if _compact_type_pagination_enabled() else MIN_BODY_FONT_CSS
+		_draw_text(("✓ " if chosen else "") + _soldier_name(type_id), rect.get_center() + Vector2(17.0 * ui_scale, 5.0 * ui_scale), roundi(label_css * ui_scale), TEXT if chosen else MUTED, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 62.0 * ui_scale)
 	if controller.mode == "challenge":
 		for class_id in ["archer", "mage", "warrior"]:
-			_draw_button(_hero_class_rect(class_id), ("✓ " if hero_class == class_id else "") + _hero_name(class_id), BLUE if hero_class == class_id else Color("405866"), 12)
+			_draw_button(_hero_class_rect(class_id), ("✓ " if hero_class == class_id else "") + _hero_name(class_id), BLUE if hero_class == class_id else Color("405866"), 13)
+	if _compact_type_pagination_enabled():
+		_draw_button(_page_rect("prev"), "◀", Color("405866"), 18)
+		_draw_button(_page_rect("next"), "▶", Color("405866"), 18)
+		var footer_text_left := _page_rect("next").end.x + 4.0 * ui_scale
+		var footer_text_right := _footer_primary_rect().position.x - 4.0 * ui_scale
+		_draw_text("%d/%d" % [_current_type_page() + 1, _type_page_count()], Vector2((footer_text_left + footer_text_right) * 0.5, size.y - 24.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, maxf(10.0, footer_text_right - footer_text_left))
 	var types_ready := not controller.selected_types_for("red").is_empty() and (controller.mode == "challenge" or not controller.selected_types_for("blue").is_empty())
 	_draw_button(_footer_primary_rect(), _t("選好了 → 數量", "DONE → COUNTS"), GOLD if types_ready else Color("4B555A"), 14)
 
@@ -1026,7 +1426,7 @@ func _draw_count_selection() -> void:
 	var footer_text_left := _page_rect("next").end.x + 4.0 * ui_scale
 	var footer_text_right := _footer_primary_rect().position.x - 4.0 * ui_scale
 	var footer_text_width := maxf(10.0, footer_text_right - footer_text_left)
-	_draw_text(_t("共 %d 人", "TOTAL %d") % controller.team_total(controller.active_team), Vector2((footer_text_left + footer_text_right) * 0.5, size.y - 25.0 * ui_scale), roundi(12.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, footer_text_width)
+	_draw_text(_t("共 %d 人", "TOTAL %d") % controller.team_total(controller.active_team), Vector2((footer_text_left + footer_text_right) * 0.5, size.y - 25.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, footer_text_width)
 	_draw_button(_footer_primary_rect(), _t("選好了 → 強化", "DONE → UPGRADES"), GOLD, 14)
 
 
@@ -1048,15 +1448,15 @@ func _draw_upgrade_selection() -> void:
 		_draw_card(row, Color(color, 0.10), Color(color, 0.52))
 		if controller.upgrade_category == "special":
 			_draw_ability_glyph(upgrade_id, row.position + Vector2(23.0 * ui_scale, row.size.y * 0.5), 9.0 * ui_scale, 1.0)
-		_draw_text(SoldierUpgradeCatalog.localized_name(upgrade_id, language), row.position + Vector2(43.0 * ui_scale, 19.0 * ui_scale), roundi(13.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 250.0 * ui_scale)
-		_draw_text(SoldierUpgradeCatalog.localized_effect_text(upgrade_id, maxi(1, rank), language), row.position + Vector2(43.0 * ui_scale, row.size.y - 10.0 * ui_scale), roundi(10.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 250.0 * ui_scale)
+		_draw_text(SoldierUpgradeCatalog.localized_name(upgrade_id, language), row.position + Vector2(43.0 * ui_scale, 19.0 * ui_scale), roundi(14.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 250.0 * ui_scale)
+		_draw_text(SoldierUpgradeCatalog.localized_effect_text(upgrade_id, maxi(1, rank), language), row.position + Vector2(43.0 * ui_scale, row.size.y - 10.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 250.0 * ui_scale)
 		_draw_button(Rect2(option["minus"]), "−", Color("6D4650"), 20)
 		_draw_text("%d/%d" % [rank, int(definition.get("max_rank", 1))], Rect2(option["minus"]).position + Vector2(-67.0 * ui_scale, 28.0 * ui_scale), roundi(13.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, 60.0 * ui_scale)
 		_draw_button(Rect2(option["plus"]), "+", Color("3F8068"), 20)
 	_draw_button(_page_rect("prev"), "◀", Color("405866"), 18)
 	_draw_button(_page_rect("next"), "▶", Color("405866"), 18)
 	var page_count := controller.upgrade_page_count(_upgrade_page_size())
-	_draw_text("%d/%d" % [controller.upgrade_page + 1, page_count], Vector2(245.0 * ui_scale, size.y - 25.0 * ui_scale), roundi(12.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, 80.0 * ui_scale)
+	_draw_text("%d/%d" % [controller.upgrade_page + 1, page_count], Vector2(245.0 * ui_scale, size.y - 25.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, 80.0 * ui_scale)
 	_draw_button(_footer_primary_rect(), _t("開始戰鬥", "START BATTLE"), GOLD, 14)
 
 
@@ -1136,8 +1536,11 @@ func _draw_battle() -> void:
 		_draw_arena_hero(controller.hero)
 	_draw_battle_hud()
 	if touch_mode and controller.mode == "challenge" and controller.phase == "battle":
-		_draw_touch_joystick(_move_center(), move_vector, _t("移動", "MOVE"), BLUE)
-		_draw_touch_joystick(_aim_center(), aim_vector, _t("瞄準攻擊", "AIM + FIRE"), Color("FF8A42"))
+		# Dynamic controls stay completely out of the way until each thumb lands.
+		if move_pointer >= 0:
+			_draw_touch_joystick(move_origin, move_vector, _t("移動", "MOVE"), BLUE)
+		if aim_pointer >= 0:
+			_draw_touch_joystick(aim_origin, aim_vector, _t("瞄準攻擊", "AIM + FIRE"), Color("FF8A42"))
 
 
 func _draw_arena_unit(unit: Dictionary) -> void:
@@ -1552,6 +1955,7 @@ func _draw_arena_hero(hero: Dictionary) -> void:
 
 func _draw_battle_hud() -> void:
 	var controls := _battle_control_rects()
+	_draw_forged_panel(Rect2(4.0 * ui_scale, 4.0 * ui_scale, size.x - 8.0 * ui_scale, 54.0 * ui_scale), FORGED_BRASS, 1.5 * ui_scale, false, Color("101B23"))
 	_draw_button(Rect2(controls["setup"]), _t("重選", "SETUP"), Color("456D7E"), 12)
 	_draw_button(Rect2(controls["restart"]), _t("重開", "RESTART"), Color("6A557A"), 12)
 	_draw_button(Rect2(controls["exit"]), _t("離開", "EXIT"), Color("8B4751"), 12)
@@ -1567,32 +1971,52 @@ func _draw_battle_hud() -> void:
 	var hud_width := maxf(80.0 * ui_scale, hud_right - hud_left)
 	var hud_center_x := hud_left + hud_width * 0.5
 	_draw_text(title, Vector2(hud_center_x, 35.0 * ui_scale), roundi(17.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, hud_width)
-	_draw_text(_t("場地自動尺寸", "AUTO-SIZED") + " %d×%d" % [roundi(controller.arena_rect.size.x), roundi(controller.arena_rect.size.y)], Vector2(hud_center_x, 54.0 * ui_scale), roundi(10.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, hud_width)
+	_draw_text(_t("場地自動尺寸", "AUTO-SIZED") + " %d×%d" % [roundi(controller.arena_rect.size.x), roundi(controller.arena_rect.size.y)], Vector2(hud_center_x, 54.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, hud_width)
 	if controller.phase == "result":
-		var overlay := Rect2(size * 0.5 - Vector2(220.0, 74.0) * ui_scale, Vector2(440.0, 148.0) * ui_scale)
-		draw_rect(overlay, PANEL)
-		draw_rect(overlay, GOLD, false, 3.0 * ui_scale)
+		var overlay := _result_panel_rect()
+		_draw_forged_panel(overlay, GOLD, 3.0 * ui_scale, true, Color("171C22"), "bronze")
 		var winner_name := _t("藍隊", "BLUE") if controller.winner == "blue" else (_t("紅隊", "RED") if controller.winner == "red" else _t("平手", "DRAW"))
-		_draw_text(winner_name + " " + _t("獲勝", "WINS"), overlay.get_center() + Vector2(0.0, -10.0 * ui_scale), roundi(28.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 20.0 * ui_scale)
-		_draw_text(_t("按 R 或點「重開」再戰", "Press R or tap RESTART"), overlay.get_center() + Vector2(0.0, 30.0 * ui_scale), roundi(12.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 20.0 * ui_scale)
+		_draw_text(winner_name + " " + _t("獲勝", "WINS"), overlay.get_center() + Vector2(0.0, -38.0 * ui_scale), roundi(26.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
+		_draw_text(_t("選擇下一步", "CHOOSE NEXT ACTION"), overlay.get_center() + Vector2(0.0, -7.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
+		var actions := _result_action_rects()
+		_draw_button(Rect2(actions["rematch"]), _t("再戰", "REMATCH"), GOLD, 15)
+		_draw_button(Rect2(actions["leave"]), _t("離開競技場", "LEAVE"), Color("8B4751"), 15)
 
 
 func _move_center() -> Vector2:
-	return Vector2(82.0 * ui_scale, size.y - 82.0 * ui_scale)
+	return move_origin
 
 
 func _aim_center() -> Vector2:
-	return Vector2(size.x - 82.0 * ui_scale, size.y - 82.0 * ui_scale)
+	return aim_origin
 
 
 func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color: Color) -> void:
-	var radius := 66.0 * ui_scale
-	draw_circle(center, radius, Color(0.02, 0.04, 0.05, 0.64))
-	draw_arc(center, radius, 0.0, TAU, 32, Color(color, 0.75), 3.0 * ui_scale)
-	var knob := center + vector.limit_length(1.0) * radius * 0.60
-	draw_circle(knob, 24.0 * ui_scale, Color(color, 0.78))
-	draw_arc(knob, 24.0 * ui_scale, 0.0, TAU, 20, TEXT, 2.0 * ui_scale)
-	_draw_text(label, center + Vector2(0.0, -radius - 9.0 * ui_scale), roundi(11.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, radius * 2.0)
+	var radius := _touch_stick_radius()
+	var knob_radius := 14.0 * ui_scale
+	# Every layer is deliberately translucent: the player can still read combat
+	# silhouettes beneath the active thumb, and idle controls are not rendered.
+	draw_circle(center, radius, Color(FORGED_INK, TOUCH_STICK_BASE_ALPHA))
+	_draw_textured_circle(center, radius - 2.5 * ui_scale, UI_STEEL_TEXTURE, Color(0.78, 0.86, 0.92, 0.16), 40)
+	for grain_index in range(-2, 3):
+		var y := float(grain_index) * radius * 0.24
+		var half_width := sqrt(maxf(0.0, radius * radius - y * y)) * 0.76
+		draw_line(center + Vector2(-half_width, y), center + Vector2(half_width, y), Color(0.72, 0.80, 0.86, 0.09), 1.0 * ui_scale)
+	draw_arc(center, radius, 0.0, TAU, 32, Color(color, TOUCH_STICK_RING_ALPHA), 2.0 * ui_scale, true)
+	draw_arc(center, radius - 3.0 * ui_scale, -2.75, -0.38, 22, Color(FORGED_BRASS_LIGHT, 0.34), 1.0 * ui_scale, true)
+	# Four quiet arrowheads retain directional affordance without restoring the
+	# old opaque D-pad. They remain below the thumb and under 30% opacity.
+	for direction_value in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
+		var direction: Vector2 = direction_value
+		var tip: Vector2 = center + direction * radius * 0.78
+		var base: Vector2 = center + direction * radius * 0.56
+		var side := Vector2(-direction.y, direction.x) * 3.2 * ui_scale
+		draw_colored_polygon(PackedVector2Array([tip, base + side, base - side]), Color(TEXT, TOUCH_STICK_CUE_ALPHA))
+	var knob := center + vector.limit_length(1.0) * radius * 0.68
+	draw_circle(knob, knob_radius, Color(color, TOUCH_STICK_KNOB_ALPHA))
+	_draw_textured_circle(knob, knob_radius - 1.0 * ui_scale, UI_BRONZE_TEXTURE, Color(0.94, 0.82, 0.60, 0.24), 28)
+	draw_arc(knob, knob_radius, 0.0, TAU, 20, Color(FORGED_BRASS_LIGHT, TOUCH_STICK_RING_ALPHA), 1.5 * ui_scale, true)
+	_draw_text(label, center + Vector2(0.0, -radius - 7.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), Color(TEXT, 0.78), HORIZONTAL_ALIGNMENT_CENTER, radius * 2.6)
 
 
 func _draw_unit_badge(type_id: String, center: Vector2, radius: float, team: String) -> void:
@@ -1646,15 +2070,81 @@ func _draw_ability_glyph(ability_id: String, center: Vector2, glyph_size: float,
 	draw_line(center + signature_direction * glyph_size * 0.28, center + signature_direction * glyph_size * 0.88, color, maxf(0.75, glyph_size * 0.11), true)
 
 
+func _draw_forged_background(rect: Rect2) -> void:
+	draw_rect(rect, FORGED_INK)
+	draw_texture_rect(UI_STEEL_TEXTURE, rect, false, Color(0.56, 0.64, 0.70, 0.48))
+	draw_rect(rect, Color(0.015, 0.028, 0.038, 0.68))
+	# Wide, quiet plate seams keep the full-screen material from looking like a
+	# repeated wallpaper while remaining subordinate to selection cards.
+	for band in 9:
+		var y := rect.position.y + rect.size.y * float(band) / 8.0
+		draw_line(Vector2(rect.position.x, y), Vector2(rect.end.x, y), Color(0.50, 0.64, 0.69, 0.055), maxf(1.0, ui_scale))
+
+
+func _draw_textured_circle(center: Vector2, radius: float, texture: Texture2D, tint: Color, segment_count: int = 36) -> void:
+	if texture == null or radius <= 0.0:
+		return
+	segment_count = maxi(12, segment_count)
+	var points := PackedVector2Array()
+	var uvs := PackedVector2Array()
+	for segment_index in segment_count:
+		var angle := TAU * float(segment_index) / float(segment_count)
+		var radial := Vector2.from_angle(angle)
+		points.append(center + radial * radius)
+		uvs.append(Vector2(0.5, 0.5) + radial * 0.5)
+	draw_polygon(points, PackedColorArray([tint]), uvs, texture)
+
+
+func _draw_forged_panel(rect: Rect2, edge_color: Color = FORGED_BRASS, border_width: float = 2.0, rivets: bool = true, fill_tint: Color = Color(0.07, 0.10, 0.13, 0.40), material: String = "steel") -> void:
+	if rect.size.x <= 0.0 or rect.size.y <= 0.0:
+		return
+	var inset := minf(3.0 * ui_scale, minf(rect.size.x, rect.size.y) * 0.10)
+	draw_rect(Rect2(rect.position + Vector2(2.5, 4.0) * ui_scale, rect.size), Color(0.0, 0.0, 0.0, 0.36))
+	draw_rect(rect, FORGED_INK)
+	var texture_rect := rect.grow(-inset)
+	if texture_rect.size.x > 0.0 and texture_rect.size.y > 0.0:
+		var surface_texture: Texture2D = UI_STEEL_TEXTURE
+		var surface_modulate := Color(0.74, 0.81, 0.88, 0.72)
+		match material:
+			"canvas":
+				surface_texture = UI_CANVAS_TEXTURE
+				surface_modulate = Color(0.58, 0.61, 0.57, 0.46)
+			"bronze":
+				surface_texture = UI_BRONZE_TEXTURE
+				surface_modulate = Color(0.78, 0.68, 0.49, 0.66)
+		draw_texture_rect(surface_texture, texture_rect, false, surface_modulate)
+		# Semantic enamel changes the meaning of a region without ever covering the
+		# brushed steel grain underneath it.
+		draw_rect(texture_rect, Color(fill_tint, minf(fill_tint.a, 0.52)))
+	draw_rect(rect, Color(edge_color, 0.94), false, maxf(1.0, border_width))
+	var inner := rect.grow(-maxf(3.0 * ui_scale, border_width + ui_scale))
+	if inner.size.x > 0.0 and inner.size.y > 0.0:
+		draw_rect(inner, Color(FORGED_BRASS_LIGHT, 0.23), false, maxf(1.0, border_width * 0.42))
+	draw_line(rect.position + Vector2(7.0, 4.0) * ui_scale, Vector2(rect.end.x - 7.0 * ui_scale, rect.position.y + 4.0 * ui_scale), Color(0.86, 0.92, 0.96, 0.18), maxf(1.0, ui_scale))
+	draw_line(Vector2(rect.position.x + 7.0 * ui_scale, rect.end.y - 4.0 * ui_scale), rect.end - Vector2(7.0, 4.0) * ui_scale, Color(0.0, 0.0, 0.0, 0.42), maxf(1.0, ui_scale))
+	if not rivets or rect.size.x < 52.0 * ui_scale or rect.size.y < 28.0 * ui_scale:
+		return
+	var rivet_inset := 8.0 * ui_scale
+	for rivet_center in [
+		rect.position + Vector2.ONE * rivet_inset,
+		Vector2(rect.end.x - rivet_inset, rect.position.y + rivet_inset),
+		Vector2(rect.position.x + rivet_inset, rect.end.y - rivet_inset),
+		rect.end - Vector2.ONE * rivet_inset,
+	]:
+		draw_circle(rivet_center + Vector2(0.7, 1.0) * ui_scale, 3.1 * ui_scale, Color(0.0, 0.0, 0.0, 0.58))
+		draw_circle(rivet_center, 2.8 * ui_scale, Color("6E5732"))
+		draw_circle(rivet_center - Vector2(0.7, 0.7) * ui_scale, 1.2 * ui_scale, FORGED_BRASS_LIGHT)
+
+
 func _draw_card(rect: Rect2, fill: Color, edge: Color) -> void:
-	draw_rect(rect, fill)
-	draw_rect(rect, edge, false, maxf(1.5, 2.0 * ui_scale))
+	var tint_alpha := clampf(fill.a, 0.10, 0.34)
+	_draw_forged_panel(rect, edge, maxf(1.5, 2.0 * ui_scale), true, Color(fill, tint_alpha), "canvas")
 
 
 func _draw_button(rect: Rect2, label: String, color: Color, base_size: int) -> void:
-	draw_rect(rect, Color(color, 0.72))
-	draw_rect(rect, color.lightened(0.22), false, maxf(1.5, 2.0 * ui_scale))
-	_draw_text(label, rect.get_center() + Vector2(0.0, float(base_size) * 0.36 * ui_scale), maxi(11, roundi(float(base_size) * ui_scale)), TEXT, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0 * ui_scale)
+	var material := "bronze" if color == GOLD else "steel"
+	_draw_forged_panel(rect, color.lightened(0.22), maxf(1.5, 2.0 * ui_scale), false, Color(color.darkened(0.42), 0.28), material)
+	_draw_text(label, rect.get_center() + Vector2(0.0, float(base_size) * 0.36 * ui_scale), maxi(roundi(MIN_SECONDARY_FONT_CSS * ui_scale), roundi(float(base_size) * ui_scale)), TEXT, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0 * ui_scale)
 
 
 func _draw_bar(rect: Rect2, ratio: float, color: Color) -> void:

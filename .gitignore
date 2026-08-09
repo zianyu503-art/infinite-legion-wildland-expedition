@@ -1,0 +1,5 @@
+# Browser QA runs include large temporary Chromium profiles and may contain
+# cookies or local storage. Keep them local; publish only explicitly selected
+# evidence PNGs with `git add -f`.
+output/audit/
+output/playwright/
