@@ -176,6 +176,28 @@ async function withTouchDrag(page, state, rect, offset, action) {
   }
 }
 
+async function holdTouchLogical(page, state, rect) {
+  let client = touchSessions.get(page);
+  if (!client) {
+    client = await page.context().newCDPSession(page);
+    touchSessions.set(page, client);
+  }
+  const point = await logicalPoint(page, state, rect);
+  const touchPoint = [{ x: point.x, y: point.y, id: 81, radiusX: 4, radiusY: 4, force: 1 }];
+  await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: touchPoint });
+  try {
+    await page.waitForTimeout(80);
+    return await readState(page);
+  } finally {
+    await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await waitForState(page, (current) => (
+      current.input?.virtual_controls?.move?.pointer === -1 &&
+      current.input?.virtual_controls?.attack?.pointer === -1 &&
+      current.input?.attack_held === false
+    ));
+  }
+}
+
 async function runCase(name, options, test) {
 	if (caseFilter && !name.includes(caseFilter)) return;
 	console.log(`[RUN] ${name}`);
@@ -185,7 +207,8 @@ async function runCase(name, options, test) {
     viewport: options.viewport,
     screen: options.viewport,
     hasTouch: Boolean(options.touch),
-    isMobile: false,
+    isMobile: Boolean(options.mobile),
+    deviceScaleFactor: options.deviceScaleFactor || 1,
     locale: options.locale || "zh-TW",
     // Keep the generated PWA worker available. The local QA server supplies
     // COOP/COEP directly, so cases do not depend on first-install timing.
@@ -325,6 +348,11 @@ await runCase(
     assert.deepEqual(Object.keys(state.vip.resource_wallet).sort(), ["crystal", "fish", "gold", "herbs", "iron", "salt", "stone", "wood"]);
 
     const controls = state.input.virtual_controls;
+    assert.equal(controls.utility_layout, "collapsible_dual_side_rails");
+    assert.equal(controls.utility_drawer_open, false);
+    assert.equal(controls.layout_version, 3);
+    assert.equal(intersects(controls.special, controls.gameplay_clear), false, "VIP special button must stay outside the center gameplay corridor");
+    assert.ok(controls.gameplay_clear.width / state.input.touch_ui_coordinate_scale >= 160);
     const xBefore = state.player.x;
     const yBefore = state.player.y;
     state = await withTouchDrag(page, state, controls.move, { x: controls.move.width * 0.34, y: 0 }, async () => {
@@ -353,36 +381,155 @@ await runCase(
 );
 
 for (const viewport of [
-  { width: 844, height: 390 },
   { width: 568, height: 320 },
+  { width: 667, height: 375 },
 ]) {
   await runCase(
-    `touch-${viewport.width}x${viewport.height}-rails`,
-    { viewport, touch: true, params: { soldier_vfx_scene: "combat", touch: "1", lang: "zh_TW" } },
+    `vip-compact-controls-${viewport.width}x${viewport.height}`,
+    {
+      viewport,
+      touch: true,
+      mobile: true,
+      deviceScaleFactor: 2,
+      locale: "zh-TW",
+      params: { vip_scene: "combat", touch: "1", lang: "zh_TW" },
+    },
     async (page) => {
-      await waitForState(page, (state) => state.input.scheme === "touch" && state.input.virtual_controls.utility_layout === "dual_side_rails");
-      const state = await readState(page);
+      let state = await waitForState(page, (value) => value.mode === "playing" && value.edition === "vip" && value.input?.virtual_controls?.layout_version === 3);
+      const controls = state.input.virtual_controls;
+      const scale = state.input.touch_ui_coordinate_scale;
+      const clear = controls.gameplay_clear;
+      assert.equal(controls.utility_layout, "collapsible_dual_side_rails");
+      assert.equal(controls.utility_drawer_open, false);
+      assert.ok(clear.width / scale >= 160);
+      assert.equal(intersects(controls.move.hit, clear), false);
+      assert.equal(intersects(controls.attack.hit, clear), false);
+      assert.equal(intersects(controls.special, clear), false);
+      const clearProbe = {
+        x: clear.x + clear.width * 0.5 - scale,
+        y: state.input.logical_viewport_height * 0.72 - scale,
+        width: scale * 2,
+        height: scale * 2,
+      };
+      const held = await holdTouchLogical(page, state, clearProbe);
+      assert.equal(held.input.virtual_controls.move.pointer, -1);
+      assert.equal(held.input.virtual_controls.attack.pointer, -1);
+      assert.equal(held.input.attack_held, false);
+      await tapLogical(page, state, controls.utility_handles.left);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
+      assert.equal(Object.values(state.input.virtual_controls.utility).filter((item) => item.visible).length, 10);
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.left);
+      await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === false);
+    },
+  );
+}
+
+for (const viewport of [
+  { width: 844, height: 390 },
+  { width: 568, height: 320 },
+  { width: 667, height: 375 },
+]) {
+  await runCase(
+    `touch-${viewport.width}x${viewport.height}-compact-controls`,
+    { viewport, touch: true, mobile: true, deviceScaleFactor: 2, params: { soldier_vfx_scene: "combat", touch: "1", lang: "zh_TW" } },
+    async (page) => {
+      await waitForState(page, (state) => state.input.scheme === "touch" && state.input.virtual_controls.utility_layout === "collapsible_dual_side_rails");
+      let state = await readState(page);
       const scale = state.input.touch_ui_coordinate_scale;
       const controls = state.input.virtual_controls;
       const utility = controls.utility;
+      const handles = controls.utility_handles;
+      const clear = controls.gameplay_clear;
+      const logicalWidth = state.input.logical_viewport_width;
+      const logicalHeight = state.input.logical_viewport_height;
       assert.equal(Object.keys(utility).length, 10);
+      assert.equal(controls.layout_version, 3);
+      assert.equal(controls.utility_drawer_open, false);
+      assert.equal(controls.move.visible, true);
+      assert.equal(controls.attack.visible, true);
+      assert.equal(controls.special.visible, true);
+      assert.ok(clear.width / scale >= 160, "phone layout must reserve at least 160 CSS px through the center");
+      assert.ok(clear.width / logicalWidth >= 0.34, "phone layout must keep at least 34% of the width button-free");
       const left = ["upgrades", "recruit", "command", "skills", "map"];
       const right = ["guide", "notices", "cheat", "fullscreen", "pause"];
       for (const action of [...left, ...right]) {
         const rect = utility[action];
-        assert.equal(rect.visible, true, `${action} should be visible`);
+        assert.equal(rect.visible, false, `${action} should stay collapsed during combat`);
         assert.ok(rect.width / scale >= 43.9 && rect.height / scale >= 43.9, `${action} is below 44 CSS px`);
-        assert.equal(intersects(rect, controls.move), false, `${action} overlaps move stick`);
-        assert.equal(intersects(rect, controls.attack), false, `${action} overlaps attack stick`);
-        assert.equal(intersects(rect, controls.special), false, `${action} overlaps special`);
       }
-      assert.ok(left.every((action) => utility[action].x / scale <= 3.0));
-      assert.ok(right.every((action) => (utility[action].x + utility[action].width) / scale >= viewport.width - 3.0));
-      await tapLogical(page, state, utility.upgrades);
+      const collapsedRects = [controls.move, controls.attack, controls.special, handles.left, handles.right];
+      let occupiedCssArea = 0;
+      for (let index = 0; index < collapsedRects.length; index += 1) {
+        const rect = collapsedRects[index];
+        assert.ok(rect.width / scale >= 43.9 && rect.height / scale >= 43.9, "collapsed control is below 44 CSS px");
+        assert.ok(rect.x >= 0 && rect.y >= 0 && rect.x + rect.width <= logicalWidth + 0.5 && rect.y + rect.height <= logicalHeight + 0.5, "collapsed control must remain inside the phone viewport");
+        assert.equal(intersects(rect, clear), false, "collapsed controls must not enter the center gameplay corridor");
+        occupiedCssArea += (rect.width / scale) * (rect.height / scale);
+        for (let previous = 0; previous < index; previous += 1) {
+          assert.equal(intersects(rect, collapsedRects[previous]), false, "collapsed controls must not overlap");
+        }
+      }
+      assert.ok(occupiedCssArea / (viewport.width * viewport.height) <= 0.24, "collapsed controls must cover no more than 24% of the phone screen");
+      assert.ok(handles.left.x / scale >= 5.9 && (handles.right.x + handles.right.width) / scale <= viewport.width - 5.9, "edge handles need a safe inset");
+      assert.ok((logicalHeight - controls.move.y - controls.move.height) / scale >= 7.9 && (logicalHeight - controls.attack.y - controls.attack.height) / scale >= 7.9, "sticks need an 8 CSS px bottom margin");
+      assert.ok(controls.special.x / scale > viewport.width * 0.68, "special skill must stay in the right-hand control cluster");
+      for (const hitRect of [controls.move.hit, controls.attack.hit]) {
+        assert.ok(hitRect.x >= 0 && hitRect.y >= 0 && hitRect.x + hitRect.width <= logicalWidth + 0.5 && hitRect.y + hitRect.height <= logicalHeight + 0.5, "stick input region must stay inside the phone viewport");
+        assert.equal(intersects(hitRect, clear), false, "stick input regions must not enter the center gameplay corridor");
+      }
+      const clearProbe = {
+        x: clear.x + clear.width * 0.5 - scale,
+        y: logicalHeight * 0.72 - scale,
+        width: scale * 2,
+        height: scale * 2,
+      };
+      const clearHeldState = await holdTouchLogical(page, state, clearProbe);
+      assert.equal(clearHeldState.input.virtual_controls.move.pointer, -1, "holding the center corridor must not start movement");
+      assert.equal(clearHeldState.input.virtual_controls.attack.pointer, -1, "holding the center corridor must not start aiming");
+      assert.equal(clearHeldState.input.attack_held, false, "holding the center corridor must not attack");
+
+      await tapLogical(page, state, handles.left);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
+      const openControls = state.input.virtual_controls;
+      if (viewport.width === 568) {
+        await page.screenshot({ path: path.join(artifactDir, "touch-568x320-utility-drawer-open.png") });
+      }
+      assert.equal(openControls.move.visible, false);
+      assert.equal(openControls.attack.visible, false);
+      assert.equal(openControls.special.visible, false);
+      assert.equal(openControls.move.pointer, -1);
+      assert.equal(openControls.attack.pointer, -1);
+      assert.equal(openControls.utility_handles.left.mode, "close");
+      assert.equal(openControls.utility_handles.right.mode, "close");
+      const leftRailEnd = Math.max(...left.map((action) => openControls.utility[action].x + openControls.utility[action].width));
+      const rightRailStart = Math.min(...right.map((action) => openControls.utility[action].x));
+      assert.ok(openControls.utility_handles.left.x >= leftRailEnd + 5.9 * scale, "left close handle must sit beside the left rail");
+      assert.ok(openControls.utility_handles.left.x + openControls.utility_handles.left.width <= clear.x, "left close handle must remain left of the gameplay corridor");
+      assert.ok(openControls.utility_handles.right.x + openControls.utility_handles.right.width <= rightRailStart - 5.9 * scale, "right close handle must sit beside the right rail");
+      assert.ok(openControls.utility_handles.right.x >= clear.x + clear.width, "right close handle must remain right of the gameplay corridor");
+      const openRects = [
+        ...[...left, ...right].map((action) => openControls.utility[action]),
+        openControls.utility_handles.left,
+        openControls.utility_handles.right,
+      ];
+      for (let index = 0; index < openRects.length; index += 1) {
+        const rect = openRects[index];
+        assert.equal(rect.visible, true);
+        assert.ok(rect.x >= 0 && rect.y >= 0 && rect.x + rect.width <= logicalWidth + 0.5 && rect.y + rect.height <= logicalHeight + 0.5, "open utility must remain inside the phone viewport");
+        assert.equal(intersects(rect, clear), false, "open utilities must stay outside the center gameplay corridor");
+        for (let previous = 0; previous < index; previous += 1) {
+          assert.equal(intersects(rect, openRects[previous]), false, "open utilities must not overlap");
+        }
+      }
+      await tapLogical(page, state, openControls.utility.upgrades);
       const panelState = await waitForState(page, (value) => value.panel === "soldier_upgrades");
       assert.equal(panelState.input.virtual_controls.panel_close.visible, true);
       await tapLogical(page, panelState, panelState.input.virtual_controls.panel_close);
-      await waitForState(page, (value) => value.panel === "");
+      state = await waitForState(page, (value) => value.panel === "" && value.input.virtual_controls.utility_drawer_open === false);
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
+      await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === false);
     },
   );
 }
