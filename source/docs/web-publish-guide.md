@@ -14,7 +14,7 @@
 
 - 公開成品倉庫：<https://github.com/zianyu503-art/infinite-legion-wildland-expedition>
 - 發布來源：`main` 分支根目錄。
-- 倉庫只包含 Godot 編譯後的 Web 成品；本機 GDScript 開發原始碼沒有放入公開倉庫。
+- 倉庫根目錄包含 GitHub Pages Web 成品；完整 Godot 4.6 專案與 GDScript 原始碼位於公開倉庫的 `source/` 目錄。
 - GitHub Pages 使用 HTTPS，WebAssembly、PCK、manifest 與 service worker 已逐一確認回傳 `200`。
 
 ## 已完成外網驗證
@@ -28,8 +28,8 @@
 ## 本機備份測試
 
 ```bash
-cd '/Users/alex/Documents/New project 53'
-python3 -m http.server 8060 --directory build/web --bind 127.0.0.1
+cd infinite-legion-wildland-expedition
+python3 tests/web/serve_with_isolation.py source/build/web --bind 127.0.0.1 --port 8060
 ```
 
 接著開啟 <http://127.0.0.1:8060/>。一般使用者不需要執行這些指令，直接使用上方公開網址即可。

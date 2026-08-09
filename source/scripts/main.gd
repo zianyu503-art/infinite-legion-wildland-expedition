@@ -6,6 +6,10 @@ extends Node2D
 const GameConfig = preload("res://scripts/game_config.gd")
 const WorldGenerator = preload("res://scripts/world_generator.gd")
 const CampaignVisualRenderer = preload("res://scripts/campaign_visual_renderer.gd")
+const VipAccessManagerScript = preload("res://scripts/vip_access_manager.gd")
+const VipWorldGeneratorScript = preload("res://scripts/vip_world_generator.gd")
+const VipTerrainCatalog = preload("res://scripts/vip_terrain_catalog.gd")
+const VipTerrainRenderer = preload("res://scripts/vip_terrain_renderer.gd")
 const GameAudioManager = preload("res://scripts/audio_manager.gd")
 const GameSaveManager = preload("res://scripts/save_manager.gd")
 const GameLocalization = preload("res://scripts/game_localization.gd")
@@ -40,7 +44,7 @@ const PLAYER_RADIUS := 17.0
 const PLAYER_HIT_GRACE_SECONDS := 0.14
 const CASTLE_CORE_COLLISION_RADIUS := 121.0
 const CASTLE_OUTER_COLLISION_RADIUS := 205.0
-const SAVE_SCHEMA := 8
+const SAVE_SCHEMA := 9
 const NATION_TICK_INTERVAL := 2.0
 const NATION_SUPPORT_RADIUS := 1750.0
 const NATION_WAR_RADIUS := 1250.0
@@ -48,6 +52,15 @@ const FIXED_STEP := 1.0 / 60.0
 const BOSS_ENTITY_ID := -9001
 const MAIN_PYTHON_BOSS_LAIR_ID := "python_boss_main_lair"
 const PROFILE_PATH := "user://infinite_legion_profile.json"
+const VIP_SAVE_PATH := "user://infinite_legion_vip_save.json"
+const WORLD_EDITION_FREE := "free"
+const WORLD_EDITION_VIP := "vip"
+const VIP_WORLD_GENERATION_VERSION := 1
+const VIP_RESOURCE_TICK_INTERVAL := 1.0
+const VIP_ACCESS_CHECK_INTERVAL := 30.0
+const VIP_RESOURCE_STATE_LIMIT := 8192
+const VIP_RESOURCE_AMOUNT_LIMIT := 1000000
+const VIP_RESOURCE_KEYS: Array[String] = ["wood", "stone", "iron", "gold", "herbs", "fish", "salt", "crystal"]
 const ENDING_DURATION := 9.6
 const TOUCH_STICK_RADIUS := 74.0
 const TOUCH_BUTTON_SIZE := 82.0
@@ -86,6 +99,8 @@ var mode: int = GameMode.TITLE
 var screen_size := VIEW_BASE
 var world_seed: int = 20260731
 var world_generator: WorldGenerator
+var vip_world_generator: Variant = null
+var vip_access: Variant = null
 var audio: GameAudioManager
 var ui_font: Font
 var arena_view: ArenaView
@@ -97,6 +112,7 @@ var camera_shake := 0.0
 var camera_shake_offset := Vector2.ZERO
 
 var active_chunks: Dictionary = {}
+var vip_terrain_chunks: Dictionary = {}
 var discovered_chunks: Dictionary = {}
 var spawned_chunks: Dictionary = {}
 var chunk_states: Dictionary = {}
@@ -115,6 +131,18 @@ var floaters: Array[Dictionary] = []
 var tombstones: Array[Dictionary] = []
 var drops: Array[Dictionary] = []
 var notifications: Array[Dictionary] = []
+var world_edition := WORLD_EDITION_FREE
+var vip_title_message := ""
+var vip_access_snapshot_cache: Dictionary = {}
+var vip_resources: Dictionary = {
+	"wood": 0, "stone": 0, "iron": 0, "gold": 0,
+	"herbs": 0, "fish": 0, "salt": 0, "crystal": 0,
+}
+var vip_resource_remaining: Dictionary = {}
+var vip_resource_tick := 0.0
+var vip_last_terrain_id := "plains"
+var vip_access_check_timer := 0.0
+var vip_last_draw_trace: Dictionary = {}
 var python_boss: Variant = null
 var active_python_boss_lair_id := MAIN_PYTHON_BOSS_LAIR_ID
 var main_python_boss_lair_cleared := false
@@ -191,6 +219,7 @@ var _web_heavy_cannon_showcase_callback: Variant = null
 var _web_chaos_showcase_callback: Variant = null
 var _web_aionis_showcase_callback: Variant = null
 var _web_arena_showcase_callback: Variant = null
+var _web_vip_showcase_callback: Variant = null
 var _web_manual_time_hold := 0.0
 var _web_test_showcase_active := false
 
@@ -227,6 +256,9 @@ func _ready() -> void:
 	arena_view.language_toggle_requested.connect(_toggle_language)
 	arena_view.sound_requested.connect(_on_arena_sound_requested)
 	world_generator = WorldGenerator.new(world_seed)
+	vip_world_generator = VipWorldGeneratorScript.new(world_seed)
+	vip_access = VipAccessManagerScript.new()
+	vip_access_snapshot_cache = Dictionary(vip_access.snapshot())
 	_initialize_empty_player()
 	soldier_research = SoldierUpgradeCatalog.create_empty_research()
 	soldier_upgrade_type_index = 0
@@ -360,6 +392,88 @@ func _class_select_pointer_is_guarded() -> bool:
 
 func _is_touch_scheme() -> bool:
 	return input_scheme == InputScheme.TOUCH
+
+
+func _is_vip_world() -> bool:
+	return world_edition == WORLD_EDITION_VIP
+
+
+func _vip_snapshot(now_unix: int = -1, refresh_storage: bool = false) -> Dictionary:
+	if vip_access == null:
+		return {"state": "not_started", "has_access": false, "remaining_seconds": 0, "access_source": "none"}
+	if refresh_storage or vip_access_snapshot_cache.is_empty():
+		vip_access_snapshot_cache = Dictionary(vip_access.snapshot(now_unix))
+	var result := vip_access_snapshot_cache.duplicate(true)
+	var observed_now := now_unix if now_unix >= 0 else int(Time.get_unix_time_from_system())
+	var effective_now := maxi(observed_now, int(result.get("effective_now", result.get("last_seen", 0))))
+	if bool(result.get("paid_entitled", false)):
+		var paid_expires := int(result.get("paid_expires", 0))
+		var paid_remaining := -1 if paid_expires == 0 else maxi(paid_expires - effective_now, 0)
+		if paid_remaining != 0:
+			result["state"] = "active"
+			result["has_access"] = true
+			result["access_source"] = "paid"
+			result["remaining_seconds"] = paid_remaining
+			return result
+	var started := int(result.get("started", 0))
+	if started > 0:
+		var remaining := maxi(int(result.get("expires", 0)) - effective_now, 0)
+		result["remaining_seconds"] = remaining
+		result["trial_remaining_seconds"] = remaining
+		result["state"] = "active" if remaining > 0 else "expired"
+		result["has_access"] = remaining > 0
+		result["access_source"] = "trial"
+	return result
+
+
+func _format_duration(seconds_value: int) -> String:
+	var total := maxi(0, seconds_value)
+	var hours := int(total / 3600)
+	var minutes := int((total % 3600) / 60)
+	var seconds := total % 60
+	return "%02d:%02d:%02d" % [hours, minutes, seconds]
+
+
+func _begin_free_edition() -> void:
+	world_edition = WORLD_EDITION_FREE
+	vip_title_message = ""
+	_enter_class_select(true)
+
+
+func _load_free_edition() -> bool:
+	world_edition = WORLD_EDITION_FREE
+	vip_title_message = ""
+	return _load_game(GameSaveManager.SAVE_PATH)
+
+
+func _request_vip_entry() -> bool:
+	if vip_access == null:
+		vip_title_message = "VIP 狀態暫時無法讀取。"
+		queue_redraw()
+		return false
+	var access := _vip_snapshot(-1, true)
+	if str(access.get("state", "not_started")) == "not_started":
+		access = Dictionary(vip_access.begin_trial())
+		vip_access_snapshot_cache = access.duplicate(true)
+		if bool(access.get("trial_started_now", false)) and not bool(access.get("save_succeeded", false)):
+			vip_title_message = "無法保存 VIP 試玩時間；請確認瀏覽器儲存空間後重試。"
+			audio.play("ui", 0.35, 0.72)
+			queue_redraw()
+			return false
+	if not bool(access.get("has_access", false)):
+		vip_title_message = "VIP 試玩已結束；存檔已保留，付費功能即將推出。"
+		audio.play("ui", 0.35, 0.82)
+		queue_redraw()
+		return false
+	world_edition = WORLD_EDITION_VIP
+	vip_title_message = ""
+	if GameSaveManager.has_save(VIP_SAVE_PATH):
+		if _load_game(VIP_SAVE_PATH):
+			return true
+		world_edition = WORLD_EDITION_VIP
+		vip_title_message = "原有 VIP 存檔無法讀取，先開始新遠征；手動存檔前不會覆蓋舊檔。"
+	_enter_class_select(true)
+	return true
 
 
 func _needs_landscape_rotation() -> bool:
@@ -534,6 +648,7 @@ func _setup_web_bridge() -> void:
 	window.__codex_render_game_to_text = _web_render_callback
 	window.__codex_advance_time = _web_advance_callback
 	var allow_test_showcases := bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('codex_test') === '1'", true))
+	var allow_local_vip_showcase := allow_test_showcases and bool(JavaScriptBridge.eval("['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)", true))
 	if allow_test_showcases:
 		_web_force_boss_callback = JavaScriptBridge.create_callback(Callable(self, "_web_force_boss_for_test"))
 		_web_touch_mode_callback = JavaScriptBridge.create_callback(Callable(self, "_web_set_touch_mode_for_test"))
@@ -549,6 +664,9 @@ func _setup_web_bridge() -> void:
 		window.__codex_force_chaos_showcase_for_test = _web_chaos_showcase_callback
 		window.__codex_force_aionis_showcase_for_test = _web_aionis_showcase_callback
 		window.__codex_force_arena_showcase_for_test = _web_arena_showcase_callback
+		if allow_local_vip_showcase:
+			_web_vip_showcase_callback = JavaScriptBridge.create_callback(Callable(self, "_web_force_vip_showcase_for_test"))
+			window.__codex_force_vip_showcase_for_test = _web_vip_showcase_callback
 		var auto_chaos_scene: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('chaos_scene') || ''", true)
 		if typeof(auto_chaos_scene) == TYPE_STRING and str(auto_chaos_scene) in ["battle", "ending", "pause", "recruit"]:
 			var auto_touch: bool = bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('touch') === '1'", true))
@@ -575,6 +693,12 @@ func _setup_web_bridge() -> void:
 			var arena_language: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('lang') || 'zh_TW'", true)
 			var arena_mode: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('arena_mode') || 'spectator'", true)
 			call_deferred("_web_force_arena_showcase_for_test", [str(auto_arena_scene), str(arena_mode), str(arena_language), arena_touch])
+		if allow_local_vip_showcase:
+			var auto_vip_scene: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('vip_scene') || ''", true)
+			if typeof(auto_vip_scene) == TYPE_STRING and str(auto_vip_scene) in ["terrain", "combat"]:
+				var vip_touch := bool(JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('touch') === '1'", true))
+				var vip_language: Variant = JavaScriptBridge.eval("new URLSearchParams(window.location.search).get('lang') || 'zh_TW'", true)
+				call_deferred("_web_force_vip_showcase_for_test", [str(auto_vip_scene), vip_touch, str(vip_language)])
 	window.__codex_game_state = render_game_to_text()
 	# JavaScriptBridge callbacks always return null. These small wrappers publish
 	# the state through a window property so browser automation receives a string.
@@ -622,6 +746,12 @@ func _setup_web_bridge() -> void:
 					window.__codex_force_arena_showcase_for_test(String(scene), String(arenaMode), String(requestedLanguage), Boolean(touchMode));
 					return window.__codex_game_state || "";
 				};
+				if (typeof window.__codex_force_vip_showcase_for_test === "function") {
+					window.force_vip_showcase_for_test = (scene = "terrain", touchMode = false, requestedLanguage = "zh_TW") => {
+						window.__codex_force_vip_showcase_for_test(String(scene), Boolean(touchMode), String(requestedLanguage));
+						return window.__codex_game_state || "";
+					};
+				}
 			}
 		})();
 	""", true)
@@ -1165,6 +1295,147 @@ func _web_force_arena_showcase_for_test(arguments: Array) -> bool:
 	return success
 
 
+func _web_force_vip_showcase_for_test(arguments: Array) -> bool:
+	if not OS.has_feature("web") and not _self_test_running:
+		return false
+	var scene := str(arguments[0]) if arguments.size() > 0 else "terrain"
+	var requested_touch := bool(arguments[1]) if arguments.size() > 1 else false
+	var requested_language := str(arguments[2]) if arguments.size() > 2 else "zh_TW"
+	if scene not in ["terrain", "combat"]:
+		return false
+	# Browser QA must never consume a player's one-time trial.  The showcase uses
+	# the real VIP world pipeline but is protected by the existing no-save guard.
+	world_edition = WORLD_EDITION_VIP
+	_start_new_game("warrior", true)
+	language = "en" if requested_language == "en" else "zh_TW"
+	_set_input_scheme(InputScheme.TOUCH if requested_touch else InputScheme.KEYBOARD_MOUSE)
+	_reset_touch_inputs()
+	tutorial_visible = false
+	notifications.clear()
+	var showcase_center := _vip_showcase_position()
+	player["pos"] = showcase_center
+	player["facing"] = Vector2.RIGHT
+	player["max_hp"] = 2400.0
+	player["hp"] = 2400.0
+	player["defense"] = 120.0
+	_last_active_center = Vector2i(999999, 999999)
+	_update_active_chunks(true)
+	if _position_hits_obstacle(showcase_center, PLAYER_RADIUS, true):
+		showcase_center = _find_open_spawn_position(showcase_center, showcase_center, PLAYER_RADIUS, true)
+		player["pos"] = showcase_center
+	castles.clear()
+	camps.clear()
+	snake_nests.clear()
+	enemies.clear()
+	soldiers.clear()
+	projectiles.clear()
+	hazards.clear()
+	var humanoid_types: Array[String] = ["swordsman", "healer", "archer", "mage", "heavy", "priest", "musketeer", "rifleman"]
+	for index in humanoid_types.size():
+		var angle := TAU * float(index) / float(humanoid_types.size())
+		var preferred := showcase_center + Vector2.from_angle(angle) * (112.0 + float(index % 2) * 32.0)
+		var spawn_position := _find_open_spawn_position(showcase_center, preferred, CampaignVisualRenderer.radius_for(humanoid_types[index]), true)
+		var soldier_id := _spawn_soldier(humanoid_types[index], spawn_position)
+		var soldier: Variant = _find_soldier_by_id(soldier_id)
+		if soldier != null:
+			soldier["aim_dir"] = Vector2.RIGHT
+			soldier["state"] = "attack" if scene == "combat" and index % 3 == 0 else ("support" if index in [1, 5] else "follow")
+			soldier["animation_action"] = str(soldier["state"])
+			soldier["animation_action_ttl"] = 2.0
+			soldier["cooldown"] = 0.0
+	if scene == "combat":
+		for enemy_index in 5:
+			var preferred_enemy := showcase_center + Vector2(310.0, (float(enemy_index) - 2.0) * 80.0)
+			var enemy_position := _find_open_spawn_position(showcase_center, preferred_enemy, 18.0)
+			_spawn_enemy("heavy" if enemy_index == 2 else "grunt", enemy_position, 12, enemy_position)
+		soldier_command = "攻擊"
+		command_point = showcase_center + Vector2(300.0, 0.0)
+	else:
+		soldier_command = "跟隨"
+		player["vel"] = Vector2(90.0, 0.0)
+	vip_last_terrain_id = str(_vip_terrain_at(showcase_center).get("terrain", "plains"))
+	camera_pos = showcase_center
+	camera_target = showcase_center
+	active_panel = ""
+	mode = GameMode.PLAYING
+	_web_manual_time_hold = 1.0
+	queue_redraw()
+	_publish_web_game_state(render_game_to_text())
+	return vip_terrain_chunks.size() >= 9 and soldiers.size() == humanoid_types.size()
+
+
+func _vip_showcase_position() -> Vector2:
+	if vip_world_generator == null:
+		return HOUSE_POS
+	var fallback := HOUSE_POS
+	for scan_y in range(-18, 19):
+		for scan_x in range(-18, 19):
+			var position := Vector2(float(scan_x) * 620.0 + 73.0, float(scan_y) * 620.0 + 119.0)
+			var sample: Dictionary = vip_world_generator.sample_world(position)
+			if bool(sample.get("blocked_ground", false)):
+				continue
+			var terrain_id := str(sample.get("terrain", "plains"))
+			if terrain_id not in ["forest", "desert", "mine", "plateau", "swamp"]:
+				continue
+			var nearby_types: Dictionary = {terrain_id: true}
+			for offset in [Vector2(720.0, 0.0), Vector2(-720.0, 0.0), Vector2(0.0, 720.0), Vector2(0.0, -720.0), Vector2(980.0, 640.0), Vector2(-980.0, -640.0)]:
+				nearby_types[vip_world_generator.terrain_at(position + offset)] = true
+			if nearby_types.size() >= 4:
+				return position
+			fallback = position
+	return fallback
+
+
+func _vip_text_state() -> Dictionary:
+	var terrain_set: Dictionary = {}
+	for chunk_value in vip_terrain_chunks.values():
+		for cell_value in Array(Dictionary(chunk_value).get("cells", [])):
+			if cell_value is Dictionary:
+				terrain_set[str(Dictionary(cell_value).get("terrain", "plains"))] = true
+	var active_terrain_ids: Array = terrain_set.keys()
+	active_terrain_ids.sort()
+	var terrain_definition := VipTerrainCatalog.definition(vip_last_terrain_id)
+	var access := {
+		"state": "qa_showcase",
+		"has_access": true,
+		"access_source": "test",
+		"remaining_seconds": VipAccessManagerScript.TRIAL_DURATION_SECONDS,
+	} if _web_test_showcase_active and _is_vip_world() else _vip_snapshot()
+	var hero_animation := {}
+	if not str(player.get("class_id", "")).is_empty():
+		hero_animation = CampaignVisualRenderer.humanoid_animation_contract(player, game_time, true, 1.38)
+	var soldier_animation_samples: Array[Dictionary] = []
+	for soldier in soldiers:
+		if str(soldier.get("type", "")) not in CampaignVisualRenderer.HUMANOID_SOLDIER_TYPES:
+			continue
+		var animation := CampaignVisualRenderer.humanoid_animation_contract(soldier, game_time, false, 1.0)
+		animation["id"] = int(soldier.get("id", -1))
+		animation["type"] = str(soldier.get("type", ""))
+		soldier_animation_samples.append(animation)
+		if soldier_animation_samples.size() >= 8:
+			break
+	return {
+		"enabled": _is_vip_world(),
+		"edition": world_edition,
+		"access": access,
+		"world_generation_version": VIP_WORLD_GENERATION_VERSION,
+		"continuous_world": true,
+		"current_terrain_id": vip_last_terrain_id,
+		"current_terrain_name": str(terrain_definition.get("name_en" if language == "en" else "name_zh", vip_last_terrain_id)),
+		"current_properties": VipTerrainCatalog.gameplay_properties(vip_last_terrain_id),
+		"active_chunk_count": vip_terrain_chunks.size(),
+		"active_terrain_ids": active_terrain_ids,
+		"resource_wallet": vip_resources.duplicate(true),
+		"resource_node_state_count": vip_resource_remaining.size(),
+		"visuals": vip_last_draw_trace.duplicate(true),
+		"animation": {
+			"profile_id": CampaignVisualRenderer.STICK_ANIMATION_PROFILE_ID,
+			"hero": hero_animation,
+			"soldiers": soldier_animation_samples,
+		},
+	}
+
+
 func render_game_to_text() -> String:
 	var mode_names := ["title", "class_select", "playing", "paused", "dead", "ending", "arena"]
 	var player_position: Vector2 = Vector2(player.get("pos", HOUSE_POS))
@@ -1353,12 +1624,24 @@ func render_game_to_text() -> String:
 				"x": snappedf(volume_rect.position.x, 0.1), "y": snappedf(volume_rect.position.y, 0.1),
 				"width": snappedf(volume_rect.size.x, 0.1), "height": snappedf(volume_rect.size.y, 0.1),
 			}
+	var title_action_state := {}
+	if mode == GameMode.TITLE:
+		var title_rects_for_state := _title_action_rects()
+		for title_action_value in title_rects_for_state.keys():
+			var title_action := str(title_action_value)
+			var title_rect := Rect2(title_rects_for_state[title_action_value])
+			title_action_state[title_action] = {
+				"x": snappedf(title_rect.position.x, 0.1), "y": snappedf(title_rect.position.y, 0.1),
+				"width": snappedf(title_rect.size.x, 0.1), "height": snappedf(title_rect.size.y, 0.1),
+			}
 	var payload := {
 		"coordinate_system": "world origin=(0,0); +x right; +y down; distances in Godot pixels",
 		"mode": mode_names[clampi(mode, 0, mode_names.size() - 1)],
 		"time": snappedf(game_time, 0.01),
 		"panel": active_panel,
 		"language": language,
+		"edition": world_edition,
+		"vip": _vip_text_state(),
 		"input": {
 			"scheme": "touch" if _is_touch_scheme() else "keyboard_mouse",
 			"touch_capable": touch_capable,
@@ -1366,6 +1649,7 @@ func render_game_to_text() -> String:
 			"logical_viewport_width": snappedf(screen_size.x, 0.1),
 			"logical_viewport_height": snappedf(screen_size.y, 0.1),
 			"touch_ui_coordinate_scale": snappedf(touch_ui_coordinate_scale, 0.001),
+			"title_actions": title_action_state,
 			"attack_held": attack_held if _is_touch_scheme() else false,
 			"troop_upgrade_button": {
 				"x": snappedf(touch_upgrade_test_rect.position.x, 0.1),
@@ -1861,6 +2145,7 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	player["attack_rate"] = float(class_data["normal_attack"]["attack_speed"])
 	player["pos"] = HOUSE_POS + Vector2(0.0, 95.0)
 	player["facing"] = Vector2.RIGHT
+	vip_world_generator = VipWorldGeneratorScript.new(world_seed)
 	mode = GameMode.PLAYING
 	active_panel = ""
 	game_time = 0.0
@@ -1879,6 +2164,7 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	command_castle_id = ""
 	recruit_anchor = HOUSE_POS
 	active_chunks.clear()
+	vip_terrain_chunks.clear()
 	discovered_chunks.clear()
 	spawned_chunks.clear()
 	chunk_states.clear()
@@ -1902,6 +2188,12 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	tombstones.clear()
 	drops.clear()
 	notifications.clear()
+	vip_resources = _empty_vip_resources()
+	vip_resource_remaining.clear()
+	vip_resource_tick = 0.0
+	vip_last_terrain_id = "plains"
+	vip_access_check_timer = 0.0
+	vip_last_draw_trace.clear()
 	next_entity_id = 1
 	active_python_boss_lair_id = MAIN_PYTHON_BOSS_LAIR_ID
 	main_python_boss_lair_cleared = false
@@ -1917,7 +2209,8 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	camera_target = camera_pos
 	_last_active_center = Vector2i(999999, 999999)
 	_update_active_chunks(true)
-	_add_notification("歡迎，%s！離開安全區並探索荒原。" % class_data["name"], GOLD, 4.0)
+	var welcome := "歡迎，%s！VIP 連續世界已啟用。" % class_data["name"] if world_edition == WORLD_EDITION_VIP else "歡迎，%s！離開安全區並探索荒原。" % class_data["name"]
+	_add_notification(welcome, GOLD, 4.0)
 	_spawn_effect("level_up", player["pos"], GOLD, 1.0)
 	audio.play("level_up", 0.7)
 	queue_redraw()
@@ -1950,7 +2243,8 @@ func _touch_utility_rects() -> Dictionary:
 	var pitch := 47.0 * scale
 	# 176 logical pixels is the bottom edge of the compact minimap. Adding four
 	# CSS pixels works for both expand-mode Web canvases and native touch windows.
-	var start_y := 176.0 + 4.0 * scale
+	var hud_bottom := 188.0 if _is_vip_world() else 176.0
+	var start_y := hud_bottom + 4.0 * scale
 	for index in left_keys.size():
 		result[left_keys[index]] = Rect2(2.0 * scale, start_y + float(index) * pitch, button_size, button_size)
 	for index in right_keys.size():
@@ -2214,7 +2508,11 @@ func _input(event: InputEvent) -> void:
 			if key == KEY_A:
 				_enter_arena()
 				return
+			if key == KEY_V:
+				_request_vip_entry()
+				return
 			if key == KEY_ENTER or key == KEY_SPACE:
+				world_edition = WORLD_EDITION_FREE
 				_enter_class_select(false)
 			return
 		if mode == GameMode.CLASS_SELECT:
@@ -2344,6 +2642,7 @@ func _simulate_game(delta: float) -> void:
 		autosave_timer += delta
 		_update_player(delta)
 		_update_active_chunks(false)
+		_update_vip_world(delta)
 		_update_castles_and_camps(delta)
 		_update_enemies(delta)
 		_update_soldiers(delta)
@@ -2370,6 +2669,91 @@ func _update_audio_settings() -> void:
 		return
 	audio.set_volume(master_volume)
 	audio.set_muted(sound_muted)
+
+
+func _vip_resource_name(resource_id: String) -> String:
+	if language == "en":
+		match resource_id:
+			"wood": return "Wood"
+			"stone": return "Stone"
+			"iron": return "Iron"
+			"gold": return "Gold Ore"
+			"herbs": return "Herbs"
+			"fish": return "Fish"
+			"salt": return "Salt"
+			"crystal": return "Crystal"
+			_: return resource_id
+	match resource_id:
+		"wood": return "木材"
+		"stone": return "石材"
+		"iron": return "鐵礦"
+		"gold": return "金礦"
+		"herbs": return "藥草"
+		"fish": return "魚獲"
+		"salt": return "鹽"
+		"crystal": return "晶礦"
+		_: return resource_id
+
+
+func _update_vip_world(delta: float) -> void:
+	if not _is_vip_world() or player.is_empty():
+		return
+	vip_access_check_timer += delta
+	if vip_access_check_timer >= VIP_ACCESS_CHECK_INTERVAL:
+		vip_access_check_timer = fmod(vip_access_check_timer, VIP_ACCESS_CHECK_INTERVAL)
+		if not _self_test_running and not _web_test_showcase_active and vip_access != null:
+			var access := _vip_snapshot(-1, true)
+			if not bool(access.get("has_access", false)):
+				# Preserve the dedicated VIP save before returning to the free title.
+				if not _save_game(false, VIP_SAVE_PATH):
+					vip_access_check_timer = VIP_ACCESS_CHECK_INTERVAL - 5.0
+					_add_notification("VIP 已到期，但存檔失敗；保留目前畫面並將自動重試。", Color("FFB2A8"), 5.0)
+					return
+				mode = GameMode.TITLE
+				world_edition = WORLD_EDITION_FREE
+				active_panel = ""
+				vip_title_message = "VIP 試玩已結束；VIP 存檔已安全保留。"
+				_reset_touch_inputs()
+				audio.play("ui", 0.45, 0.78)
+				queue_redraw()
+				return
+	vip_resource_tick += delta
+	if vip_resource_tick < VIP_RESOURCE_TICK_INTERVAL:
+		return
+	vip_resource_tick = fmod(vip_resource_tick, VIP_RESOURCE_TICK_INTERVAL)
+	var player_position := Vector2(player.get("pos", HOUSE_POS))
+	var current_cell := _vip_terrain_at(player_position)
+	vip_last_terrain_id = str(current_cell.get("terrain", "plains"))
+	var nearest: Dictionary = {}
+	var nearest_distance := INF
+	for chunk_value in vip_terrain_chunks.values():
+		for resource_value in Array(Dictionary(chunk_value).get("resource_nodes", [])):
+			if not resource_value is Dictionary:
+				continue
+			var resource: Dictionary = resource_value
+			var resource_id := str(resource.get("id", ""))
+			var default_amount := maxi(0, int(resource.get("amount", 0)))
+			var remaining := maxi(0, int(vip_resource_remaining.get(resource_id, default_amount)))
+			if remaining <= 0:
+				continue
+			var distance := player_position.distance_to(Vector2(resource.get("position", Vector2.ZERO)))
+			var interaction_radius := float(resource.get("interaction_radius", 24.0)) + PLAYER_RADIUS + 34.0
+			if distance <= interaction_radius and distance < nearest_distance:
+				nearest = resource
+				nearest_distance = distance
+	if nearest.is_empty():
+		return
+	var node_id := str(nearest.get("id", ""))
+	var original_amount := maxi(1, int(nearest.get("amount", 1)))
+	var remaining := maxi(0, int(vip_resource_remaining.get(node_id, original_amount)) - 1)
+	vip_resource_remaining[node_id] = remaining
+	var inventory_key := str(nearest.get("inventory_key", "stone"))
+	if inventory_key not in VIP_RESOURCE_KEYS:
+		inventory_key = "stone"
+	vip_resources[inventory_key] = int(vip_resources.get(inventory_key, 0)) + 1
+	_add_floater(player_position + Vector2(0.0, -34.0), "+1 %s" % _vip_resource_name(inventory_key), Color("D9F4B1"), 0.85)
+	if remaining <= 0:
+		_add_notification("資源採集完成：%s" % _vip_resource_name(inventory_key), Color("BEEA9F"), 2.0)
 
 
 # -----------------------------------------------------------------------------
@@ -3560,6 +3944,7 @@ func _update_player(delta: float) -> void:
 	if move_input.length_squared() > 1.0:
 		move_input = move_input.normalized()
 	var speed := _player_move_speed()
+	speed *= _vip_movement_multiplier(Vector2(player["pos"]))
 	var old_move_position: Vector2 = Vector2(player["pos"])
 	var desired_velocity := move_input * speed
 	player["pos"] = _move_with_collision(player["pos"], desired_velocity * delta, PLAYER_RADIUS, true)
@@ -3631,6 +4016,7 @@ func _update_active_chunks(force: bool) -> void:
 			remove_keys.append(key)
 	for key in remove_keys:
 		active_chunks.erase(key)
+		vip_terrain_chunks.erase(key)
 	for i in range(enemies.size() - 1, -1, -1):
 		var enemy: Dictionary = enemies[i]
 		var enemy_chunk := world_generator.world_to_chunk(enemy["pos"])
@@ -3648,6 +4034,9 @@ func _activate_chunk(coord: Vector2i) -> void:
 	_clear_python_boss_home_trees(data)
 	var key: String = data["key"]
 	active_chunks[key] = data
+	if _is_vip_world() and vip_world_generator != null:
+		var vip_data: Dictionary = vip_world_generator.generate_chunk(coord)
+		vip_terrain_chunks[key] = VipTerrainRenderer.prepare_chunk(vip_data)
 	discovered_chunks[key] = true
 	if data["castle"] != null:
 		_register_castle(data["castle"])
@@ -3703,6 +4092,8 @@ func _restore_chunk_enemy_state(key: String) -> void:
 		else:
 			var restored_enemy := Dictionary(entry).duplicate(true)
 			_normalize_loaded_enemy(restored_enemy)
+			if _is_vip_world() and str(restored_enemy.get("domain", "ground")) != "air" and _position_hits_obstacle(Vector2(restored_enemy.get("pos", Vector2.ZERO)), float(restored_enemy.get("radius", 11.0))):
+				restored_enemy["pos"] = _find_open_spawn_position(Vector2(restored_enemy.get("home", restored_enemy.get("pos", Vector2.ZERO))), Vector2(restored_enemy.get("pos", Vector2.ZERO)), float(restored_enemy.get("radius", 11.0)))
 			enemies.append(restored_enemy)
 	if remaining.is_empty():
 		chunk_states.erase(key)
@@ -4249,7 +4640,7 @@ func _damage_player(raw_damage: float, source_pos: Vector2, allow_knockback: boo
 		return false
 	if _is_in_friendly_safe_zone(Vector2(player["pos"])):
 		return false
-	var damage := _calculate_damage(raw_damage, _player_defense())
+	var damage := _calculate_damage(raw_damage * _vip_damage_taken_multiplier(Vector2(player["pos"])), _player_defense())
 	var shield_absorb := minf(damage, maxf(0.0, float(player.get("support_shield", 0.0))))
 	if shield_absorb > 0.0:
 		player["support_shield"] = float(player.get("support_shield", 0.0)) - shield_absorb
@@ -4381,6 +4772,8 @@ func _spawn_enemy(type_id: String, position: Vector2, level: int, home: Vector2,
 	next_entity_id += 1
 	var radius := _enemy_radius(type_id)
 	var domain := str(combat.get("domain", "ground"))
+	if _is_vip_world() and domain != "air" and _position_hits_obstacle(position, radius):
+		position = _find_open_spawn_position(home, position, radius)
 	var altitude := 0.0
 	if type_id == "helicopter": altitude = 44.0
 	elif type_id == "bomber": altitude = 58.0
@@ -4720,6 +5113,8 @@ func _move_enemy(enemy: Dictionary, direction: Vector2, delta: float) -> void:
 		speed *= clamp(1.0 - float(enemy.get("slow_factor", 0.28)), 0.35, 1.0)
 	if float(enemy.get("soldier_suppression_ttl", 0.0)) > 0.0:
 		speed *= 1.0 - clampf(float(enemy.get("soldier_suppression_move_reduction", 0.0)), 0.0, 0.75)
+	if not _enemy_is_air(enemy):
+		speed *= _vip_movement_multiplier(Vector2(enemy["pos"]))
 	var motion := direction.limit_length(1.0) * speed * delta
 	var old_position: Vector2 = Vector2(enemy["pos"])
 	if _enemy_is_air(enemy):
@@ -5217,6 +5612,7 @@ func _update_soldiers(delta: float) -> void:
 		soldier["support_cd"] = max(0.0, float(soldier["support_cd"]) - delta)
 		soldier["revive_cd"] = max(0.0, float(soldier["revive_cd"]) - delta)
 		soldier["flash"] = max(0.0, float(soldier["flash"]) - delta)
+		soldier["animation_action_ttl"] = maxf(0.0, float(soldier.get("animation_action_ttl", 0.0)) - delta)
 		soldier["invuln"] = max(0.0, float(soldier["invuln"]) - delta)
 		soldier["soul_fatigue"] = max(0.0, float(soldier["soul_fatigue"]) - delta)
 		soldier["revive_reduction_ttl"] = max(0.0, float(soldier.get("revive_reduction_ttl", 0.0)) - delta)
@@ -5399,6 +5795,8 @@ func _update_healer(soldier: Dictionary, delta: float) -> bool:
 		var heal_result := _perform_soldier_heal(soldier, target, amount, true)
 		soldier["support_cd"] = 2.35 / maxf(0.1, float(soldier.get("support_rate", 1.0)))
 		soldier["state"] = "heal"
+		soldier["animation_action"] = "support"
+		soldier["animation_action_ttl"] = 0.42
 		_spawn_effect("heal", target_pos, HEAL_GREEN, 0.85)
 		_add_floater(target_pos + Vector2(0, -20), "+%d" % int(heal_result.get("effective", 0.0)), HEAL_GREEN, 0.9)
 		audio.play("heal", 0.42)
@@ -5473,6 +5871,8 @@ func _try_priest_combat_mark(priest: Dictionary) -> bool:
 		_spawn_effect("hit", enemies[enemy_index]["pos"], Color("B993FF"), 0.75)
 	_set_soldier_upgrade_cooldown(priest, "priest_mark", 4.0)
 	priest["state"] = "mark"
+	priest["animation_action"] = "support"
+	priest["animation_action_ttl"] = 0.48
 	return true
 
 
@@ -5846,6 +6246,8 @@ func _fire_soldier_attack(soldier: Dictionary, target_id: int) -> void:
 		return
 	if _enemy_is_air(enemy) and not _soldier_can_target_air(soldier):
 		return
+	soldier["animation_action"] = "attack"
+	soldier["animation_action_ttl"] = 0.30
 	var origin: Vector2 = soldier["pos"]
 	var target_position := Vector2(enemy["pos"])
 	var attack_context := _begin_soldier_attack(soldier, enemy, target_id, target_position)
@@ -6168,6 +6570,8 @@ func _nearest_enemy_excluding(position: Vector2, radius: float, excluded: Dictio
 func _attack_castle_with_soldier(soldier: Dictionary, castle: Dictionary) -> void:
 	var type_id := str(soldier["type"])
 	var combat: Dictionary = GameConfig.SOLDIERS[type_id]["combat"]
+	soldier["animation_action"] = "attack"
+	soldier["animation_action_ttl"] = 0.30
 	var origin: Vector2 = soldier["pos"]
 	var direction := (Vector2(castle["pos"]) - origin).normalized()
 	if direction.length_squared() < 0.01: direction = Vector2.RIGHT
@@ -6282,15 +6686,15 @@ func _soldier_tree_avoidance_direction(soldier: Dictionary, desired: Vector2) ->
 	var probe_distance := maxf(62.0, radius * 3.2)
 	var remembered := Vector2(soldier.get("avoid_dir", Vector2.ZERO))
 	if float(soldier.get("avoid_timer", 0.0)) > 0.0 and remembered.length_squared() > 0.01:
-		if not _segment_hits_environment_obstacle(position, position + remembered.normalized() * probe_distance, radius + 2.0):
+		if not _segment_hits_environment_obstacle(position, position + remembered.normalized() * probe_distance, radius + 2.0) and not _segment_hits_vip_blocked_ground(position, position + remembered.normalized() * probe_distance, radius + 2.0):
 			return remembered.normalized()
-	if not _segment_hits_environment_obstacle(position, position + desired * probe_distance, radius + 2.0):
+	if not _segment_hits_environment_obstacle(position, position + desired * probe_distance, radius + 2.0) and not _segment_hits_vip_blocked_ground(position, position + desired * probe_distance, radius + 2.0):
 		soldier["avoid_dir"] = Vector2.ZERO
 		return desired
 	var turn_sign := -1.0 if int(soldier.get("id", 0)) % 2 == 0 else 1.0
 	for signed_angle in [0.55 * turn_sign, -0.55 * turn_sign, 1.0 * turn_sign, -1.0 * turn_sign, 1.42 * turn_sign, -1.42 * turn_sign]:
 		var candidate := desired.rotated(float(signed_angle)).normalized()
-		if _segment_hits_environment_obstacle(position, position + candidate * probe_distance, radius + 2.0):
+		if _segment_hits_environment_obstacle(position, position + candidate * probe_distance, radius + 2.0) or _segment_hits_vip_blocked_ground(position, position + candidate * probe_distance, radius + 2.0):
 			continue
 		soldier["avoid_dir"] = candidate
 		soldier["avoid_timer"] = 0.55
@@ -6365,6 +6769,7 @@ func _move_soldier_toward(soldier: Dictionary, destination: Vector2, delta: floa
 	if distance_from_player > 0.01 and distance_from_player < desired_from_player:
 		separation += player_away.normalized() * (1.0 - distance_from_player / desired_from_player) * 0.7
 	var speed := float(soldier["speed"]) * speed_scale * _soldier_rally_move_multiplier(soldier)
+	speed *= _vip_movement_multiplier(Vector2(soldier["pos"]))
 	if python_boss != null:
 		speed *= float(python_boss.get_speed_multiplier("soldier", int(soldier["id"])))
 	var player_distance := Vector2(soldier["pos"]).distance_to(player["pos"])
@@ -6399,7 +6804,7 @@ func _damage_soldier(soldier: Dictionary, raw_damage: float, source_pos: Vector2
 		return
 	if _is_in_friendly_safe_zone(Vector2(soldier["pos"])):
 		return
-	var damage := raw_damage
+	var damage := raw_damage * _vip_damage_taken_multiplier(Vector2(soldier["pos"])) * _vip_ranged_damage_multiplier(source_pos, damage_kind)
 	if float(soldier.get("dash_reduction_ttl", 0.0)) > 0.0:
 		damage *= 1.0 - clampf(float(soldier.get("dash_damage_reduction", 0.0)), 0.0, 0.85)
 	if soldier["type"] == "heavy" and damage_kind in ["projectile", "area"]:
@@ -7070,7 +7475,7 @@ func _damage_enemy(index: int, raw_damage: float, source_pos: Vector2, damage_ki
 	if index < 0 or index >= enemies.size():
 		return 0.0
 	var enemy: Dictionary = enemies[index]
-	var damage := raw_damage
+	var damage := raw_damage * _vip_damage_taken_multiplier(Vector2(enemy["pos"])) * _vip_ranged_damage_multiplier(source_pos, damage_kind)
 	if float(enemy.get("enhancement_reactive_reduction", 0.0)) > 0.0 and float(enemy.get("enhancement_reactive_timer", 0.0)) <= 0.0 and damage_kind in ["projectile", "area", "beam"]:
 		damage *= 1.0 - clampf(float(enemy["enhancement_reactive_reduction"]), 0.0, 0.75)
 		enemy["enhancement_reactive_timer"] = maxf(1.0, float(enemy.get("enhancement_reactive_cooldown", 8.0)))
@@ -7521,15 +7926,19 @@ func _sort_projectile_hit_time(a: Dictionary, b: Dictionary) -> bool:
 
 
 func _find_open_spawn_position(anchor: Vector2, preferred: Vector2, radius: float, friendly_passage: bool = false) -> Vector2:
+	if not _position_hits_obstacle(preferred, radius, friendly_passage):
+		return preferred
 	var offset := preferred - anchor
 	var distance: float = maxf(90.0, offset.length())
 	var base_angle := offset.angle() if offset.length_squared() > 0.01 else 0.0
-	for ring in 4:
-		for step in 16:
-			var angle := base_angle + TAU * float(step) / 16.0
-			var candidate: Vector2 = anchor + Vector2.from_angle(angle) * (distance + float(ring) * 34.0)
+	for ring in 16:
+		for step in 24:
+			var angle := base_angle + TAU * float(step) / 24.0
+			var candidate: Vector2 = anchor + Vector2.from_angle(angle) * (distance + float(ring) * 46.0)
 			if not _position_hits_obstacle(candidate, radius, friendly_passage):
 				return candidate
+	if not _position_hits_obstacle(anchor, radius, friendly_passage):
+		return anchor
 	return preferred
 
 
@@ -7543,7 +7952,165 @@ func _obstacle_blocks_movement(obstacle: Dictionary) -> bool:
 	return str(obstacle.get("type", "")) == "tree"
 
 
+func _vip_cached_cell_at(position: Vector2) -> Dictionary:
+	if not _is_vip_world() or vip_world_generator == null:
+		return {}
+	var coord: Vector2i = vip_world_generator.world_to_chunk(position)
+	var key: String = vip_world_generator.chunk_key(coord)
+	if not vip_terrain_chunks.has(key):
+		return {}
+	var chunk: Dictionary = vip_terrain_chunks[key]
+	var origin := Vector2(chunk.get("origin", Vector2(coord) * WorldGenerator.CHUNK_SIZE))
+	var cell_count := maxi(1, int(chunk.get("grid_cells", 12)))
+	var spacing := float(chunk.get("sample_spacing", WorldGenerator.CHUNK_SIZE / float(cell_count)))
+	var local := position - origin
+	var cell_x := clampi(int(floor(local.x / spacing)), 0, cell_count - 1)
+	var cell_y := clampi(int(floor(local.y / spacing)), 0, cell_count - 1)
+	var cells: Array = Array(chunk.get("cells", []))
+	var index := cell_y * cell_count + cell_x
+	return Dictionary(cells[index]) if index >= 0 and index < cells.size() and cells[index] is Dictionary else {}
+
+
+func _vip_terrain_at(position: Vector2) -> Dictionary:
+	if _is_vip_world() and _vip_reserved_land_contains(position):
+		return {"terrain": "plains", "properties": VipTerrainCatalog.gameplay_properties("plains"), "reserved_clearing": true}
+	var cell := _vip_cached_cell_at(position)
+	if cell.is_empty():
+		return {"terrain": "plains", "properties": VipTerrainCatalog.gameplay_properties("plains")}
+	return cell
+
+
+func _vip_reserved_land_contains(position: Vector2, radius: float = 0.0) -> bool:
+	if position.distance_to(HOUSE_POS) <= HOUSE_SAFE_RADIUS + radius:
+		return true
+	for castle_value in castles.values():
+		var castle: Dictionary = castle_value
+		if position.distance_to(Vector2(castle.get("pos", Vector2.ZERO))) <= CASTLE_OUTER_COLLISION_RADIUS + 82.0 + radius:
+			return true
+	for camp_value in camps.values():
+		if position.distance_to(Vector2(Dictionary(camp_value).get("pos", Vector2.ZERO))) <= 145.0 + radius:
+			return true
+	for nest_value in snake_nests.values():
+		if position.distance_to(Vector2(Dictionary(nest_value).get("pos", Vector2.ZERO))) <= 330.0 + radius:
+			return true
+	for boss_home in [Vector2(GameConfig.PYTHON_BOSS_CONFIG["home_position"]), Vector2(GameConfig.CHAOS_BOSS_CONFIG["home_position"]), Vector2(GameConfig.AIONIS_BOSS_CONFIG["home_position"])]:
+		if position.distance_to(boss_home) <= 820.0 + radius:
+			return true
+	return false
+
+
+func _vip_blocked_strength_at(position: Vector2) -> float:
+	# Interpolate the same triangle samples used by the terrain mesh. Shore and
+	# mountain collision therefore follows the continuous surface instead of an
+	# invisible 80x80 cell boundary.
+	if not _is_vip_world() or vip_world_generator == null:
+		return 0.0
+	var coord: Vector2i = vip_world_generator.world_to_chunk(position)
+	var key: String = vip_world_generator.chunk_key(coord)
+	if not vip_terrain_chunks.has(key):
+		return 0.0
+	var chunk: Dictionary = vip_terrain_chunks[key]
+	var origin := Vector2(chunk.get("origin", Vector2(coord) * VipWorldGeneratorScript.CHUNK_SIZE))
+	var cell_count := maxi(1, int(chunk.get("grid_cells", VipWorldGeneratorScript.GRID_CELLS)))
+	var spacing := maxf(1.0, float(chunk.get("sample_spacing", VipWorldGeneratorScript.SAMPLE_SPACING)))
+	var local := position - origin
+	var cell_x := clampi(int(floor(local.x / spacing)), 0, cell_count - 1)
+	var cell_y := clampi(int(floor(local.y / spacing)), 0, cell_count - 1)
+	var u := clampf(local.x / spacing - float(cell_x), 0.0, 1.0)
+	var v := clampf(local.y / spacing - float(cell_y), 0.0, 1.0)
+	var vertices_per_row := cell_count + 1
+	var samples: Array = Array(chunk.get("samples", []))
+	var top_left := cell_y * vertices_per_row + cell_x
+	var top_right := top_left + 1
+	var bottom_left := top_left + vertices_per_row
+	var bottom_right := bottom_left + 1
+	if bottom_right >= samples.size():
+		return 0.0
+	var strength_tl := float(Dictionary(samples[top_left]).get("blocked_strength", 0.0))
+	var strength_tr := float(Dictionary(samples[top_right]).get("blocked_strength", 0.0))
+	var strength_bl := float(Dictionary(samples[bottom_left]).get("blocked_strength", 0.0))
+	var strength_br := float(Dictionary(samples[bottom_right]).get("blocked_strength", 0.0))
+	var global_x := coord.x * cell_count + cell_x
+	var global_y := coord.y * cell_count + cell_y
+	if ((global_x + global_y) & 1) == 0:
+		if v <= u:
+			return (1.0 - u) * strength_tl + (u - v) * strength_tr + v * strength_br
+		return (1.0 - v) * strength_tl + u * strength_br + (v - u) * strength_bl
+	if u + v <= 1.0:
+		return (1.0 - u - v) * strength_tl + u * strength_tr + v * strength_bl
+	return (1.0 - v) * strength_tr + (u + v - 1.0) * strength_br + (1.0 - u) * strength_bl
+
+
+func _vip_terrain_blocks_ground(position: Vector2, radius: float = 0.0) -> bool:
+	if not _is_vip_world() or _vip_reserved_land_contains(position, radius):
+		return false
+	var probes: Array[Vector2] = [position]
+	if radius > 1.0:
+		var probe_radius := radius * 0.72
+		probes.append(position + Vector2(probe_radius, 0.0))
+		probes.append(position + Vector2(-probe_radius, 0.0))
+		probes.append(position + Vector2(0.0, probe_radius))
+		probes.append(position + Vector2(0.0, -probe_radius))
+	for probe in probes:
+		if _vip_blocked_strength_at(probe) >= VipWorldGeneratorScript.BLOCK_THRESHOLD:
+			return true
+	return false
+
+
+func _vip_feature_blocks_ground(position: Vector2, radius: float) -> bool:
+	if not _is_vip_world() or vip_world_generator == null or _vip_reserved_land_contains(position, radius):
+		return false
+	var center: Vector2i = vip_world_generator.world_to_chunk(position)
+	for y in range(center.y - 1, center.y + 2):
+		for x in range(center.x - 1, center.x + 2):
+			var key: String = vip_world_generator.chunk_key(Vector2i(x, y))
+			if not vip_terrain_chunks.has(key):
+				continue
+			for feature_value in Array(Dictionary(vip_terrain_chunks[key]).get("feature_nodes", [])):
+				if not feature_value is Dictionary:
+					continue
+				var feature: Dictionary = feature_value
+				if bool(feature.get("blocks_ground", false)) and position.distance_to(Vector2(feature.get("position", Vector2.ZERO))) < radius + float(feature.get("radius", 0.0)):
+					return true
+	return false
+
+
+func _vip_movement_multiplier(position: Vector2) -> float:
+	if not _is_vip_world():
+		return 1.0
+	var properties: Dictionary = Dictionary(_vip_terrain_at(position).get("properties", {}))
+	return clampf(float(properties.get("movement_multiplier", 1.0)), 0.35, 1.0)
+
+
+func _vip_damage_taken_multiplier(position: Vector2) -> float:
+	if not _is_vip_world():
+		return 1.0
+	var properties: Dictionary = Dictionary(_vip_terrain_at(position).get("properties", {}))
+	return clampf(1.0 - float(properties.get("defense_bonus", 0.0)), 0.62, 1.22)
+
+
+func _vip_ranged_damage_multiplier(position: Vector2, damage_kind: String) -> float:
+	if not _is_vip_world() or damage_kind not in ["projectile", "beam", "area"]:
+		return 1.0
+	var properties: Dictionary = Dictionary(_vip_terrain_at(position).get("properties", {}))
+	return clampf(1.0 + float(properties.get("ranged_bonus", 0.0)), 0.76, 1.28)
+
+
+func _segment_hits_vip_blocked_ground(start: Vector2, finish: Vector2, radius: float) -> bool:
+	if not _is_vip_world():
+		return false
+	var distance := start.distance_to(finish)
+	var steps := clampi(int(ceil(distance / 44.0)), 1, 24)
+	for step in range(1, steps + 1):
+		var point := start.lerp(finish, float(step) / float(steps))
+		if _vip_terrain_blocks_ground(point, radius) or _vip_feature_blocks_ground(point, radius):
+			return true
+	return false
+
+
 func _position_hits_tree(position: Vector2, radius: float) -> bool:
+	if _is_vip_world():
+		return _vip_terrain_blocks_ground(position, radius) or _vip_feature_blocks_ground(position, radius)
 	var center := world_generator.world_to_chunk(position)
 	for y in range(center.y - 1, center.y + 2):
 		for x in range(center.x - 1, center.x + 2):
@@ -7557,6 +8124,14 @@ func _position_hits_tree(position: Vector2, radius: float) -> bool:
 
 
 func _segment_environment_hit_time(start: Vector2, finish: Vector2, radius: float) -> float:
+	if _is_vip_world():
+		var vip_steps := maxi(1, int(ceil(start.distance_to(finish) / maxf(8.0, radius))))
+		for vip_step in range(1, vip_steps + 1):
+			var vip_time := float(vip_step) / float(vip_steps)
+			var vip_point := start.lerp(finish, vip_time)
+			if _vip_terrain_blocks_ground(vip_point, radius) or _vip_feature_blocks_ground(vip_point, radius):
+				return vip_time
+		return 2.0
 	var earliest := 2.0
 	var min_point := Vector2(min(start.x, finish.x), min(start.y, finish.y)) - Vector2.ONE * radius
 	var max_point := Vector2(max(start.x, finish.x), max(start.y, finish.y)) + Vector2.ONE * radius
@@ -7606,17 +8181,20 @@ func _separate_position_from_units(position: Vector2, radius: float, units: Arra
 
 
 func _position_hits_obstacle(position: Vector2, radius: float, friendly_passage: bool = false) -> bool:
+	if _vip_terrain_blocks_ground(position, radius) or _vip_feature_blocks_ground(position, radius):
+		return true
 	var center := world_generator.world_to_chunk(position)
 	for y in range(center.y - 1, center.y + 2):
 		for x in range(center.x - 1, center.x + 2):
 			var key := world_generator.chunk_key(Vector2i(x, y))
 			if not active_chunks.has(key): continue
 			var chunk: Dictionary = active_chunks[key]
-			for obstacle in chunk["obstacles"]:
-				if not _obstacle_blocks_movement(obstacle):
-					continue
-				if Vector2(obstacle["position"]).distance_to(position) < float(obstacle["radius"]) + radius:
-					return true
+			if not _is_vip_world():
+				for obstacle in chunk["obstacles"]:
+					if not _obstacle_blocks_movement(obstacle):
+						continue
+					if Vector2(obstacle["position"]).distance_to(position) < float(obstacle["radius"]) + radius:
+						return true
 			if chunk["castle"] != null:
 				var castle_id := str(chunk["castle"]["id"])
 				var castle_pos: Vector2 = Vector2(castles[castle_id]["pos"]) if castles.has(castle_id) else Vector2(chunk["castle"]["position"])
@@ -8323,14 +8901,92 @@ func _update_visuals(delta: float) -> void:
 		if float(notifications[i]["ttl"]) <= 0.0: notifications.remove_at(i)
 
 
-func _save_game(show_notice: bool = true, path: String = GameSaveManager.SAVE_PATH) -> bool:
+func _current_save_path() -> String:
+	return VIP_SAVE_PATH if world_edition == WORLD_EDITION_VIP else GameSaveManager.SAVE_PATH
+
+
+func _resolved_save_path(path: String) -> String:
+	return _current_save_path() if path.is_empty() else path
+
+
+func _empty_vip_resources() -> Dictionary:
+	var result := {}
+	for resource_id in VIP_RESOURCE_KEYS:
+		result[resource_id] = 0
+	return result
+
+
+func _sanitize_vip_resources(value: Variant) -> Dictionary:
+	var result := _empty_vip_resources()
+	if typeof(value) != TYPE_DICTIONARY:
+		return result
+	var source: Dictionary = value
+	for resource_id in VIP_RESOURCE_KEYS:
+		var amount_value: Variant = source.get(resource_id, 0)
+		if typeof(amount_value) in [TYPE_INT, TYPE_FLOAT] and is_finite(float(amount_value)):
+			result[resource_id] = maxi(0, int(amount_value))
+	return result
+
+
+func _sanitize_vip_resource_remaining(value: Variant) -> Dictionary:
+	var result := {}
+	if typeof(value) != TYPE_DICTIONARY:
+		return result
+	var source: Dictionary = value
+	var accepted := 0
+	for raw_key in source.keys():
+		if accepted >= VIP_RESOURCE_STATE_LIMIT:
+			break
+		var resource_id := str(raw_key)
+		var amount_value: Variant = source[raw_key]
+		if resource_id.is_empty() or resource_id.length() > 160:
+			continue
+		if typeof(amount_value) not in [TYPE_INT, TYPE_FLOAT] or not is_finite(float(amount_value)) or not is_equal_approx(float(amount_value), float(int(amount_value))):
+			continue
+		result[resource_id] = clampi(int(amount_value), 0, VIP_RESOURCE_AMOUNT_LIMIT)
+		accepted += 1
+	return result
+
+
+func _vip_resources_are_valid(value: Variant) -> bool:
+	if typeof(value) != TYPE_DICTIONARY:
+		return false
+	var source: Dictionary = value
+	for resource_id in VIP_RESOURCE_KEYS:
+		if not source.has(resource_id) or not _is_integral_save_number(source[resource_id]) or int(source[resource_id]) < 0:
+			return false
+	return true
+
+
+func _vip_resource_remaining_is_valid(value: Variant) -> bool:
+	if typeof(value) != TYPE_DICTIONARY:
+		return false
+	var source: Dictionary = value
+	if source.size() > VIP_RESOURCE_STATE_LIMIT:
+		return false
+	for raw_key in source.keys():
+		var resource_id := str(raw_key)
+		var amount_value: Variant = source[raw_key]
+		if resource_id.is_empty() or resource_id.length() > 160:
+			return false
+		if typeof(amount_value) not in [TYPE_INT, TYPE_FLOAT] or not is_finite(float(amount_value)) or not is_equal_approx(float(amount_value), float(int(amount_value))):
+			return false
+		if int(amount_value) < 0 or int(amount_value) > VIP_RESOURCE_AMOUNT_LIMIT:
+			return false
+	return true
+
+
+func _save_game(show_notice: bool = true, path: String = "") -> bool:
 	if player["class_id"] == "": return false
-	if not _can_persist_to_path(path):
+	var resolved_path := _resolved_save_path(path)
+	if not _can_persist_to_path(resolved_path):
 		if show_notice:
 			_add_notification("測試場景不會覆寫玩家存檔。", Color("C9EDFF"), 2.2)
 		return false
 	var data := {
 		"schema": SAVE_SCHEMA,
+		"edition": world_edition,
+		"world_generation_version": VIP_WORLD_GENERATION_VERSION if world_edition == WORLD_EDITION_VIP else 0,
 		"world_seed": world_seed,
 		"game_time": game_time,
 		"player": player.duplicate(true),
@@ -8353,6 +9009,8 @@ func _save_game(show_notice: bool = true, path: String = GameSaveManager.SAVE_PA
 		"pending_chunk_spawns": pending_chunk_spawns.duplicate(true),
 		"settings": {"master_volume": master_volume, "muted": sound_muted, "tutorial": tutorial_visible, "notifications_hidden": notifications_hidden},
 		"soldier_research": soldier_research.duplicate(true),
+		"vip_resources": vip_resources.duplicate(true),
+		"vip_resource_remaining": vip_resource_remaining.duplicate(true),
 		"boss": {} if python_boss == null else python_boss.serialize(),
 		"chaos_boss": {} if chaos_boss == null else chaos_boss.serialize(),
 		"aionis_boss": {} if not timeless_gate_unlocked or aionis_boss == null else aionis_boss.serialize(),
@@ -8365,7 +9023,7 @@ func _save_game(show_notice: bool = true, path: String = GameSaveManager.SAVE_PA
 			"kaeron_ending_completed": kaeron_ending_completed,
 		},
 	}
-	var success := GameSaveManager.save_game(data, path)
+	var success := GameSaveManager.save_game(data, resolved_path)
 	if show_notice:
 		_add_notification("遊戲已儲存。" if success else "儲存失敗。", HEAL_GREEN if success else Color("FF857A"), 2.0)
 		if success: audio.play("ui", 0.5)
@@ -8373,14 +9031,17 @@ func _save_game(show_notice: bool = true, path: String = GameSaveManager.SAVE_PA
 
 
 func _can_persist_to_path(path: String) -> bool:
-	return not (_web_test_showcase_active and path == GameSaveManager.SAVE_PATH)
+	return not (_web_test_showcase_active and path in [GameSaveManager.SAVE_PATH, VIP_SAVE_PATH])
 
 
-func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
-	var data: Dictionary = GameSaveManager.load_game(path)
+func _load_game(path: String = "") -> bool:
+	var resolved_path := _resolved_save_path(path)
+	var data: Dictionary = GameSaveManager.load_game(resolved_path)
 	if not _is_valid_save_data(data):
 		_add_notification("找不到有效存檔。", Color("FF857A"), 2.2)
 		return false
+	var loaded_edition := str(data.get("edition", WORLD_EDITION_VIP if resolved_path == VIP_SAVE_PATH else WORLD_EDITION_FREE))
+	world_edition = WORLD_EDITION_VIP if loaded_edition == WORLD_EDITION_VIP else WORLD_EDITION_FREE
 	var loaded_lair_binding := _resolve_saved_python_boss_lair_binding(data)
 	var loaded_progression: Dictionary = Dictionary(data.get("progression", {}))
 	var loaded_schema := int(data.get("schema", 1))
@@ -8399,6 +9060,7 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 	_web_manual_time_hold = 0.0
 	world_seed = int(data.get("world_seed", 20260731))
 	world_generator = WorldGenerator.new(world_seed)
+	vip_world_generator = VipWorldGeneratorScript.new(world_seed)
 	game_time = float(data.get("game_time", 0.0))
 	player = Dictionary(data["player"]).duplicate(true)
 	if not player.has("upgrades"):
@@ -8423,6 +9085,10 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 	for entry in data.get("tombstones", []): tombstones.append(Dictionary(entry).duplicate(true))
 	drops = []
 	for entry in data.get("drops", []): drops.append(Dictionary(entry).duplicate(true))
+	vip_resources = _sanitize_vip_resources(data.get("vip_resources", {}))
+	vip_resource_remaining = _sanitize_vip_resource_remaining(data.get("vip_resource_remaining", {}))
+	vip_resource_tick = 0.0
+	vip_access_check_timer = 0.0
 	castles = Dictionary(data.get("castles", {})).duplicate(true)
 	for loaded_castle in castles.values():
 		var loaded_level := int(loaded_castle.get("level", 1))
@@ -8494,6 +9160,7 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 		aionis_boss.restore(Dictionary(data["aionis_boss"]))
 		aionis_boss_defeated = aionis_boss.is_defeated()
 	active_chunks.clear()
+	vip_terrain_chunks.clear()
 	projectiles.clear()
 	hazards.clear()
 	upgrade_effects.clear()
@@ -8510,9 +9177,27 @@ func _load_game(path: String = GameSaveManager.SAVE_PATH) -> bool:
 	camera_pos = player["pos"]
 	_last_active_center = Vector2i(999999, 999999)
 	_update_active_chunks(true)
+	_relocate_vip_ground_units()
 	_add_notification("存檔讀取完成。", HEAL_GREEN, 2.2)
 	audio.play("ui", 0.55)
 	return true
+
+
+func _relocate_vip_ground_units() -> void:
+	if not _is_vip_world():
+		return
+	for enemy in enemies:
+		if str(enemy.get("domain", "ground")) == "air":
+			continue
+		var enemy_position := Vector2(enemy.get("pos", Vector2.ZERO))
+		if _position_hits_obstacle(enemy_position, float(enemy.get("radius", 11.0))):
+			enemy["pos"] = _find_open_spawn_position(Vector2(enemy.get("home", enemy_position)), enemy_position, float(enemy.get("radius", 11.0)))
+	for soldier in soldiers:
+		if str(soldier.get("domain", "ground")) == "air":
+			continue
+		var soldier_position := Vector2(soldier.get("pos", Vector2.ZERO))
+		if _position_hits_obstacle(soldier_position, float(soldier.get("radius", 11.0)), true):
+			soldier["pos"] = _find_open_spawn_position(Vector2(player.get("pos", HOUSE_POS)), soldier_position, float(soldier.get("radius", 11.0)), true)
 
 
 func _normalize_loaded_enemy(loaded_enemy: Dictionary) -> void:
@@ -8598,6 +9283,15 @@ func _is_valid_save_data(data: Dictionary) -> bool:
 		return false
 	if schema >= 8 and not SoldierUpgradeCatalog.research_is_valid(data.get("soldier_research", {})):
 		return false
+	if schema >= 9:
+		if str(data.get("edition", "")) not in [WORLD_EDITION_FREE, WORLD_EDITION_VIP]:
+			return false
+		if not _is_integral_save_number(data.get("world_generation_version", -1)):
+			return false
+		if str(data["edition"]) == WORLD_EDITION_VIP and int(data["world_generation_version"]) != VIP_WORLD_GENERATION_VERSION:
+			return false
+		if not _vip_resources_are_valid(data.get("vip_resources", {})) or not _vip_resource_remaining_is_valid(data.get("vip_resource_remaining", {})):
+			return false
 	if schema >= 5:
 		if typeof(data["progression"]) != TYPE_DICTIONARY or typeof(data["chaos_boss"]) != TYPE_DICTIONARY:
 			return false
@@ -8986,13 +9680,16 @@ func _handle_ui_click(position: Vector2) -> bool:
 			# Touch browsers can emit a compatibility mouse press before the real
 			# screen-touch event. Consume that same physical press on the next screen
 			# so the centered Mage card is never chosen automatically.
-			_enter_class_select(true)
+			_begin_free_edition()
+			return true
+		if Rect2(title_rects["vip"]).has_point(position):
+			_request_vip_entry()
 			return true
 		if Rect2(title_rects["arena"]).has_point(position):
 			_enter_arena()
 			return true
 		if GameSaveManager.has_save() and Rect2(title_rects["load"]).has_point(position):
-			_load_game()
+			_load_free_edition()
 			return true
 		return false
 	if mode == GameMode.CLASS_SELECT:
@@ -9469,32 +10166,64 @@ func _draw_title_screen() -> void:
 	_draw_flag(c + Vector2(260, -145), ENEMY_RED, true, 1.5)
 	_draw_text("無盡軍勢", c + Vector2(0, -122), 54, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 600)
 	_draw_text("荒 原 遠 征", c + Vector2(0, -72), 25, GOLD, HORIZONTAL_ALIGNMENT_CENTER, 440)
-	_draw_text("程序生成的無限草原．動作戰鬥．軍隊養成．城堡征服", c + Vector2(0, -25), 18, Color("AFC7D6"), HORIZONTAL_ALIGNMENT_CENTER, 720)
+	_draw_text("免費荒原遠征．VIP 連續世界．動作戰鬥．軍隊養成", c + Vector2(0, -25), 18, Color("AFC7D6"), HORIZONTAL_ALIGNMENT_CENTER, 760)
+	var vip_state := _vip_snapshot()
+	var vip_status := "Your first VIP entry starts a free 24-hour trial" if language == "en" else "首次進入可免費試玩 24 小時"
+	if str(vip_state.get("state", "not_started")) == "active":
+		vip_status = ("VIP trial remaining %s" if language == "en" else "VIP 試玩剩餘 %s") % _format_duration(int(vip_state.get("remaining_seconds", 0)))
+	elif bool(vip_state.get("has_access", false)):
+		vip_status = "VIP Active" if language == "en" else "VIP 已啟用"
+	elif str(vip_state.get("state", "not_started")) == "expired":
+		vip_status = "VIP trial ended · Your save is preserved" if language == "en" else "VIP 試玩已結束・存檔仍保留"
+	_draw_text(vip_status, c + Vector2(0, 8), 15, Color("E9CC79") if bool(vip_state.get("has_access", false)) or str(vip_state.get("state", "")) == "not_started" else Color("A6A6A6"), HORIZONTAL_ALIGNMENT_CENTER, 720)
+	if not vip_title_message.is_empty():
+		_draw_text(vip_title_message, c + Vector2(0, 34), 14, Color("FFB2A8"), HORIZONTAL_ALIGNMENT_CENTER, 860)
 	var title_rects := _title_action_rects()
-	_draw_button(Rect2(title_rects["start"]), "開始遠征", FRIEND_BLUE)
+	_draw_button(Rect2(title_rects["start"]), "開始免費版", FRIEND_BLUE)
+	var vip_label := "VIP 版・24 小時免費試玩"
+	if GameSaveManager.has_save(VIP_SAVE_PATH) and bool(vip_state.get("has_access", false)):
+		vip_label = "繼續 VIP 版"
+	elif str(vip_state.get("state", "not_started")) == "expired" and not bool(vip_state.get("has_access", false)):
+		vip_label = "VIP 試玩已結束"
+	_draw_button(Rect2(title_rects["vip"]), vip_label, Color("D4A72C") if bool(vip_state.get("has_access", false)) or str(vip_state.get("state", "")) == "not_started" else Color("5C5C62"))
 	_draw_button(Rect2(title_rects["arena"]), "Arena" if language == "en" else "競技場", Color("8C6AB1"))
 	if GameSaveManager.has_save():
-		_draw_button(Rect2(title_rects["load"]), "讀取上次進度", Color("466B76"))
-	_draw_text("Enter / 點擊開始　　A 競技場　　F 全螢幕", Vector2(c.x, screen_size.y - 30), 15, Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, 620)
+		_draw_button(Rect2(title_rects["load"]), "讀取免費版進度", Color("466B76"))
+	_draw_text("Enter 免費版　V VIP 版　A 競技場　F 全螢幕", Vector2(c.x, screen_size.y - 24), 15, Color("7893A3"), HORIZONTAL_ALIGNMENT_CENTER, 680)
 
 
 func _title_action_rects() -> Dictionary:
 	var scale := touch_ui_coordinate_scale if _is_touch_scheme() else 1.0
+	if _is_touch_scheme() and screen_size.y / maxf(scale, 0.001) < 500.0:
+		var compact_gap := maxf(6.0, 8.0 * scale)
+		var compact_width := minf(264.0 * scale, (screen_size.x - compact_gap * 3.0) * 0.5)
+		var compact_height := maxf(44.0 * scale, 46.0)
+		var compact_total_width := compact_width * 2.0 + compact_gap
+		var compact_x := (screen_size.x - compact_total_width) * 0.5
+		var compact_y := minf(screen_size.y - compact_height * 2.0 - compact_gap - 20.0, screen_size.y * 0.56)
+		return {
+			"start": Rect2(compact_x, compact_y, compact_width, compact_height),
+			"vip": Rect2(compact_x + compact_width + compact_gap, compact_y, compact_width, compact_height),
+			"arena": Rect2(compact_x, compact_y + compact_height + compact_gap, compact_width, compact_height),
+			"load": Rect2(compact_x + compact_width + compact_gap, compact_y + compact_height + compact_gap, compact_width, compact_height),
+		}
 	var width := minf(screen_size.x - 24.0 * scale, 280.0 * scale)
 	var height := maxf(54.0, 44.0 * scale)
 	var gap := 6.0 * scale
-	var start_y := screen_size.y * 0.5 - 10.0 if _is_touch_scheme() else screen_size.y * 0.5 + 55.0
+	var start_y := screen_size.y * 0.5 + 30.0 if _is_touch_scheme() else screen_size.y * 0.5 + 42.0
 	var start_x := (screen_size.x - width) * 0.5
 	return {
 		"start": Rect2(start_x, start_y, width, height),
-		"arena": Rect2(start_x, start_y + height + gap, width, height),
-		"load": Rect2(start_x, start_y + (height + gap) * 2.0, width, height),
+		"vip": Rect2(start_x, start_y + height + gap, width, height),
+		"arena": Rect2(start_x, start_y + (height + gap) * 2.0, width, height),
+		"load": Rect2(start_x, start_y + (height + gap) * 3.0, width, height),
 	}
 
 
 func _draw_class_select() -> void:
 	draw_rect(Rect2(Vector2.ZERO, screen_size), Color("101E27"))
-	_draw_text("選擇新職業" if class_change_pending else "選擇你的遠征職業", Vector2(screen_size.x * 0.5, 72), 35, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 680)
+	var edition_label := "VIP 連續世界" if _is_vip_world() else "免費荒原世界"
+	_draw_text("選擇新職業" if class_change_pending else "選擇你的遠征職業・%s" % edition_label, Vector2(screen_size.x * 0.5, 72), 35, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 780)
 	_draw_text("金錢、等級、士兵、城池與 Boss 進度都會保留" if class_change_pending else "職業選定後可用 change 作弊碼保留進度切換", Vector2(screen_size.x * 0.5, 105), 16, Color("91A9B8"), HORIZONTAL_ALIGNMENT_CENTER, 760)
 	var card_width: float = min(330.0, (screen_size.x - 110.0) / 3.0)
 	var total: float = card_width * 3.0 + 24.0 * 2.0
@@ -9520,12 +10249,56 @@ func _draw_class_select() -> void:
 
 
 func _draw_world() -> void:
-	draw_rect(Rect2(Vector2.ZERO, screen_size), Color("527B4A"))
-	for chunk in active_chunks.values():
-		CampaignVisualRenderer.draw_wildland_chunk(
-			self, Dictionary(chunk), camera_pos, screen_size * 0.5 + camera_shake_offset,
-			1.0, Rect2(Vector2.ZERO, screen_size)
-		)
+	var viewport_rect := Rect2(Vector2.ZERO, screen_size)
+	if _is_vip_world():
+		draw_rect(viewport_rect, Color("174E72"))
+		var rendered_keys: Array[String] = []
+		var rendered_terrain_set: Dictionary = {}
+		var mesh_draw_count := 0
+		var triangle_count := 0
+		var feature_count := 0
+		var resource_count := 0
+		for vip_chunk_value in vip_terrain_chunks.values():
+			var vip_chunk: Dictionary = vip_chunk_value
+			var draw_result: Dictionary = VipTerrainRenderer.draw_chunk(
+				self, vip_chunk, camera_pos, screen_size * 0.5 + camera_shake_offset,
+				1.0, viewport_rect, vip_resource_remaining, true, false
+			)
+			if bool(draw_result.get("visible", false)):
+				rendered_keys.append(str(vip_chunk.get("key", "")))
+				mesh_draw_count += 1
+				triangle_count += int(vip_chunk.get("triangle_count", 0))
+				for terrain_value in Array(draw_result.get("terrain_types", [])):
+					rendered_terrain_set[str(terrain_value)] = true
+		for vip_chunk_value in vip_terrain_chunks.values():
+			var prop_result: Dictionary = VipTerrainRenderer.draw_chunk(
+				self, Dictionary(vip_chunk_value), camera_pos, screen_size * 0.5 + camera_shake_offset,
+				1.0, viewport_rect, vip_resource_remaining, false, true
+			)
+			if bool(prop_result.get("visible", false)):
+				feature_count += int(prop_result.get("feature_count", 0))
+				resource_count += int(prop_result.get("resource_count", 0))
+		var rendered_terrain_ids: Array = rendered_terrain_set.keys()
+		rendered_terrain_ids.sort()
+		vip_last_draw_trace = {
+			"renderer_id": VipTerrainRenderer.RENDERER_ID,
+			"profile_id": VipTerrainRenderer.PROFILE_ID,
+			"rendered_chunk_keys": rendered_keys,
+			"rendered_terrain_ids": rendered_terrain_ids,
+			"mesh_draw_count": mesh_draw_count,
+			"triangle_count": triangle_count,
+			"feature_count": feature_count,
+			"resource_count": resource_count,
+		}
+		_draw_vip_reserved_clearings()
+	else:
+		vip_last_draw_trace = {}
+		draw_rect(viewport_rect, Color("527B4A"))
+		for chunk in active_chunks.values():
+			CampaignVisualRenderer.draw_wildland_chunk(
+				self, Dictionary(chunk), camera_pos, screen_size * 0.5 + camera_shake_offset,
+				1.0, viewport_rect
+			)
 	_draw_aionis_arena_environment()
 	_draw_chaos_arena_environment()
 	_draw_python_nest_environment()
@@ -9544,6 +10317,23 @@ func _draw_world() -> void:
 	_draw_house(HOUSE_POS)
 	for camp in camps.values(): _draw_camp(camp)
 	for castle in castles.values(): _draw_castle(castle)
+
+
+func _draw_vip_reserved_clearings() -> void:
+	var clearings: Array[Dictionary] = [{"position": HOUSE_POS, "radius": HOUSE_SAFE_RADIUS + 45.0}]
+	for castle_value in castles.values():
+		clearings.append({"position": Vector2(Dictionary(castle_value).get("pos", Vector2.ZERO)), "radius": CASTLE_OUTER_COLLISION_RADIUS + 58.0})
+	for camp_value in camps.values():
+		clearings.append({"position": Vector2(Dictionary(camp_value).get("pos", Vector2.ZERO)), "radius": 135.0})
+	for nest_value in snake_nests.values():
+		clearings.append({"position": Vector2(Dictionary(nest_value).get("pos", Vector2.ZERO)), "radius": 285.0})
+	for clearing in clearings:
+		var center := _world_to_screen(Vector2(clearing["position"]))
+		var radius := float(clearing["radius"])
+		if not _on_screen(center, radius + 24.0):
+			continue
+		draw_circle(center, radius + 20.0, Color(VipTerrainCatalog.color_for("plains"), 0.28))
+		draw_circle(center, radius, Color(VipTerrainCatalog.color_for("plains"), 0.82))
 
 
 func _draw_aionis_arena_environment() -> void:
@@ -10023,7 +10813,8 @@ func _draw_units() -> void:
 			var aim := Vector2(player["facing"])
 			draw_line(p + aim * 23.0, p + aim * 52.0, Color(0.85, 0.96, 1.0, 0.56), 2.0)
 			draw_arc(p + aim * 58.0, 6.0, 0, TAU, 12, Color("EAF6FF"), 1.5)
-			_draw_character_icon(str(player["class_id"]), p, 1.0, Vector2(player["facing"]).angle(), float(player["flash"]) > 0.0)
+			if not CampaignVisualRenderer.draw_hero(self, player, p, game_time, "blue", 1.0, true):
+				_draw_character_icon(str(player["class_id"]), p, 1.0, Vector2(player["facing"]).angle(), float(player["flash"]) > 0.0)
 			draw_arc(p, 22.0, 0, TAU, 28, GOLD, 2.5)
 			if float(player.get("support_shield", 0.0)) > 0.0:
 				var player_shield_source := str(player.get("support_shield_source", "holy_shield"))
@@ -11618,8 +12409,9 @@ func _draw_particles_and_floaters() -> void:
 
 func _draw_hud() -> void:
 	# 左上：玩家狀態。
-	draw_rect(Rect2(18, 18, 315, 126), Color(0.025, 0.045, 0.06, 0.90))
-	draw_rect(Rect2(18, 18, 315, 126), PANEL_EDGE, false, 2.0)
+	var player_card_height := 170.0 if _is_vip_world() else 126.0
+	draw_rect(Rect2(18, 18, 315, player_card_height), Color(0.025, 0.045, 0.06, 0.90))
+	draw_rect(Rect2(18, 18, 315, player_card_height), Color("D4A72C") if _is_vip_world() else PANEL_EDGE, false, 2.0)
 	var hero_class_name: String = str(GameConfig.HERO_CLASSES[str(player["class_id"])]["name"])
 	_draw_text("Lv.%d  %s" % [int(player["level"]), hero_class_name], Vector2(34, 45), 19, Color("EAF6FF"))
 	_draw_text("$ %d" % int(player["money"]), Vector2(220, 45), 18, GOLD)
@@ -11629,6 +12421,19 @@ func _draw_hud() -> void:
 	_draw_text("XP %d / %d" % [int(player["xp"]), int(player["xp_need"])], Vector2(34, 115), 13, Color("B9DDF4"))
 	_draw_text("技能點 %d" % int(player["skill_points"]), Vector2(220, 115), 13, GOLD if int(player["skill_points"]) > 0 else Color("7893A3"))
 	_draw_text("擊殺 %d　城堡 %d" % [int(player["kills"]), int(player["captured"])], Vector2(34, 136), 12, Color("8FA8B7"))
+	if _is_vip_world():
+		var terrain_definition := VipTerrainCatalog.definition(vip_last_terrain_id)
+		var terrain_name := str(terrain_definition.get("name_en" if language == "en" else "name_zh", vip_last_terrain_id))
+		var access := {"remaining_seconds": VipAccessManagerScript.TRIAL_DURATION_SECONDS, "access_source": "test"} if _web_test_showcase_active else _vip_snapshot()
+		var remaining := int(access.get("remaining_seconds", 0))
+		var access_label := "Permanent" if remaining < 0 else _format_duration(remaining)
+		var terrain_line := "VIP · %s · %s" % [terrain_name, access_label]
+		_draw_text(terrain_line, Vector2(34, 157), 12, Color("F4D77D"))
+		var resource_line := ("W %d  S %d  Fe %d  Au %d  H %d  F %d  Sa %d  Cr %d" if language == "en" else "木%d 石%d 鐵%d 金%d 藥%d 魚%d 鹽%d 晶%d") % [
+			int(vip_resources.get("wood", 0)), int(vip_resources.get("stone", 0)), int(vip_resources.get("iron", 0)), int(vip_resources.get("gold", 0)),
+			int(vip_resources.get("herbs", 0)), int(vip_resources.get("fish", 0)), int(vip_resources.get("salt", 0)), int(vip_resources.get("crystal", 0)),
+		]
+		_draw_text(resource_line, Vector2(34, 178), 11, Color("CFE9C1"))
 
 	_draw_minimap(Rect2(screen_size.x - 230, 18, 212, 158), false)
 	if not _is_touch_scheme():
@@ -12196,13 +13001,31 @@ func _draw_minimap(rect: Rect2, large: bool) -> void:
 	draw_rect(rect, Color("587D82"), false, 2.0)
 	var scale := (0.055 if large else 0.032)
 	var center := rect.get_center()
-	# 已探索 Chunk。
-	for key in discovered_chunks.keys():
-		var parts := str(key).split(",")
-		if parts.size() != 2: continue
-		var chunk_center := Vector2(float(parts[0]) * WorldGenerator.CHUNK_SIZE + WorldGenerator.CHUNK_SIZE * 0.5, float(parts[1]) * WorldGenerator.CHUNK_SIZE + WorldGenerator.CHUNK_SIZE * 0.5)
-		var p := center + (chunk_center - Vector2(player["pos"])) * scale
-		if rect.grow(-3).has_point(p): draw_rect(Rect2(p - Vector2(3, 3), Vector2(6, 6)), Color(0.32, 0.52, 0.35, 0.55))
+	# VIP 使用已串流的低解析地形色；區塊僅是快取邊界，不畫邊框。
+	if _is_vip_world():
+		var map_bounds := rect.grow(-3.0)
+		for chunk_value in vip_terrain_chunks.values():
+			var chunk: Dictionary = chunk_value
+			var cells: Array = Array(chunk.get("cells", []))
+			var cell_count := maxi(1, int(chunk.get("grid_cells", 12)))
+			for cell_y in range(0, cell_count, 2):
+				for cell_x in range(0, cell_count, 2):
+					var index := cell_y * cell_count + cell_x
+					if index < 0 or index >= cells.size() or not cells[index] is Dictionary:
+						continue
+					var cell: Dictionary = cells[index]
+					var p := center + (Vector2(cell.get("center", Vector2.ZERO)) - Vector2(player["pos"])) * scale
+					if map_bounds.has_point(p):
+						var sample_size := maxf(2.0, float(chunk.get("sample_spacing", 80.0)) * scale * 2.05)
+						draw_rect(Rect2(p - Vector2.ONE * sample_size * 0.5, Vector2.ONE * sample_size), Color(cell.get("color", Color("69A94F"))))
+	else:
+		# 免費版保留原本已探索 Chunk 顯示。
+		for key in discovered_chunks.keys():
+			var parts := str(key).split(",")
+			if parts.size() != 2: continue
+			var chunk_center := Vector2(float(parts[0]) * WorldGenerator.CHUNK_SIZE + WorldGenerator.CHUNK_SIZE * 0.5, float(parts[1]) * WorldGenerator.CHUNK_SIZE + WorldGenerator.CHUNK_SIZE * 0.5)
+			var p := center + (chunk_center - Vector2(player["pos"])) * scale
+			if rect.grow(-3).has_point(p): draw_rect(Rect2(p - Vector2(3, 3), Vector2(6, 6)), Color(0.32, 0.52, 0.35, 0.55))
 	var house_p := center + (HOUSE_POS - Vector2(player["pos"])) * scale
 	if rect.has_point(house_p): draw_rect(Rect2(house_p - Vector2(4, 4), Vector2(8, 8)), Color("EAF6FF"))
 	for castle in castles.values():
@@ -12643,6 +13466,29 @@ func _run_self_test() -> void:
 	var origin_b := wg.generate_chunk(Vector2i.ZERO)
 	_test_assert(str(origin_a) == str(origin_b), "deterministic_chunk")
 	_test_assert(origin_a["house"] != null and origin_a["enemy_spawns"].is_empty(), "origin_safe_zone")
+	var vip_access_test := VipAccessManagerScript.self_test()
+	_test_assert(int(vip_access_test.get("failed", 1)) == 0 and int(vip_access_test.get("passed", 0)) == 12, "vip_access_trial_paid_expiry_and_clock_rollback_contract")
+	var vip_catalog_test := VipTerrainCatalog.catalog_self_test()
+	_test_assert(bool(vip_catalog_test.get("passed", false)) and VipTerrainCatalog.terrain_ids().size() == 10, "vip_catalog_has_ten_distinct_gameplay_terrains")
+	var vip_generator_test_instance := VipWorldGeneratorScript.new(20260731)
+	var vip_generator_test := vip_generator_test_instance.core_self_test()
+	_test_assert(bool(vip_generator_test.get("passed", false)) and Dictionary(vip_generator_test.get("terrain_found", {})).size() == 10, "vip_continuous_world_is_deterministic_seamless_and_covers_all_terrains")
+	var vip_prepared_test_chunk := VipTerrainRenderer.prepare_chunk(vip_generator_test_instance.build_chunk_data(Vector2i.ZERO))
+	var vip_test_mesh: ArrayMesh = vip_prepared_test_chunk.get("render_mesh") as ArrayMesh
+	_test_assert(vip_test_mesh != null and vip_test_mesh.get_surface_count() == 1 and VipTerrainRenderer.RENDERER_ID == "vip_continuous_terrain_v1", "vip_renderer_batches_each_chunk_into_one_colored_mesh")
+	var idle_animation := CampaignVisualRenderer.humanoid_animation_contract({"id": 7, "state": "idle", "vel": Vector2.ZERO, "facing": Vector2.RIGHT}, 1.0)
+	var walk_animation := CampaignVisualRenderer.humanoid_animation_contract({"id": 7, "state": "move", "vel": Vector2(120.0, 0.0), "facing": Vector2.RIGHT}, 1.0)
+	var attack_animation := CampaignVisualRenderer.humanoid_animation_contract({"id": 7, "state": "idle", "animation_action": "attack", "animation_action_ttl": 0.2, "facing": Vector2.RIGHT}, 1.0)
+	_test_assert(str(idle_animation.get("action", "")) == "idle" and str(walk_animation.get("action", "")) == "walk" and str(attack_animation.get("action", "")) == "attack" and Dictionary(walk_animation.get("joints", {})).size() == 7, "procedural_stick_rig_exposes_idle_walk_attack_and_seven_joints")
+	var edition_before_path_test := world_edition
+	world_edition = WORLD_EDITION_FREE
+	var free_path_test := _current_save_path()
+	world_edition = WORLD_EDITION_VIP
+	var vip_path_test := _current_save_path()
+	world_edition = edition_before_path_test
+	_test_assert(free_path_test == GameSaveManager.SAVE_PATH and vip_path_test == VIP_SAVE_PATH and free_path_test != vip_path_test, "vip_and_free_campaign_saves_are_isolated")
+	var invalid_vip_resource_state := {"node": "not-a-number"}
+	_test_assert(_vip_resources_are_valid(_empty_vip_resources()) and not _vip_resource_remaining_is_valid(invalid_vip_resource_state) and _sanitize_vip_resource_remaining(invalid_vip_resource_state).is_empty(), "vip_resource_wallet_and_node_state_validate_before_load")
 	var castle_chunk := wg.generate_chunk(Vector2i(5, 5))
 	_test_assert(castle_chunk["castle"] != null, "irregular_castle_milestone_anchor")
 	var milestone_levels := [20, 30, 35, 40, 45, 50]

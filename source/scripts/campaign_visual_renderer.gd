@@ -14,6 +14,7 @@ const PROFILE_ID := "campaign"
 const SOLDIER_RENDERER_ID := "campaign_soldier_v1"
 const HERO_RENDERER_ID := "campaign_hero_v1"
 const MAP_RENDERER_ID := "campaign_wildland_v1"
+const STICK_ANIMATION_PROFILE_ID := "procedural_stick_motion_v1"
 
 const BLUE := Color("3B82F6")
 const BLUE_DARK := Color("12365A")
@@ -30,6 +31,19 @@ const SUPPORTED_SOLDIER_TYPES: Array[String] = [
 	"swordsman", "healer", "archer", "roller", "mage", "heavy",
 	"priest", "cannon", "musketeer", "rifleman", "tank", "rocket",
 	"gatling", "helicopter", "bomber", "ufo",
+]
+
+const HUMANOID_SOLDIER_TYPES: Array[String] = [
+	"swordsman", "healer", "archer", "mage", "heavy", "priest",
+	"musketeer", "rifleman",
+]
+
+const HUMANOID_SUPPORT_STATES: Array[String] = [
+	"heal", "support", "revive_cast", "mark",
+]
+
+const HUMANOID_ATTACK_STATES: Array[String] = [
+	"attack", "charge", "charge_castle", "aim", "siege_attack",
 ]
 
 
@@ -56,6 +70,29 @@ static func supported_soldier_types() -> Array[String]:
 	return result
 
 
+static func humanoid_animation_contract(
+	unit: Dictionary,
+	time_seconds: float,
+	is_hero: bool = false,
+	visual_scale: float = 1.0
+) -> Dictionary:
+	## Read-only QA contract produced by the same articulated pose used to draw.
+	var facing := Vector2(unit.get("aim_dir", unit.get("facing", Vector2.RIGHT))).normalized()
+	if facing.length_squared() < 0.001:
+		facing = Vector2.RIGHT
+	var pose := _humanoid_pose(unit, Vector2.ZERO, facing, time_seconds, maxf(0.01, visual_scale), is_hero)
+	var joints := {}
+	for joint_name in ["pelvis", "chest", "head", "left_hand", "right_hand", "left_foot", "right_foot"]:
+		var point := Vector2(pose[joint_name])
+		joints[joint_name] = {"x": snappedf(point.x, 0.001), "y": snappedf(point.y, 0.001)}
+	return {
+		"profile_id": STICK_ANIMATION_PROFILE_ID,
+		"action": str(pose["action"]),
+		"phase": snappedf(float(pose["phase"]), 0.001),
+		"joints": joints,
+	}
+
+
 static func draw_soldier(
 	canvas: CanvasItem,
 	soldier: Dictionary,
@@ -72,7 +109,6 @@ static func draw_soldier(
 		return false
 	var scale := maxf(0.01, visual_scale)
 	var base_radius := maxf(1.0, float(soldier.get("radius", radius_for(type_id))))
-	var radius := base_radius * scale
 	var entity_id := int(soldier.get("id", 0))
 	var primary := _team_primary(team)
 	var dark := _team_dark(team)
@@ -163,42 +199,17 @@ static func draw_soldier(
 		for light_index in 5:
 			canvas.draw_circle(position + Vector2(-24.0 + float(light_index) * 12.0, 10.0) * scale, (3.5 + pulse) * scale, GOLD if light_index % 2 == 0 else Color("75E8FF"))
 		canvas.draw_circle(position + Vector2(0.0, 18.0) * scale, (10.0 + pulse * 3.0) * scale, Color(0.35, 0.9, 1.0, 0.42))
+	elif type_id in HUMANOID_SOLDIER_TYPES:
+		var facing := _unit_facing(soldier, team)
+		var humanoid_scale := scale * clampf(base_radius / 11.0, 0.82, 1.42)
+		_draw_humanoid_character(canvas, soldier, position, facing, type_id, color, primary, dark, time_seconds, humanoid_scale, false)
 	else:
 		var points := [Vector2(-base_radius, 4), Vector2(-base_radius * 0.7, -base_radius * 0.75), Vector2(0, -base_radius), Vector2(base_radius * 0.8, -base_radius * 0.55), Vector2(base_radius, 5), Vector2(0, base_radius)]
 		_draw_polygon_shape(canvas, position, points, 0.0, color, dark, 2.0 * scale, scale)
 		match type_id:
-			"swordsman":
-				canvas.draw_line(position + Vector2(6, 3) * scale, position + Vector2(17, -9) * scale, FLASH_COLOR, 2.5 * scale)
-				canvas.draw_line(position + Vector2(3, 0) * scale, position + Vector2(10, 7) * scale, GOLD, 2.0 * scale)
-			"healer":
-				canvas.draw_line(position + Vector2(-5, 0) * scale, position + Vector2(5, 0) * scale, HEAL_GREEN, 3.0 * scale)
-				canvas.draw_line(position + Vector2(0, -5) * scale, position + Vector2(0, 5) * scale, HEAL_GREEN, 3.0 * scale)
-			"archer":
-				canvas.draw_arc(position + Vector2(7, 0) * scale, 8.0 * scale, -1.1, 1.1, 10, Color("8B5A2B"), 1.6 * scale)
 			"roller":
 				canvas.draw_circle(position + Vector2(11, -2) * scale, 7.0 * scale, Color("778493"))
 				canvas.draw_line(position + Vector2(8, -5) * scale, position + Vector2(14, 1) * scale, Color("BFD0DA"), 1.0 * scale)
-			"mage":
-				canvas.draw_line(position + Vector2(4, 8) * scale, position + Vector2(11, -9) * scale, Color("8B5A2B"), 2.0 * scale)
-				canvas.draw_circle(position + Vector2(11, -9) * scale, 3.0 * scale, MAGIC_PURPLE)
-			"heavy":
-				_draw_polygon_shape(canvas, position + Vector2(-10, 0) * scale, [Vector2(-7, -10), Vector2(6, -9), Vector2(9, 5), Vector2(0, 11), Vector2(-8, 5)], 0.0, Color("A7B2BE"), dark, 1.6 * scale, scale)
-			"priest":
-				canvas.draw_arc(position, radius + 3.0 * scale, PI, TAU, 16, GOLD, 2.0 * scale)
-				canvas.draw_line(position + Vector2(8, 7) * scale, position + Vector2(14, -9) * scale, GOLD, 2.0 * scale)
-			"musketeer":
-				var facing := _unit_facing(soldier, team)
-				canvas.draw_line(position - facing * 8.0 * scale, position + facing * 31.0 * scale, Color("875B36"), 5.0 * scale)
-				canvas.draw_line(position + facing * 3.0 * scale, position + facing * 37.0 * scale, Color("E1E9ED"), 2.4 * scale)
-				canvas.draw_line(position + facing * 33.0 * scale, position + facing * 41.0 * scale, Color("FFFFFF"), 1.5 * scale)
-				canvas.draw_arc(position + Vector2(0, -8) * scale, 9.0 * scale, PI, TAU, 12, Color("725039"), 4.0 * scale)
-			"rifleman":
-				var facing := _unit_facing(soldier, team)
-				var side := Vector2(-facing.y, facing.x)
-				canvas.draw_circle(position + Vector2(0, -8) * scale, 7.0 * scale, Color("5D8E76"))
-				canvas.draw_line(position - facing * 7.0 * scale, position + facing * 31.0 * scale, Color("263136"), 5.0 * scale)
-				canvas.draw_line(position + facing * 6.0 * scale, position + facing * 35.0 * scale, Color("DCE8EA"), 1.8 * scale)
-				_draw_polygon_shape(canvas, position + facing * 4.0 * scale + side * 5.0 * scale, [Vector2(-3, -2), Vector2(4, -2), Vector2(6, 8), Vector2(-1, 9)], facing.angle(), Color("20282C"), dark, 1.0 * scale, scale)
 	return true
 
 
@@ -220,32 +231,339 @@ static func draw_hero(
 	var facing := Vector2(hero.get("aim_dir", hero.get("facing", Vector2.RIGHT))).normalized()
 	if facing.length_squared() < 0.001:
 		facing = Vector2.RIGHT if team != "red" else Vector2.LEFT
-	var rotation := facing.angle()
 	var dark := _team_dark(team)
+	var primary := _team_primary(team)
 	var main_color := FLASH_COLOR if float(hero.get("flash", 0.0)) > 0.0 else Color(GameConfig.HERO_CLASSES[class_id]["color"])
 	if draw_shadow:
 		_draw_ellipse_shadow(canvas, ground_screen_position + Vector2(5, 9) * scale, Vector2(17, 7) * scale)
-	match class_id:
-		"archer":
-			_draw_polygon_shape(canvas, ground_screen_position, [Vector2(-12, 0), Vector2(-8, -8), Vector2(2, -10), Vector2(12, 0), Vector2(2, 10), Vector2(-8, 8)], rotation, main_color, dark, 2.5 * scale, scale)
-			var bow_base := ground_screen_position + Vector2(0, -12).rotated(rotation) * scale
-			canvas.draw_arc(bow_base, 13.0 * scale, rotation - 1.1, rotation + 1.1, 12, Color("8B5A2B"), 2.2 * scale)
-			canvas.draw_line(ground_screen_position + Vector2(2, -24).rotated(rotation) * scale, ground_screen_position + Vector2(2, 0).rotated(rotation) * scale, FLASH_COLOR, 1.0 * scale)
-		"mage":
-			_draw_polygon_shape(canvas, ground_screen_position, [Vector2(-11, 9), Vector2(-13, -2), Vector2(-5, -12), Vector2(8, -10), Vector2(14, 2), Vector2(9, 11)], rotation, main_color, dark, 2.5 * scale, scale)
-			_draw_polygon_shape(canvas, ground_screen_position + Vector2(0, -12).rotated(rotation) * scale, [Vector2(-9, 4), Vector2(4, -14), Vector2(11, 5)], rotation, Color("6E58A8"), dark, 2.0 * scale, scale)
-			var orb := ground_screen_position + Vector2(18, -7).rotated(rotation) * scale
-			canvas.draw_line(ground_screen_position + Vector2(9, 7).rotated(rotation) * scale, orb, Color("8B5A2B"), 2.0 * scale)
-			canvas.draw_circle(orb, 4.0 * scale, MAGIC_PURPLE)
-		"warrior":
-			_draw_polygon_shape(canvas, ground_screen_position, [Vector2(-14, 9), Vector2(-15, -8), Vector2(-7, -13), Vector2(9, -12), Vector2(15, -5), Vector2(14, 10)], rotation, main_color, dark, 2.5 * scale, scale)
-			var shield := ground_screen_position + Vector2(-13, 0).rotated(rotation) * scale
-			_draw_polygon_shape(canvas, shield, [Vector2(-6, -10), Vector2(7, -8), Vector2(9, 3), Vector2(0, 12), Vector2(-8, 4)], rotation, Color("A7B2BE"), dark, 2.0 * scale, scale)
-			var sword_a := ground_screen_position + Vector2(8, 4).rotated(rotation) * scale
-			var sword_b := ground_screen_position + Vector2(23, -10).rotated(rotation) * scale
-			canvas.draw_line(sword_a, sword_b, FLASH_COLOR, 3.0 * scale)
-			canvas.draw_line(ground_screen_position + Vector2(5, 0).rotated(rotation) * scale, ground_screen_position + Vector2(14, 8).rotated(rotation) * scale, GOLD, 2.0 * scale)
+	_draw_humanoid_character(canvas, hero, ground_screen_position, facing, class_id, main_color, primary, dark, _time_seconds, scale * 1.38, true)
 	return true
+
+
+static func _draw_humanoid_character(
+	canvas: CanvasItem,
+	unit: Dictionary,
+	center: Vector2,
+	facing: Vector2,
+	role: String,
+	body_color: Color,
+	team_color: Color,
+	outline_color: Color,
+	time_seconds: float,
+	scale: float,
+	is_hero: bool
+) -> void:
+	var pose := _humanoid_pose(unit, center, facing, time_seconds, scale, is_hero)
+	var action := str(pose["action"])
+	var side := Vector2(-facing.y, facing.x)
+	var pelvis: Vector2 = pose["pelvis"]
+	var chest: Vector2 = pose["chest"]
+	var head: Vector2 = pose["head"]
+	var left_shoulder: Vector2 = pose["left_shoulder"]
+	var right_shoulder: Vector2 = pose["right_shoulder"]
+	var left_elbow: Vector2 = pose["left_elbow"]
+	var right_elbow: Vector2 = pose["right_elbow"]
+	var left_hand: Vector2 = pose["left_hand"]
+	var right_hand: Vector2 = pose["right_hand"]
+	var left_knee: Vector2 = pose["left_knee"]
+	var right_knee: Vector2 = pose["right_knee"]
+	var left_foot: Vector2 = pose["left_foot"]
+	var right_foot: Vector2 = pose["right_foot"]
+	var line_width := (2.35 if is_hero else 1.85) * scale
+	var joint_radius := (1.55 if is_hero else 1.22) * scale
+	var phase := float(pose["phase"])
+
+	# Motion reads from the silhouette first: dash trails, a compact hero cape,
+	# and support rings all sit behind the articulated body.
+	if action == "dash":
+		for trail_index in 3:
+			var spread := float(trail_index - 1) * 3.2 * scale
+			var trail_start := pelvis - facing * (8.0 + float(trail_index) * 3.0) * scale + side * spread
+			var trail_end := trail_start - facing * (9.0 + float(trail_index) * 2.0) * scale
+			canvas.draw_line(trail_start, trail_end, Color(team_color, 0.62 - float(trail_index) * 0.13), maxf(1.0, (2.4 - float(trail_index) * 0.45) * scale), true)
+	if is_hero:
+		var cape_points := PackedVector2Array([
+			left_shoulder - facing * 1.8 * scale,
+			pelvis - facing * 6.5 * scale + side * 4.7 * scale,
+			pelvis - facing * 9.0 * scale,
+			pelvis - facing * 6.5 * scale - side * 4.7 * scale,
+			right_shoulder - facing * 1.8 * scale,
+		])
+		canvas.draw_colored_polygon(cape_points, Color(outline_color, 0.78))
+		canvas.draw_polyline(PackedVector2Array([cape_points[0], cape_points[1], cape_points[2], cape_points[3], cape_points[4]]), Color(team_color, 0.74), 1.15 * scale, true)
+	if action == "support":
+		var support_color := GOLD if role == "priest" else (MAGIC_PURPLE if role == "mage" else HEAL_GREEN)
+		var support_pulse := 0.5 + 0.5 * sin(phase * 1.35)
+		canvas.draw_arc(chest, (7.5 + support_pulse * 2.5) * scale, 0.0, TAU, 18, Color(support_color, 0.34 + support_pulse * 0.28), 1.5 * scale, true)
+
+	_draw_stick_bone(canvas, pelvis, left_knee, body_color, outline_color, line_width)
+	_draw_stick_bone(canvas, left_knee, left_foot, body_color, outline_color, line_width)
+	_draw_stick_bone(canvas, pelvis, right_knee, body_color, outline_color, line_width)
+	_draw_stick_bone(canvas, right_knee, right_foot, body_color, outline_color, line_width)
+	_draw_stick_joint(canvas, left_knee, body_color, outline_color, joint_radius)
+	_draw_stick_joint(canvas, right_knee, body_color, outline_color, joint_radius)
+
+	# A tapered torso keeps the character readable as a stick figure without
+	# becoming a featureless line at the browser game's normal zoom level.
+	var torso_points := PackedVector2Array([
+		left_shoulder,
+		pelvis + side * 2.3 * scale,
+		pelvis - side * 2.3 * scale,
+		right_shoulder,
+	])
+	canvas.draw_colored_polygon(torso_points, body_color)
+	var closed_torso := PackedVector2Array(torso_points)
+	closed_torso.append(torso_points[0])
+	canvas.draw_polyline(closed_torso, outline_color, maxf(1.0, 1.35 * scale), true)
+	_draw_stick_bone(canvas, left_shoulder, left_elbow, body_color, outline_color, line_width)
+	_draw_stick_bone(canvas, left_elbow, left_hand, body_color, outline_color, line_width)
+	_draw_stick_bone(canvas, right_shoulder, right_elbow, body_color, outline_color, line_width)
+	_draw_stick_bone(canvas, right_elbow, right_hand, body_color, outline_color, line_width)
+	_draw_stick_joint(canvas, left_elbow, body_color, outline_color, joint_radius)
+	_draw_stick_joint(canvas, right_elbow, body_color, outline_color, joint_radius)
+
+	# Team belt and headband remain visible even when class colors overlap.
+	canvas.draw_line(pelvis + side * 2.6 * scale, pelvis - side * 2.6 * scale, team_color, maxf(1.0, 1.5 * scale), true)
+	var head_radius := (3.25 if is_hero else 2.7) * scale
+	canvas.draw_circle(head, head_radius + 1.0 * scale, outline_color)
+	canvas.draw_circle(head, head_radius, body_color.lightened(0.12))
+	canvas.draw_line(head + side * head_radius * 0.86 - facing * 0.2 * scale, head - side * head_radius * 0.86 - facing * 0.2 * scale, team_color, maxf(1.0, 1.1 * scale), true)
+	canvas.draw_circle(head + facing * head_radius * 0.62 - side * head_radius * 0.28, maxf(0.55, 0.62 * scale), FLASH_COLOR)
+	canvas.draw_circle(head + facing * head_radius * 0.62 + side * head_radius * 0.28, maxf(0.55, 0.62 * scale), FLASH_COLOR)
+
+	_draw_humanoid_equipment(canvas, role, pose, facing, body_color, team_color, outline_color, time_seconds, scale, is_hero)
+
+	if action == "hurt":
+		for spark_side in [-1.0, 1.0]:
+			var spark_center := head - facing * 1.5 * scale + side * float(spark_side) * 5.8 * scale
+			canvas.draw_line(spark_center - facing * 2.0 * scale, spark_center + facing * 2.0 * scale, Color("FFF2B6"), 1.2 * scale, true)
+			canvas.draw_line(spark_center - side * 1.8 * scale, spark_center + side * 1.8 * scale, Color("FFF2B6"), 1.2 * scale, true)
+
+
+static func _humanoid_pose(unit: Dictionary, center: Vector2, facing: Vector2, time_seconds: float, scale: float, is_hero: bool) -> Dictionary:
+	var side := Vector2(-facing.y, facing.x)
+	var entity_id := int(unit.get("id", 0))
+	var seed := float(abs(entity_id % 997)) * 0.071
+	var velocity := Vector2(unit.get("vel", Vector2.ZERO))
+	var speed_phase := clampf(velocity.length() / 70.0, 0.0, 4.0)
+	var phase := time_seconds * (5.5 + speed_phase) + seed
+	var state := str(unit.get("state", "idle")).to_lower()
+	var forced_action := str(unit.get("animation_action", "")).to_lower()
+	var forced_action_ttl := maxf(0.0, float(unit.get("animation_action_ttl", 0.0)))
+	var flash := maxf(0.0, float(unit.get("flash", 0.0)))
+	var dash_time := maxf(float(unit.get("dash_timer", 0.0)), float(unit.get("dash_reduction_ttl", 0.0)))
+	var hero_attack_time := maxf(float(unit.get("attack_cd", 0.0)), float(unit.get("cooldown", 0.0))) if is_hero else 0.0
+	var action := "idle"
+	if flash > 0.0:
+		action = "hurt"
+	elif dash_time > 0.0 or state.contains("dash"):
+		action = "dash"
+	elif forced_action_ttl > 0.0 and forced_action in ["attack", "support", "walk"]:
+		action = forced_action
+	elif state in HUMANOID_SUPPORT_STATES:
+		action = "support"
+	elif state in HUMANOID_ATTACK_STATES or hero_attack_time > 0.0:
+		action = "attack"
+	elif velocity.length_squared() > 9.0 or state in ["move", "approach", "retreat", "heal_move", "revive_move"]:
+		action = "walk"
+
+	var stride := 0.0
+	var arm_swing := 0.0
+	var lean := 0.0
+	var lateral_sway := 0.0
+	var bob := 0.0
+	var strike := 0.5 + 0.5 * sin(phase * 1.42)
+	match action:
+		"walk":
+			stride = sin(phase) * 2.7
+			arm_swing = -stride * 0.82
+			lateral_sway = cos(phase) * 0.52
+			bob = absf(sin(phase)) * 0.72
+		"attack":
+			lean = 1.5 + strike * 1.6
+			lateral_sway = (strike - 0.5) * 1.3
+			bob = sin(phase * 1.42) * 0.28
+		"support":
+			lean = 0.65
+			bob = 0.45 + sin(phase * 1.35) * 0.55
+		"hurt":
+			lean = -3.2
+			lateral_sway = 1.8 if entity_id % 2 == 0 else -1.8
+			stride = 1.4
+		"dash":
+			lean = 4.7
+			stride = sin(phase * 1.3) * 1.4
+			bob = 0.6
+		_:
+			bob = sin(time_seconds * 2.15 + seed) * 0.34
+
+	var body_center := center - Vector2(0.0, bob * scale)
+	var pelvis := body_center + facing * (-1.8 + lean) * scale + side * lateral_sway * 0.35 * scale
+	var chest := body_center + facing * (2.0 + lean) * scale + side * lateral_sway * scale
+	var breath := sin(time_seconds * 2.15 + seed) * 0.22
+	var head := chest + facing * (5.2 + breath) * scale
+	var left_shoulder := chest + side * 3.25 * scale
+	var right_shoulder := chest - side * 3.25 * scale
+
+	var left_foot := pelvis + facing * (-5.7 + stride) * scale + side * 3.25 * scale
+	var right_foot := pelvis + facing * (-5.7 - stride) * scale - side * 3.25 * scale
+	if action == "dash":
+		left_foot = pelvis - facing * 8.2 * scale + side * 4.0 * scale
+		right_foot = pelvis - facing * 10.5 * scale - side * 2.8 * scale
+	elif action == "hurt":
+		left_foot = pelvis - facing * 4.2 * scale + side * 5.4 * scale
+		right_foot = pelvis - facing * 6.5 * scale - side * 4.5 * scale
+	var left_knee := pelvis.lerp(left_foot, 0.53) + side * 0.85 * scale
+	var right_knee := pelvis.lerp(right_foot, 0.53) - side * 0.85 * scale
+
+	var left_hand := chest - facing * (2.1 - arm_swing) * scale + side * 5.2 * scale
+	var right_hand := chest - facing * (2.1 + arm_swing) * scale - side * 5.2 * scale
+	if action == "attack":
+		left_hand = chest + facing * (2.6 + strike * 1.4) * scale + side * (3.3 - strike * 1.1) * scale
+		right_hand = chest + facing * (4.8 + strike * 3.4) * scale - side * (4.6 - strike * 2.0) * scale
+	elif action == "support":
+		left_hand = chest + facing * (4.3 + sin(phase * 1.35) * 0.7) * scale + side * 4.6 * scale
+		right_hand = chest + facing * (4.3 + cos(phase * 1.35) * 0.7) * scale - side * 4.6 * scale
+	elif action == "hurt":
+		left_hand = chest - facing * 4.0 * scale + side * 6.3 * scale
+		right_hand = chest - facing * 2.2 * scale - side * 6.6 * scale
+	elif action == "dash":
+		left_hand = chest - facing * 3.3 * scale + side * 3.7 * scale
+		right_hand = chest + facing * 6.5 * scale - side * 2.2 * scale
+	var left_elbow := left_shoulder.lerp(left_hand, 0.5) + side * 1.0 * scale
+	var right_elbow := right_shoulder.lerp(right_hand, 0.5) - side * 1.0 * scale
+	var swing_angle := lerpf(-0.72, 0.66, strike)
+	var weapon_dir := facing.rotated(swing_angle)
+
+	return {
+		"action": action, "phase": phase, "strike": strike,
+		"pelvis": pelvis, "chest": chest, "head": head,
+		"left_shoulder": left_shoulder, "right_shoulder": right_shoulder,
+		"left_elbow": left_elbow, "right_elbow": right_elbow,
+		"left_hand": left_hand, "right_hand": right_hand,
+		"left_knee": left_knee, "right_knee": right_knee,
+		"left_foot": left_foot, "right_foot": right_foot,
+		"weapon_dir": weapon_dir,
+	}
+
+
+static func _draw_humanoid_equipment(
+	canvas: CanvasItem,
+	role: String,
+	pose: Dictionary,
+	facing: Vector2,
+	_body_color: Color,
+	team_color: Color,
+	outline_color: Color,
+	time_seconds: float,
+	scale: float,
+	is_hero: bool
+) -> void:
+	var side := Vector2(-facing.y, facing.x)
+	var action := str(pose["action"])
+	var strike := float(pose["strike"])
+	var phase := float(pose["phase"])
+	var chest: Vector2 = pose["chest"]
+	var head: Vector2 = pose["head"]
+	var left_hand: Vector2 = pose["left_hand"]
+	var right_hand: Vector2 = pose["right_hand"]
+	var weapon_dir: Vector2 = pose["weapon_dir"]
+	match role:
+		"swordsman", "warrior":
+			var blade_length := (14.5 if is_hero else 11.5) * scale
+			var blade_end := right_hand + weapon_dir * blade_length
+			canvas.draw_line(right_hand - weapon_dir * 1.8 * scale, blade_end, outline_color, (4.3 if is_hero else 3.5) * scale, true)
+			canvas.draw_line(right_hand, blade_end, FLASH_COLOR, (2.1 if is_hero else 1.7) * scale, true)
+			canvas.draw_line(right_hand - side * 2.6 * scale, right_hand + side * 2.6 * scale, GOLD, 1.5 * scale, true)
+			if role == "warrior":
+				_draw_humanoid_shield(canvas, left_hand, facing, side, team_color, outline_color, scale * 1.08)
+			if action == "attack":
+				canvas.draw_arc(chest + facing * 5.0 * scale, (11.0 if is_hero else 8.5) * scale, facing.angle() - 0.88, facing.angle() + 0.72, 12, Color(FLASH_COLOR, 0.35 + strike * 0.45), 1.7 * scale, true)
+		"heavy":
+			_draw_humanoid_shield(canvas, left_hand, facing, side, Color("A7B2BE"), outline_color, scale * 1.18)
+			var hammer_end := right_hand + weapon_dir * 9.0 * scale
+			canvas.draw_line(right_hand - weapon_dir * 3.0 * scale, hammer_end, Color("795130"), 2.4 * scale, true)
+			_draw_polygon_shape(canvas, hammer_end, [Vector2(-3.2, -4.4), Vector2(3.2, -4.4), Vector2(3.2, 4.4), Vector2(-3.2, 4.4)], weapon_dir.angle(), Color("B9C8D0"), outline_color, 1.0 * scale, scale)
+			if action == "attack":
+				canvas.draw_arc(chest + facing * 3.0 * scale, 9.5 * scale, facing.angle() - 0.8, facing.angle() + 0.6, 11, Color(GOLD, 0.58), 2.0 * scale, true)
+		"archer":
+			var bow_center := left_hand + facing * 0.8 * scale
+			var bow_radius := (8.0 if is_hero else 6.2) * scale
+			var bow_start_angle := facing.angle() - 1.18
+			var bow_end_angle := facing.angle() + 1.18
+			var bow_a := bow_center + Vector2.from_angle(bow_start_angle) * bow_radius
+			var bow_b := bow_center + Vector2.from_angle(bow_end_angle) * bow_radius
+			canvas.draw_arc(bow_center, bow_radius, bow_start_angle, bow_end_angle, 12, Color("9A642F"), 1.8 * scale, true)
+			canvas.draw_line(bow_a, right_hand, Color("EAF6FF"), maxf(0.7, 0.8 * scale), true)
+			canvas.draw_line(right_hand, bow_b, Color("EAF6FF"), maxf(0.7, 0.8 * scale), true)
+			var arrow_tip := right_hand + facing * (13.0 if action == "attack" else 9.5) * scale
+			canvas.draw_line(right_hand - facing * 3.0 * scale, arrow_tip, Color("D9F4FF"), 1.1 * scale, true)
+			_draw_polygon_shape(canvas, arrow_tip, [Vector2(-2.2, -1.5), Vector2(3.0, 0.0), Vector2(-2.2, 1.5)], facing.angle(), FLASH_COLOR, outline_color, 0.5 * scale, scale)
+		"mage":
+			var staff_tip := right_hand + facing * (10.5 if action != "hurt" else 7.0) * scale
+			canvas.draw_line(right_hand - facing * 5.0 * scale, staff_tip, Color("815632"), 2.2 * scale, true)
+			var orb_pulse := 0.55 + 0.45 * sin(time_seconds * 6.0 + phase * 0.17)
+			canvas.draw_circle(staff_tip, (3.5 + orb_pulse * 1.2) * scale, Color(MAGIC_PURPLE, 0.22 + orb_pulse * 0.25))
+			canvas.draw_circle(staff_tip, (2.2 + orb_pulse * 0.55) * scale, MAGIC_PURPLE)
+			_draw_polygon_shape(canvas, head - facing * 0.7 * scale, [Vector2(-4.2, 2.8), Vector2(1.0, -6.8), Vector2(5.0, 3.0)], facing.angle(), Color("6E58A8"), outline_color, 0.9 * scale, scale)
+		"healer":
+			var healer_tip := right_hand + facing * 9.0 * scale
+			canvas.draw_line(right_hand - facing * 5.0 * scale, healer_tip, Color("7C5A38"), 2.0 * scale, true)
+			canvas.draw_circle(healer_tip, 3.6 * scale, Color(HEAL_GREEN, 0.26))
+			canvas.draw_line(healer_tip - side * 2.5 * scale, healer_tip + side * 2.5 * scale, HEAL_GREEN, 1.7 * scale, true)
+			canvas.draw_line(healer_tip - facing * 2.5 * scale, healer_tip + facing * 2.5 * scale, HEAL_GREEN, 1.7 * scale, true)
+			if action == "support":
+				for hand_position in [left_hand, right_hand]:
+					canvas.draw_circle(Vector2(hand_position), (1.8 + 0.7 * sin(phase * 1.35)) * scale, Color("D9FFF0"))
+		"priest":
+			var priest_tip := right_hand + facing * 10.0 * scale
+			canvas.draw_line(right_hand - facing * 5.0 * scale, priest_tip, Color("8B653D"), 2.1 * scale, true)
+			canvas.draw_arc(priest_tip - side * 1.4 * scale, 3.5 * scale, facing.angle() - 0.2, facing.angle() + PI + 0.2, 10, GOLD, 1.8 * scale, true)
+			canvas.draw_arc(head, (4.5 + sin(phase * 0.8) * 0.35) * scale, 0.0, TAU, 16, Color(GOLD, 0.84), 1.2 * scale, true)
+			if action == "support":
+				canvas.draw_circle(left_hand, (2.1 + strike) * scale, Color(GOLD, 0.48))
+		"musketeer", "rifleman":
+			var recoil := (1.7 * strike if action == "attack" else 0.0) * scale
+			var stock_start := chest - facing * 6.0 * scale + side * 0.8 * scale
+			var barrel_end := chest + facing * ((17.5 if role == "rifleman" else 16.0) * scale - recoil)
+			canvas.draw_line(stock_start, barrel_end, outline_color, (4.5 if role == "rifleman" else 4.0) * scale, true)
+			canvas.draw_line(stock_start, chest + facing * 6.0 * scale, Color("855A35"), (2.9 if role == "musketeer" else 2.4) * scale, true)
+			canvas.draw_line(chest + facing * 4.0 * scale, barrel_end, Color("DCE8EA"), 1.55 * scale, true)
+			canvas.draw_circle(left_hand, 1.25 * scale, team_color)
+			canvas.draw_circle(right_hand, 1.25 * scale, team_color)
+			if role == "musketeer":
+				canvas.draw_arc(head - facing * 0.7 * scale, 4.3 * scale, facing.angle() + 0.18, facing.angle() + PI - 0.18, 10, Color("725039"), 2.2 * scale, true)
+			else:
+				canvas.draw_arc(head - facing * 0.4 * scale, 4.0 * scale, facing.angle(), facing.angle() + PI, 10, Color("5D8E76"), 2.5 * scale, true)
+			if action == "attack" and strike > 0.68:
+				var flash_tip := barrel_end + facing * 2.4 * scale
+				_draw_polygon_shape(canvas, flash_tip, [Vector2(-3.8, -2.0), Vector2(4.8, 0.0), Vector2(-3.8, 2.0)], facing.angle(), Color("FFF0A8"), FIRE_ORANGE, 0.7 * scale, scale)
+
+
+static func _draw_humanoid_shield(canvas: CanvasItem, center: Vector2, facing: Vector2, side: Vector2, fill_color: Color, outline_color: Color, scale: float) -> void:
+	var points := PackedVector2Array([
+		center + facing * 4.5 * scale,
+		center + side * 4.0 * scale,
+		center - facing * 3.3 * scale + side * 2.8 * scale,
+		center - facing * 4.5 * scale,
+		center - facing * 3.3 * scale - side * 2.8 * scale,
+		center - side * 4.0 * scale,
+	])
+	canvas.draw_colored_polygon(points, fill_color)
+	var closed := PackedVector2Array(points)
+	closed.append(points[0])
+	canvas.draw_polyline(closed, outline_color, maxf(1.0, 1.2 * scale), true)
+	canvas.draw_line(center - side * 2.2 * scale, center + side * 2.2 * scale, FLASH_COLOR, maxf(0.8, 0.9 * scale), true)
+
+
+static func _draw_stick_bone(canvas: CanvasItem, from: Vector2, to: Vector2, fill_color: Color, outline_color: Color, width: float) -> void:
+	canvas.draw_line(from, to, outline_color, width + maxf(1.1, width * 0.72), true)
+	canvas.draw_line(from, to, fill_color, width, true)
+
+
+static func _draw_stick_joint(canvas: CanvasItem, center: Vector2, fill_color: Color, outline_color: Color, radius: float) -> void:
+	canvas.draw_circle(center, radius + maxf(0.7, radius * 0.48), outline_color)
+	canvas.draw_circle(center, radius, fill_color)
 
 
 static func draw_wildland_chunk(
@@ -254,7 +572,8 @@ static func draw_wildland_chunk(
 	camera_world_position: Vector2,
 	screen_center: Vector2,
 	zoom: float,
-	viewport_rect: Rect2
+	viewport_rect: Rect2,
+	draw_ground: bool = true
 ) -> Dictionary:
 	var biome_data: Dictionary = Dictionary(chunk.get("biome", {}))
 	var result := {
@@ -276,7 +595,8 @@ static func draw_wildland_chunk(
 		return result
 	result["visible"] = true
 	var grass_color := _chunk_grass_color(chunk).lerp(Color("607D52"), 0.22)
-	canvas.draw_rect(chunk_screen_rect, grass_color)
+	if draw_ground:
+		canvas.draw_rect(chunk_screen_rect, grass_color)
 
 	var decoration_cull := viewport_rect.grow(30.0 * zoom)
 	for decoration_value in Array(chunk.get("decorations", [])):

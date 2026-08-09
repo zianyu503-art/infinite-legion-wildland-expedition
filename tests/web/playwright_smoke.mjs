@@ -6,9 +6,10 @@ import { pathToFileURL } from "node:url";
 const baseUrl = process.argv[2] || "http://127.0.0.1:8060/index.html";
 const artifactDir = process.argv[3] || "/tmp/infinite-legion-playwright";
 const moduleSpecifier = process.env.PLAYWRIGHT_CORE_MODULE || "playwright-core";
-const playwright = await import(
+const playwrightModule = await import(
   moduleSpecifier.startsWith("/") ? pathToFileURL(moduleSpecifier).href : moduleSpecifier
 );
+const playwright = playwrightModule.default || playwrightModule;
 const { chromium } = playwright;
 
 await fs.mkdir(artifactDir, { recursive: true });
@@ -26,6 +27,7 @@ const browserLaunchOptions = {
 };
 
 const results = [];
+const caseFilter = process.env.CASE_FILTER || "";
 
 function intersects(a, b) {
   return !(
@@ -135,7 +137,47 @@ async function clickLogical(page, state, rect) {
   await page.mouse.click(point.x, point.y);
 }
 
+const touchSessions = new WeakMap();
+
+async function withTouchDrag(page, state, rect, offset, action) {
+  let client = touchSessions.get(page);
+  if (!client) {
+    client = await page.context().newCDPSession(page);
+    touchSessions.set(page, client);
+  }
+  const start = await logicalPoint(page, state, rect);
+  const canvas = await page.locator("canvas").first().boundingBox();
+  assert.ok(canvas, "Godot canvas must have a browser bounding box");
+  const logicalWidth = state.input.logical_viewport_width || canvas.width;
+  const logicalHeight = state.input.logical_viewport_height || canvas.height;
+  const end = {
+    x: start.x + offset.x / (logicalWidth / canvas.width),
+    y: start.y + offset.y / (logicalHeight / canvas.height),
+  };
+  const touchPoint = [{ x: end.x, y: end.y, id: 71, radiusX: 4, radiusY: 4, force: 1 }];
+  const isMoveStick = end.x < canvas.x + canvas.width * 0.48;
+  // A real player can put a thumb down directly at any point inside a virtual
+  // stick. Starting at the directional point avoids Chromium coalescing the
+  // synthetic start+move pair while still exercising Godot's touch path.
+  await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: touchPoint });
+  await waitForState(page, (current) => isMoveStick
+    ? current.input?.virtual_controls?.move?.pointer >= 0 && Math.hypot(current.input?.move_x || 0, current.input?.move_y || 0) > 0.1
+    : current.input?.virtual_controls?.attack?.pointer >= 0 && current.input?.attack_held === true
+  );
+  try {
+    return await action();
+  } finally {
+    await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await waitForState(page, (current) => (
+      current.input?.virtual_controls?.move?.pointer === -1 &&
+      current.input?.virtual_controls?.attack?.pointer === -1 &&
+      current.input?.attack_held === false
+    ));
+  }
+}
+
 async function runCase(name, options, test) {
+	if (caseFilter && !name.includes(caseFilter)) return;
 	console.log(`[RUN] ${name}`);
   const userDataDir = await fs.mkdtemp(path.join(artifactDir, `${name}-profile-`));
   const context = await chromium.launchPersistentContext(userDataDir, {
@@ -202,6 +244,100 @@ await runCase(
     assert.equal(maxedState.soldier_upgrades.soldier_type_count, 16);
     assert.ok(Object.values(maxedState.soldier_upgrades.selected_research.base).every((rank) => rank > 0));
     assert.ok(Object.values(maxedState.soldier_upgrades.selected_research.special).every((rank) => rank === 3));
+  },
+);
+
+await runCase(
+  "desktop-en-vip-trial-entry",
+  { viewport: { width: 1280, height: 720 }, locale: "en-US", params: { lang: "en" } },
+  async (page) => {
+    await waitForState(page, (state) => state.mode === "title" && state.vip?.access?.state === "not_started");
+    await page.keyboard.press("v");
+    let state = await waitForState(page, (value) => value.mode === "class_select" && value.edition === "vip" && value.vip?.access?.state === "active");
+    assert.equal(state.vip.access.access_source, "trial");
+    assert.ok(state.vip.access.remaining_seconds > 86000 && state.vip.access.remaining_seconds <= 86400);
+    await page.keyboard.press("3");
+    state = await waitForState(page, (value) => value.mode === "playing" && value.vip?.enabled && value.vip?.visuals?.mesh_draw_count > 0);
+    assert.equal(state.player.class, "warrior");
+    assert.equal(state.vip.continuous_world, true);
+    assert.equal(state.vip.visuals.renderer_id, "vip_continuous_terrain_v1");
+    assert.equal(state.vip.animation.profile_id, "procedural_stick_motion_v1");
+  },
+);
+
+await runCase(
+  "vip-title-touch-568x320",
+  { viewport: { width: 568, height: 320 }, touch: true, locale: "zh-TW", params: {} },
+  async (page) => {
+    const state = await waitForState(page, (value) => value.mode === "title" && value.input?.scheme === "touch");
+    const actions = state.input.title_actions;
+    assert.deepEqual(Object.keys(actions).sort(), ["arena", "load", "start", "vip"]);
+    const scale = state.input.touch_ui_coordinate_scale;
+    const logicalWidth = state.input.logical_viewport_width;
+    const logicalHeight = state.input.logical_viewport_height;
+    for (const [name, rect] of Object.entries(actions)) {
+      assert.ok(rect.x >= 0 && rect.y >= 0, `${name} must start inside the title viewport`);
+      assert.ok(rect.x + rect.width <= logicalWidth + 0.5 && rect.y + rect.height <= logicalHeight + 0.5, `${name} must fit inside the short title viewport`);
+      assert.ok(rect.width / scale >= 43.9 && rect.height / scale >= 43.9, `${name} must remain at least 44 CSS px`);
+    }
+    const rects = Object.values(actions);
+    for (let left = 0; left < rects.length; left += 1) {
+      for (let right = left + 1; right < rects.length; right += 1) {
+        assert.equal(intersects(rects[left], rects[right]), false, "title actions must not overlap");
+      }
+    }
+  },
+);
+
+await runCase(
+  "vip-terrain-animation-touch-844x390",
+  {
+    viewport: { width: 844, height: 390 },
+    touch: true,
+    locale: "en-US",
+    params: { vip_scene: "combat", touch: "1", lang: "en" },
+  },
+  async (page) => {
+    let state = await waitForState(page, (value) => (
+      value.mode === "playing" &&
+      value.edition === "vip" &&
+      value.vip?.visuals?.mesh_draw_count > 0 &&
+      value.vip?.animation?.soldiers?.length === 8
+    ));
+    assert.equal(state.language, "en");
+    assert.equal(state.input.scheme, "touch");
+    assert.equal(state.vip.enabled, true);
+    assert.equal(state.vip.continuous_world, true);
+    assert.ok(state.vip.active_chunk_count >= 25);
+    assert.ok(state.vip.active_terrain_ids.length >= 4);
+    assert.equal(state.vip.visuals.renderer_id, "vip_continuous_terrain_v1");
+    assert.ok(state.vip.visuals.mesh_draw_count > 0);
+    assert.ok(state.vip.visuals.triangle_count >= state.vip.visuals.mesh_draw_count * 288);
+    assert.ok(state.vip.visuals.rendered_terrain_ids.length > 0);
+    assert.equal(state.vip.animation.profile_id, "procedural_stick_motion_v1");
+    assert.ok(state.vip.animation.soldiers.some((unit) => unit.action === "attack"));
+    assert.ok(state.vip.animation.soldiers.some((unit) => unit.action === "support"));
+    assert.ok(state.vip.animation.soldiers.every((unit) => Object.keys(unit.joints).length === 7));
+    assert.deepEqual(Object.keys(state.vip.resource_wallet).sort(), ["crystal", "fish", "gold", "herbs", "iron", "salt", "stone", "wood"]);
+
+    const controls = state.input.virtual_controls;
+    const xBefore = state.player.x;
+    const yBefore = state.player.y;
+    state = await withTouchDrag(page, state, controls.move, { x: controls.move.width * 0.34, y: 0 }, async () => {
+      await page.evaluate(() => window.advanceTime(500));
+      return await readState(page);
+    });
+    const displacement = Math.hypot(state.player.x - xBefore, state.player.y - yBefore);
+    assert.ok(displacement > 2, `VIP terrain must accept real virtual-stick movement: ${JSON.stringify({ displacement, xBefore, yBefore, xAfter: state.player.x, yAfter: state.player.y, moveX: state.input.move_x, moveY: state.input.move_y, pointer: state.input.virtual_controls.move.pointer, terrain: state.vip.current_terrain_id })}`);
+    assert.equal(state.vip.animation.hero.action, "walk");
+
+    state = await withTouchDrag(page, state, state.input.virtual_controls.attack, { x: state.input.virtual_controls.attack.width * 0.34, y: 0 }, async () => {
+      await page.evaluate(() => window.advanceTime(180));
+      return await readState(page);
+    });
+    assert.equal(state.input.attack_held, true, `attack stick must remain held during the action: ${JSON.stringify({ pointer: state.input.virtual_controls.attack.pointer, movePointer: state.input.virtual_controls.move.pointer, attackHeld: state.input.attack_held })}`);
+    assert.equal(state.vip.animation.hero.action, "attack");
+    assert.ok(state.player.attack_cooldown > 0 || state.projectiles.length > 0);
   },
 );
 

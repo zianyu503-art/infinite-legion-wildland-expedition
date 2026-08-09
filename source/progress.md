@@ -1,5 +1,16 @@
 Original prompt: 依照 `/Users/alex/.codex/attachments/573a9183-7335-45aa-b2d1-68325b99e124/pasted-text.txt` 的完整規格，製作可直接遊玩的 Godot 無限地圖 2D 動作戰鬥／軍隊養成遊戲，並提供繁體中文操作說明與終端開啟指令。使用者明確指定套用 develop-web-game、game-engine、web-games、2d-games、game-ai-behavior、combat-design、level-design、environment-art、character-design、game-art、vfx-realtime、game-audio、game-design 技能。
 
+## 2026-08-09：VIP 24 小時試玩、無縫地形與程序火柴人動畫
+
+- [x] 標題頁可分別進入免費版、VIP 版與競技場；首次主動進入 VIP 才啟動 24 小時免費試玩，付費權限保留未來接線 API，到期會先保存獨立 VIP 存檔再返回標題。
+- [x] 免費版與 VIP 版使用不同 Campaign 存檔；存檔升級至 Schema 9，保存世界版本、8 種 VIP 資源與資源節點狀態，舊存檔可遷移，壞檔與儲存失敗不會靜默消耗或遺失試玩進度。
+- [x] VIP 世界新增海洋、湖泊、河流、山脈、礦山、高原、沙漠、森林、沼澤、平原 10 種地形；以共享世界座標頂點色與三角網格連續混合，Chunk 只作串流快取，不顯示格線。
+- [x] 地形實際接入移速、防禦、遠程傷害、地面阻擋、投射物阻擋、特徵障礙、出生點修正、據點平原安全區、彩色小地圖、地形 HUD，以及木／石／鐵／金／藥草／魚／鹽／水晶採集與存檔。
+- [x] 3 種英雄與 8 種人形士兵改用同一套程序火柴人骨架；具備待機、行走、攻擊、支援、受傷與衝刺姿勢，武器、弓箭、法杖、槍械、治療與攻城動作會跟隨實際戰鬥狀態。
+- [x] 觸控短螢幕標題改為 2×2 按鈕；568×320 與 844×390 的側欄、雙虛擬搖桿、VIP HUD、強化按鈕與競技場仍保留至少 44 CSS px 觸控目標，且不互相遮擋。
+- [x] 公開站不暴露可繞過 VIP 時限的 QA 場景；測試入口只允許 localhost。Godot 4.6.3 deterministic self-test 276／276、真實 Chrome 桌面／觸控／英文／VIP／Arena 14／14 全部通過，console 0 errors。
+- [x] Web 成品已以 Godot 4.6.3 重新匯出並同步 Pages 根目錄；`index.pck` SHA-256：`f50acae97f5e04f7882c20b636c21fd506255f0cca5afe47bf3e663d4e15ccfa`，固定公開網址維持不變。
+
 ## 2026-08-08：`the best` 全兵種永久強化作弊碼
 
 - [x] 新增 `the best` 作弊碼；16 種兵種的 8 類基礎強化與所有相容特殊能力一次升至最高階。
