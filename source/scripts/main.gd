@@ -24,6 +24,7 @@ const PythonBossControllerScript = preload("res://scripts/python_boss.gd")
 const ChaosBossControllerScript = preload("res://scripts/chaos_boss.gd")
 const AionisBossControllerScript = preload("res://scripts/aionis_boss.gd")
 const CAVIAR_AVATAR_TEXTURE = preload("res://assets/ui/caviar_avatar.png")
+const UI_STEEL_TEXTURE = preload("res://assets/ui/textures/dark_blued_steel.png")
 const UI_FONT_PATH := "res://assets/fonts/NotoSansTC-Regular.otf"
 
 enum GameMode { TITLE, CLASS_SELECT, PLAYING, PAUSED, DEAD, ENDING, ARENA }
@@ -62,13 +63,16 @@ const VIP_RESOURCE_STATE_LIMIT := 8192
 const VIP_RESOURCE_AMOUNT_LIMIT := 1000000
 const VIP_RESOURCE_KEYS: Array[String] = ["wood", "stone", "iron", "gold", "herbs", "fish", "salt", "crystal"]
 const ENDING_DURATION := 9.6
-const TOUCH_STICK_MIN_RADIUS_CSS := 54.0
-const TOUCH_STICK_MAX_RADIUS_CSS := 62.0
+const TOUCH_STICK_MIN_RADIUS_CSS := 50.0
+const TOUCH_STICK_MAX_RADIUS_CSS := 54.0
 const TOUCH_SPECIAL_SIZE_CSS := 52.0
 const TOUCH_RAIL_BUTTON_SIZE_CSS := 44.0
 const TOUCH_EDGE_MARGIN_CSS := 8.0
 const TOUCH_RAIL_EDGE_CSS := 6.0
 const TOUCH_CLUSTER_GAP_CSS := 6.0
+const UI_FORGED_BRASS := Color("B9904F")
+const UI_FORGED_BRASS_LIGHT := Color("E0C27A")
+const UI_FORGED_INK := Color("091016")
 const CLASS_SELECT_POINTER_GUARD_MSEC := 420
 const HERO_LEVEL_CAP := 50
 const ENEMY_PREDICTION_MAX_LEAD := 220.0
@@ -12572,8 +12576,7 @@ func _draw_particles_and_floaters() -> void:
 func _draw_hud() -> void:
 	# 左上：玩家狀態。
 	var player_card_height := 170.0 if _is_vip_world() else 126.0
-	draw_rect(Rect2(18, 18, 315, player_card_height), Color(0.025, 0.045, 0.06, 0.90))
-	draw_rect(Rect2(18, 18, 315, player_card_height), Color("D4A72C") if _is_vip_world() else PANEL_EDGE, false, 2.0)
+	_draw_forged_panel(Rect2(18, 18, 315, player_card_height), Color("D4A72C") if _is_vip_world() else UI_FORGED_BRASS)
 	var hero_class_name: String = str(GameConfig.HERO_CLASSES[str(player["class_id"])]["name"])
 	_draw_text("Lv.%d  %s" % [int(player["level"]), hero_class_name], Vector2(34, 45), 19, Color("EAF6FF"))
 	_draw_text("$ %d" % int(player["money"]), Vector2(220, 45), 18, GOLD)
@@ -12614,12 +12617,10 @@ func _draw_hud() -> void:
 	# 下方 HUD 會依最後使用的輸入裝置自動切換版型。
 	if _is_touch_scheme():
 		var army_panel := Rect2(screen_size.x * 0.5 - 176.0, screen_size.y - 54.0, 352.0, 36.0)
-		draw_rect(army_panel, Color(0.025, 0.045, 0.06, 0.88))
-		draw_rect(army_panel, PANEL_EDGE, false, 1.5)
+		_draw_forged_panel(army_panel, UI_FORGED_BRASS, 1.5, false)
 		_draw_text("軍隊 %d / %d　命令：%s" % [soldiers.size(), _army_limit(), _soldier_command_display()], army_panel.position + Vector2(army_panel.size.x * 0.5, 24.0), 13, Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, army_panel.size.x - 16.0)
 	else:
-		draw_rect(Rect2(18, screen_size.y - 78, 610, 60), Color(0.025, 0.045, 0.06, 0.90))
-		draw_rect(Rect2(18, screen_size.y - 78, 610, 60), PANEL_EDGE, false, 2.0)
+		_draw_forged_panel(Rect2(18, screen_size.y - 78, 610, 60), UI_FORGED_BRASS)
 		_draw_text("軍隊 %d / %d　命令：%s" % [soldiers.size(), _army_limit(), _soldier_command_display()], Vector2(32, screen_size.y - 50), 15, Color("EAF6FF"))
 		_draw_text("1 跟隨　2 防守　3 攻擊　4 撤退　5 駐守　6 攻城", Vector2(32, screen_size.y - 27), 13, Color("8FB7CC"))
 
@@ -12893,11 +12894,10 @@ func _draw_touch_round_button(rect: Rect2, label: String, color: Color, pressed:
 	var center := rect.get_center()
 	var radius := minf(rect.size.x, rect.size.y) * 0.5
 	var base_color := color if enabled else Color("596168")
-	draw_circle(center + Vector2(0.0, 3.0 * scale), radius, Color(0.015, 0.025, 0.035, 0.72))
-	draw_circle(center, radius - 2.0 * scale, Color(base_color.darkened(0.60), 0.82 if enabled else 0.62))
+	_draw_forged_circle(center, radius, base_color, 0.88 if enabled else 0.62)
 	if pressed:
-		draw_circle(center, radius - 7.0 * scale, Color(base_color, 0.34))
-	draw_arc(center, radius - 2.0 * scale, 0.0, TAU, 32, Color(base_color.lightened(0.22), 0.95), 2.8 * scale, true)
+		draw_circle(center, radius - 7.0 * scale, Color(base_color, 0.30))
+	draw_arc(center, radius - 3.0 * scale, -2.80, -0.34, 22, Color(base_color.lightened(0.32), 0.82), 1.3 * scale, true)
 	_draw_text(label, center + Vector2(0.0, 6.0 * scale), maxi(12, roundi(14.0 * scale)), Color("F5FAFF") if enabled else Color("A2ABB0"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0 * scale)
 
 
@@ -12907,10 +12907,11 @@ func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color
 	var marker_distance := radius * 0.69
 	var marker_radius := maxf(8.0 * scale, radius * 0.155)
 	var knob_radius := maxf(19.0 * scale, radius * 0.33)
-	var alpha := 0.72 if active else 0.34
-	draw_circle(center + Vector2(0.0, 5.0 * scale), radius + 2.0 * scale, Color(0.01, 0.02, 0.025, 0.50))
-	draw_circle(center, radius, Color(0.025, 0.055, 0.07, alpha))
-	draw_arc(center, radius, 0.0, TAU, 42, Color(color, 0.74 if active else 0.45), 3.0 * scale, true)
+	# Keep the generated steel readable even at rest; the compact corner size is
+	# what protects the battlefield, so the material no longer needs to disappear.
+	var alpha := 0.88 if active else 0.72
+	_draw_forged_circle(center, radius + 2.0 * scale, color, alpha)
+	draw_arc(center, radius - 4.0 * scale, 0.0, TAU, 42, Color(UI_FORGED_BRASS, 0.82), 1.4 * scale, true)
 	for direction_value in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
 		var direction := Vector2(direction_value)
 		var marker_center: Vector2 = center + direction * marker_distance
@@ -12926,8 +12927,9 @@ func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color
 		draw_colored_polygon(arrow, Color("F5FAFF") if selected else Color(color.lightened(0.30), 0.92))
 	var knob_position := center + vector.limit_length(1.0) * (radius * 0.62)
 	draw_circle(knob_position + Vector2(0.0, 3.0 * scale), knob_radius + 2.0 * scale, Color(0.01, 0.02, 0.03, 0.62))
-	draw_circle(knob_position, knob_radius, Color(color.darkened(0.42), 0.96))
-	draw_arc(knob_position, knob_radius, 0.0, TAU, 28, Color(color.lightened(0.25), 0.95), 2.5 * scale, true)
+	draw_circle(knob_position, knob_radius, Color(color.darkened(0.48), 0.98))
+	draw_arc(knob_position, knob_radius, 0.0, TAU, 28, Color(UI_FORGED_BRASS_LIGHT, 0.92), 2.0 * scale, true)
+	draw_arc(knob_position, knob_radius - 3.0 * scale, -2.7, -0.45, 18, Color(color.lightened(0.45), 0.72), 1.2 * scale, true)
 	_draw_text(label, center + Vector2(0.0, -radius - 9.0 * scale), maxi(10, roundi(11.0 * scale)), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, radius * 2.0)
 
 
@@ -13174,8 +13176,8 @@ func _draw_castle_map_icon(position: Vector2, castle: Dictionary, large: bool) -
 
 
 func _draw_minimap(rect: Rect2, large: bool) -> void:
-	draw_rect(rect, Color(0.025, 0.055, 0.055, 0.94))
-	draw_rect(rect, Color("587D82"), false, 2.0)
+	_draw_forged_panel(rect, UI_FORGED_BRASS, 2.0, true)
+	draw_rect(rect.grow(-5.0), Color(0.015, 0.035, 0.035, 0.82))
 	var scale := (0.055 if large else 0.032)
 	var center := rect.get_center()
 	# VIP 使用已串流的低解析地形色；區塊僅是快取邊界，不畫邊框。
@@ -13581,9 +13583,43 @@ func _draw_text(text: String, baseline: Vector2, size: int, color: Color, alignm
 	draw_string(ui_font, draw_position, _localized(text), alignment, width, size, color)
 
 
+func _draw_forged_panel(rect: Rect2, edge_color: Color = UI_FORGED_BRASS, border_width: float = 2.0, rivets: bool = true) -> void:
+	# A quiet material layer gives panels physical depth without reducing text
+	# contrast. The generated steel asset is deliberately low-contrast.
+	draw_rect(Rect2(rect.position + Vector2(3.0, 5.0), rect.size), Color(0.0, 0.0, 0.0, 0.36))
+	draw_rect(rect, UI_FORGED_INK)
+	draw_texture_rect(UI_STEEL_TEXTURE, rect.grow(-3.0), false, Color(0.78, 0.84, 0.92, 0.70))
+	draw_rect(rect.grow(-3.0), Color(0.01, 0.02, 0.03, 0.38))
+	draw_rect(rect, Color(edge_color, 0.94), false, border_width)
+	draw_rect(rect.grow(-5.0), Color(UI_FORGED_BRASS_LIGHT, 0.26), false, maxf(1.0, border_width * 0.45))
+	draw_line(rect.position + Vector2(7.0, 4.0), Vector2(rect.end.x - 7.0, rect.position.y + 4.0), Color(0.86, 0.92, 0.96, 0.20), 1.0)
+	draw_line(Vector2(rect.position.x + 7.0, rect.end.y - 4.0), rect.end - Vector2(7.0, 4.0), Color(0.0, 0.0, 0.0, 0.45), 1.0)
+	if not rivets or rect.size.x < 52.0 or rect.size.y < 28.0:
+		return
+	for rivet_center in [
+		rect.position + Vector2(8.0, 8.0), Vector2(rect.end.x - 8.0, rect.position.y + 8.0),
+		Vector2(rect.position.x + 8.0, rect.end.y - 8.0), rect.end - Vector2(8.0, 8.0),
+	]:
+		draw_circle(rivet_center + Vector2(0.8, 1.2), 3.3, Color(0.0, 0.0, 0.0, 0.62))
+		draw_circle(rivet_center, 3.1, Color("6E5732"))
+		draw_circle(rivet_center - Vector2(0.8, 0.8), 1.35, UI_FORGED_BRASS_LIGHT)
+
+
+func _draw_forged_circle(center: Vector2, radius: float, accent: Color, alpha: float = 0.82) -> void:
+	draw_circle(center + Vector2(0.0, 4.0), radius + 1.0, Color(0.0, 0.0, 0.0, 0.48))
+	draw_circle(center, radius, Color(UI_FORGED_INK, alpha))
+	draw_circle(center, radius - 3.0, Color("18222B", alpha))
+	for grain_index in range(-4, 5):
+		var y := float(grain_index) * radius * 0.16
+		var half_width := sqrt(maxf(0.0, radius * radius - y * y)) * 0.82
+		draw_line(center + Vector2(-half_width, y), center + Vector2(half_width, y), Color(0.60, 0.70, 0.78, 0.045), 1.0)
+	draw_arc(center, radius, 0.0, TAU, 42, Color(UI_FORGED_BRASS, 0.94), 2.3, true)
+	draw_arc(center, radius - 3.0, -2.82, -0.30, 24, Color(accent.lightened(0.30), 0.72), 1.4, true)
+
+
 func _draw_button(rect: Rect2, label: String, color: Color, text_size: int = 15, border_width: float = 2.0) -> void:
-	draw_rect(rect, color.darkened(0.55), true)
-	draw_rect(rect, color, false, border_width)
+	_draw_forged_panel(rect, color.lightened(0.18), border_width, false)
+	draw_rect(rect.grow(-5.0), Color(color.darkened(0.42), 0.22))
 	_draw_text(label, rect.position + Vector2(rect.size.x * 0.5, rect.size.y * 0.67), text_size, Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, rect.size.x)
 
 

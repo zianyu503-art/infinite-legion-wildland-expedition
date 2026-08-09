@@ -45,7 +45,7 @@ function assertCampaignArenaVisuals(state, { expectHero = false } = {}) {
   assert.equal(visuals.profile, "campaign");
   assert.equal(visuals.soldier_renderer_id, "campaign_soldier_v2");
   assert.equal(visuals.hero_renderer_id, "campaign_hero_v2");
-  assert.equal(visuals.map_renderer_id, "campaign_wildland_v1");
+  assert.equal(visuals.map_renderer_id, "campaign_wildland_v2");
   assert.equal(visuals.map_source, "WorldGenerator");
   assert.equal(visuals.map_style, "campaign_wildland");
   assert.ok(Number.isInteger(visuals.world_seed));
@@ -530,6 +530,10 @@ for (const viewport of [
       state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
       await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
       await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === false);
+      if (viewport.width === 568) {
+        await page.evaluate(() => window.advanceTime(6500));
+        await page.screenshot({ path: path.join(artifactDir, "touch-568x320-design-qa.png") });
+      }
     },
   );
 }
