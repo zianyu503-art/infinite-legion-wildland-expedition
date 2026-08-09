@@ -62,8 +62,13 @@ const VIP_RESOURCE_STATE_LIMIT := 8192
 const VIP_RESOURCE_AMOUNT_LIMIT := 1000000
 const VIP_RESOURCE_KEYS: Array[String] = ["wood", "stone", "iron", "gold", "herbs", "fish", "salt", "crystal"]
 const ENDING_DURATION := 9.6
-const TOUCH_STICK_RADIUS := 74.0
-const TOUCH_BUTTON_SIZE := 82.0
+const TOUCH_STICK_MIN_RADIUS_CSS := 54.0
+const TOUCH_STICK_MAX_RADIUS_CSS := 62.0
+const TOUCH_SPECIAL_SIZE_CSS := 52.0
+const TOUCH_RAIL_BUTTON_SIZE_CSS := 44.0
+const TOUCH_EDGE_MARGIN_CSS := 8.0
+const TOUCH_RAIL_EDGE_CSS := 6.0
+const TOUCH_CLUSTER_GAP_CSS := 6.0
 const CLASS_SELECT_POINTER_GUARD_MSEC := 420
 const HERO_LEVEL_CAP := 50
 const ENEMY_PREDICTION_MAX_LEAD := 220.0
@@ -1548,12 +1553,17 @@ func render_game_to_text() -> String:
 	var aionis_marker_defeated: bool = aionis_boss_defeated or (aionis_boss != null and bool(aionis_boss.is_defeated()))
 	var aionis_marker_engaged: bool = aionis_boss != null and bool(aionis_boss.is_engaged())
 	var touch_utility_rects := _touch_utility_rects()
+	var touch_utility_handles := _touch_utility_handle_rects()
 	var touch_upgrade_test_rect := Rect2(touch_utility_rects.get("upgrades", Rect2()))
 	var touch_scale := maxf(0.001, touch_ui_coordinate_scale)
-	var touch_radius := TOUCH_STICK_RADIUS * touch_scale
+	var touch_radius := _touch_stick_radius()
 	var touch_move_rect := Rect2(_touch_move_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
 	var touch_attack_rect := Rect2(_touch_aim_center() - Vector2.ONE * touch_radius, Vector2.ONE * touch_radius * 2.0)
+	var touch_move_hit_rect := _touch_stick_hit_rect(_touch_move_center())
+	var touch_attack_hit_rect := _touch_stick_hit_rect(_touch_aim_center())
 	var touch_special_button_rect := _touch_special_rect()
+	var touch_gameplay_clear_rect := _touch_gameplay_clear_rect()
+	var touch_primary_controls_visible := _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty() and not touch_utility_drawer_open
 	var touch_utility_menu_rect := _touch_utility_menu_rect()
 	var touch_recruit_enabled := player_position.distance_to(HOUSE_POS) <= 185.0
 	if not touch_recruit_enabled:
@@ -1572,7 +1582,7 @@ func render_game_to_text() -> String:
 			"width": snappedf(action_rect.size.x, 0.1),
 			"height": snappedf(action_rect.size.y, 0.1),
 			"enabled": action != "recruit" or touch_recruit_enabled,
-			"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
+			"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty() and touch_utility_drawer_open,
 		}
 	var touch_close_rect := _touch_panel_close_rect()
 	var touch_recruit_controls: Array[Dictionary] = []
@@ -1658,27 +1668,43 @@ func render_game_to_text() -> String:
 				"y": snappedf(touch_upgrade_test_rect.position.y, 0.1),
 				"width": snappedf(touch_upgrade_test_rect.size.x, 0.1),
 				"height": snappedf(touch_upgrade_test_rect.size.y, 0.1),
-				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
+				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty() and touch_utility_drawer_open,
 			},
 			"virtual_controls": {
 				"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
 				"coordinate_space": "logical_viewport_pixels",
+				"layout_version": 3,
+				"gameplay_clear": {
+					"x": snappedf(touch_gameplay_clear_rect.position.x, 0.1), "y": snappedf(touch_gameplay_clear_rect.position.y, 0.1),
+					"width": snappedf(touch_gameplay_clear_rect.size.x, 0.1), "height": snappedf(touch_gameplay_clear_rect.size.y, 0.1),
+				},
 				"move": {
 					"x": snappedf(touch_move_rect.position.x, 0.1), "y": snappedf(touch_move_rect.position.y, 0.1),
 					"width": snappedf(touch_move_rect.size.x, 0.1), "height": snappedf(touch_move_rect.size.y, 0.1),
 					"center_x": snappedf(_touch_move_center().x, 0.1), "center_y": snappedf(_touch_move_center().y, 0.1),
 					"radius": snappedf(touch_radius, 0.1), "pointer": touch_move_pointer,
+					"visible": touch_primary_controls_visible,
+					"hit": {
+						"x": snappedf(touch_move_hit_rect.position.x, 0.1), "y": snappedf(touch_move_hit_rect.position.y, 0.1),
+						"width": snappedf(touch_move_hit_rect.size.x, 0.1), "height": snappedf(touch_move_hit_rect.size.y, 0.1),
+					},
 				},
 				"attack": {
 					"x": snappedf(touch_attack_rect.position.x, 0.1), "y": snappedf(touch_attack_rect.position.y, 0.1),
 					"width": snappedf(touch_attack_rect.size.x, 0.1), "height": snappedf(touch_attack_rect.size.y, 0.1),
 					"center_x": snappedf(_touch_aim_center().x, 0.1), "center_y": snappedf(_touch_aim_center().y, 0.1),
 					"radius": snappedf(touch_radius, 0.1), "pointer": touch_aim_pointer, "held": attack_held,
+					"visible": touch_primary_controls_visible,
+					"hit": {
+						"x": snappedf(touch_attack_hit_rect.position.x, 0.1), "y": snappedf(touch_attack_hit_rect.position.y, 0.1),
+						"width": snappedf(touch_attack_hit_rect.size.x, 0.1), "height": snappedf(touch_attack_hit_rect.size.y, 0.1),
+					},
 				},
 				"special": {
 					"x": snappedf(touch_special_button_rect.position.x, 0.1), "y": snappedf(touch_special_button_rect.position.y, 0.1),
 					"width": snappedf(touch_special_button_rect.size.x, 0.1), "height": snappedf(touch_special_button_rect.size.y, 0.1),
 					"enabled": int(player.get("level", 1)) >= 10,
+					"visible": touch_primary_controls_visible,
 				},
 				"utility_menu": {
 					"x": snappedf(touch_utility_menu_rect.position.x, 0.1), "y": snappedf(touch_utility_menu_rect.position.y, 0.1),
@@ -1686,7 +1712,22 @@ func render_game_to_text() -> String:
 					"visible": false,
 					"expanded": false,
 				},
-				"utility_layout": "dual_side_rails",
+				"utility_layout": "collapsible_dual_side_rails",
+				"utility_drawer_open": touch_utility_drawer_open,
+				"utility_handles": {
+					"left": {
+						"x": snappedf(Rect2(touch_utility_handles["left"]).position.x, 0.1), "y": snappedf(Rect2(touch_utility_handles["left"]).position.y, 0.1),
+						"width": snappedf(Rect2(touch_utility_handles["left"]).size.x, 0.1), "height": snappedf(Rect2(touch_utility_handles["left"]).size.y, 0.1),
+						"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
+						"mode": "close" if touch_utility_drawer_open else "open",
+					},
+					"right": {
+						"x": snappedf(Rect2(touch_utility_handles["right"]).position.x, 0.1), "y": snappedf(Rect2(touch_utility_handles["right"]).position.y, 0.1),
+						"width": snappedf(Rect2(touch_utility_handles["right"]).size.x, 0.1), "height": snappedf(Rect2(touch_utility_handles["right"]).size.y, 0.1),
+						"visible": _is_touch_scheme() and mode == GameMode.PLAYING and active_panel.is_empty(),
+						"mode": "close" if touch_utility_drawer_open else "open",
+					},
+				},
 				"utility": touch_utility_state,
 				"panel_close": {
 					"visible": _is_touch_scheme() and mode == GameMode.PLAYING and not active_panel.is_empty() and touch_close_rect.has_area(),
@@ -2218,45 +2259,105 @@ func _start_new_game(class_id: String, web_test_showcase: bool = false) -> void:
 	queue_redraw()
 
 
+func _touch_stick_radius() -> float:
+	var scale := maxf(0.001, touch_ui_coordinate_scale)
+	var css_size := screen_size / scale
+	var css_radius := clampf(
+		minf(css_size.y * 0.18, css_size.x * 0.105),
+		TOUCH_STICK_MIN_RADIUS_CSS,
+		TOUCH_STICK_MAX_RADIUS_CSS
+	)
+	return css_radius * scale
+
+
 func _touch_move_center() -> Vector2:
 	var scale := touch_ui_coordinate_scale
-	return Vector2(122.0 * scale, screen_size.y - 132.0 * scale)
+	var radius := _touch_stick_radius()
+	var horizontal_anchor := (TOUCH_RAIL_EDGE_CSS + TOUCH_RAIL_BUTTON_SIZE_CSS + TOUCH_CLUSTER_GAP_CSS) * scale
+	return Vector2(horizontal_anchor + radius, screen_size.y - TOUCH_EDGE_MARGIN_CSS * scale - radius)
 
 
 func _touch_aim_center() -> Vector2:
 	var scale := touch_ui_coordinate_scale
-	return Vector2(screen_size.x - 122.0 * scale, screen_size.y - 132.0 * scale)
+	var radius := _touch_stick_radius()
+	var horizontal_anchor := (TOUCH_RAIL_EDGE_CSS + TOUCH_RAIL_BUTTON_SIZE_CSS + TOUCH_CLUSTER_GAP_CSS) * scale
+	return Vector2(screen_size.x - horizontal_anchor - radius, screen_size.y - TOUCH_EDGE_MARGIN_CSS * scale - radius)
 
 
 func _touch_special_rect() -> Rect2:
 	var scale := touch_ui_coordinate_scale
-	return Rect2(Vector2(screen_size.x - 326.0 * scale, screen_size.y - 180.0 * scale), Vector2(92.0, 92.0) * scale)
+	var size := Vector2.ONE * TOUCH_SPECIAL_SIZE_CSS * scale
+	var handle_size := 48.0 * scale
+	var handle_y := clampf(screen_size.y * 0.5 - handle_size * 0.5, 4.0 * scale, screen_size.y - handle_size - 4.0 * scale)
+	var x := screen_size.x - (TOUCH_RAIL_EDGE_CSS + 48.0 + TOUCH_CLUSTER_GAP_CSS + TOUCH_SPECIAL_SIZE_CSS) * scale
+	var y := clampf(handle_y - 12.0 * scale, 4.0 * scale, screen_size.y - size.y - 4.0 * scale)
+	return Rect2(Vector2(x, y), size)
+
+
+func _touch_gameplay_clear_rect() -> Rect2:
+	# Controls live in two corner clusters. This full-height center corridor is
+	# intentionally free of buttons so the player, enemies and warnings remain
+	# visible even on a 568×320 phone.
+	var scale := touch_ui_coordinate_scale
+	var radius := _touch_stick_radius()
+	# Keep a one-CSS-pixel guard band beyond the forgiving stick hit regions.
+	# Besides preventing edge touches from steering, the gap remains stable after
+	# the Web debug-state coordinates are rounded for browser automation.
+	var left := _touch_move_center().x + radius + 9.0 * scale
+	var right := _touch_aim_center().x - radius - 9.0 * scale
+	return Rect2(left, 0.0, maxf(0.0, right - left), screen_size.y)
+
+
+func _touch_stick_hit_rect(center: Vector2) -> Rect2:
+	# Eight extra CSS pixels around the visible ring make thumb placement
+	# forgiving without extending into the button-free center corridor.
+	var hit_radius := _touch_stick_radius() + 8.0 * touch_ui_coordinate_scale
+	return Rect2(center - Vector2.ONE * hit_radius, Vector2.ONE * hit_radius * 2.0)
 
 
 func _touch_utility_rects() -> Dictionary:
-	# Permanent dual side rails keep the center of the battlefield clear. In CSS
-	# pixels each rail is exactly 44 wide with a two-pixel safety gap from the
-	# virtual-stick hit regions, including the 568x320 compact landscape case.
+	# Expandable dual side rails keep the center of the battlefield clear. Hit
+	# targets stay 44 CSS pixels while the visible circles are slightly inset.
 	var left_keys := ["upgrades", "recruit", "command", "skills", "map"]
 	var right_keys := ["guide", "notices", "cheat", "fullscreen", "pause"]
 	var result: Dictionary = {}
 	var scale := touch_ui_coordinate_scale
-	var button_size := 44.0 * scale
-	var pitch := 47.0 * scale
+	var button_size := TOUCH_RAIL_BUTTON_SIZE_CSS * scale
+	var pitch := 45.0 * scale
 	# 176 logical pixels is the bottom edge of the compact minimap. Adding four
 	# CSS pixels works for both expand-mode Web canvases and native touch windows.
 	var hud_bottom := 188.0 if _is_vip_world() else 176.0
-	var start_y := hud_bottom + 4.0 * scale
+	var requested_start_y := hud_bottom + 4.0 * scale
+	var total_height := button_size + pitch * float(left_keys.size() - 1)
+	var latest_start_y := screen_size.y - TOUCH_EDGE_MARGIN_CSS * scale - total_height
+	var start_y := maxf(4.0 * scale, minf(requested_start_y, latest_start_y))
 	for index in left_keys.size():
-		result[left_keys[index]] = Rect2(2.0 * scale, start_y + float(index) * pitch, button_size, button_size)
+		result[left_keys[index]] = Rect2(TOUCH_RAIL_EDGE_CSS * scale, start_y + float(index) * pitch, button_size, button_size)
 	for index in right_keys.size():
-		result[right_keys[index]] = Rect2(screen_size.x - 46.0 * scale, start_y + float(index) * pitch, button_size, button_size)
+		result[right_keys[index]] = Rect2(screen_size.x - (TOUCH_RAIL_EDGE_CSS + TOUCH_RAIL_BUTTON_SIZE_CSS) * scale, start_y + float(index) * pitch, button_size, button_size)
 	return result
 
 
+func _touch_utility_handle_rects() -> Dictionary:
+	# Two small edge handles replace ten permanent buttons during combat. Opening
+	# them is deliberate and temporary, so fingers and labels no longer form two
+	# opaque walls around a phone-sized battlefield.
+	var scale := touch_ui_coordinate_scale
+	var handle_size := 48.0 * scale
+	var y := clampf(screen_size.y * 0.5 - handle_size * 0.5, 4.0 * scale, screen_size.y - handle_size - 4.0 * scale)
+	var edge_x := TOUCH_RAIL_EDGE_CSS * scale
+	var open_x := (TOUCH_RAIL_EDGE_CSS + TOUCH_RAIL_BUTTON_SIZE_CSS + TOUCH_CLUSTER_GAP_CSS) * scale
+	var left_x := open_x if touch_utility_drawer_open else edge_x
+	var right_inset := (TOUCH_RAIL_EDGE_CSS + TOUCH_RAIL_BUTTON_SIZE_CSS + TOUCH_CLUSTER_GAP_CSS + 48.0) * scale if touch_utility_drawer_open else (TOUCH_RAIL_EDGE_CSS + 48.0) * scale
+	return {
+		"left": Rect2(left_x, y, handle_size, handle_size),
+		"right": Rect2(screen_size.x - right_inset, y, handle_size, handle_size),
+	}
+
+
 func _touch_utility_menu_rect() -> Rect2:
-	# Kept as an empty compatibility hook for older Web QA callers. The utility
-	# actions now live directly on the left and right rails and need no drawer.
+	# Kept as an empty compatibility hook for older Web QA callers. New callers
+	# use the explicit left/right handle rectangles above.
 	return Rect2()
 
 
@@ -2302,8 +2403,8 @@ func _soldier_upgrade_toggle_rect() -> Rect2:
 
 func _tutorial_panel_rect() -> Rect2:
 	if _is_touch_scheme():
-		# Side rails own the outer 46 CSS pixels. Centering the tutorial leaves both
-		# rails and both virtual sticks unobstructed on short landscape phones.
+		# Collapsible side actions own only the outer edge. Centering the tutorial
+		# leaves both handles and both virtual sticks unobstructed on short phones.
 		return Rect2(screen_size.x * 0.5 - 150.0, 158.0, 300.0, 154.0)
 	var tutorial_y := 158.0
 	if python_boss != null:
@@ -2357,30 +2458,59 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 		return true
 	if mode != GameMode.PLAYING or active_panel != "":
 		return false
+	var utility_handles := _touch_utility_handle_rects()
+	if not touch_utility_drawer_open:
+		for side_value in utility_handles.keys():
+			var side := str(side_value)
+			if not Rect2(utility_handles[side]).has_point(position):
+				continue
+			_reset_touch_inputs()
+			touch_utility_drawer_open = true
+			_mark_touch_feedback("utility_%s" % side)
+			audio.play("ui", 0.45)
+			queue_redraw()
+			return true
+	else:
+		for side_value in utility_handles.keys():
+			var side := str(side_value)
+			if not Rect2(utility_handles[side]).has_point(position):
+				continue
+			touch_utility_drawer_open = false
+			_mark_touch_feedback("utility_%s" % side)
+			audio.play("ui", 0.45)
+			queue_redraw()
+			return true
 	var utility_rects := _touch_utility_rects()
-	for action_value in utility_rects.keys():
-		var action := str(action_value)
-		if not Rect2(utility_rects[action]).has_point(position):
-			continue
-		_mark_touch_feedback(action)
-		match action:
-			"guide": tutorial_visible = not tutorial_visible
-			"map": active_panel = "map"
-			"skills": active_panel = "skills"
-			"upgrades":
-				active_panel = "soldier_upgrades"
-				soldier_upgrade_page = 0
-			"recruit":
-				if _is_near_recruitment():
-					active_panel = "recruit"
-				else:
-					_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
-			"command": active_panel = "command"
-			"notices": _toggle_notifications()
-			"cheat": _open_cheat_input()
-			"fullscreen": _toggle_fullscreen()
-			"pause": mode = GameMode.PAUSED
-		audio.play("ui", 0.45)
+	if touch_utility_drawer_open:
+		for action_value in utility_rects.keys():
+			var action := str(action_value)
+			if not Rect2(utility_rects[action]).has_point(position):
+				continue
+			touch_utility_drawer_open = false
+			_mark_touch_feedback(action)
+			match action:
+				"guide": tutorial_visible = not tutorial_visible
+				"map": active_panel = "map"
+				"skills": active_panel = "skills"
+				"upgrades":
+					active_panel = "soldier_upgrades"
+					soldier_upgrade_page = 0
+				"recruit":
+					if _is_near_recruitment():
+						active_panel = "recruit"
+					else:
+						_add_notification("需要靠近出生房屋或友方城堡。", Color("F6C177"), 2.0)
+				"command": active_panel = "command"
+				"notices": _toggle_notifications()
+				"cheat": _open_cheat_input()
+				"fullscreen": _toggle_fullscreen()
+				"pause": mode = GameMode.PAUSED
+			audio.play("ui", 0.45)
+			queue_redraw()
+			return true
+		# A tap outside either rail closes the temporary drawer without leaking
+		# through into movement, aiming or combat on the same touch event.
+		touch_utility_drawer_open = false
 		queue_redraw()
 		return true
 	if _touch_special_rect().has_point(position):
@@ -2393,7 +2523,7 @@ func _handle_touch_action_at(position: Vector2) -> bool:
 func _update_touch_move(position: Vector2) -> void:
 	touch_move_position = position
 	var scale := touch_ui_coordinate_scale
-	var radius := TOUCH_STICK_RADIUS * scale
+	var radius := _touch_stick_radius()
 	var deadzone := 10.0 * scale
 	var offset := (position - _touch_move_center()).limit_length(radius)
 	var magnitude := offset.length()
@@ -2406,7 +2536,7 @@ func _update_touch_move(position: Vector2) -> void:
 func _update_touch_aim(position: Vector2) -> void:
 	touch_aim_position = position
 	var scale := touch_ui_coordinate_scale
-	var offset := (position - _touch_aim_center()).limit_length(TOUCH_STICK_RADIUS * scale)
+	var offset := (position - _touch_aim_center()).limit_length(_touch_stick_radius())
 	if offset.length() >= 8.0 * scale:
 		touch_aim_vector = offset.normalized()
 	attack_held = true
@@ -2437,15 +2567,17 @@ func _handle_screen_touch(event: InputEventScreenTouch) -> void:
 	if mode != GameMode.PLAYING or active_panel != "":
 		_handle_ui_click(event.position)
 		return
-	if python_boss != null and python_boss.is_rooted("player", 0) and event.position.x >= screen_size.x * 0.48:
+	var move_hit_rect := _touch_stick_hit_rect(_touch_move_center())
+	var aim_hit_rect := _touch_stick_hit_rect(_touch_aim_center())
+	if python_boss != null and python_boss.is_rooted("player", 0) and aim_hit_rect.has_point(event.position):
 		python_boss.register_break_click(_player_damage(1.0))
 		_spawn_effect("hit", player["pos"], Color("DDA6FF"), 0.55)
 		return
-	if event.position.x < screen_size.x * 0.48 and event.position.y > screen_size.y * 0.38 and touch_move_pointer < 0:
+	if move_hit_rect.has_point(event.position) and touch_move_pointer < 0:
 		touch_move_pointer = event.index
 		_update_touch_move(event.position)
 		return
-	if event.position.y > screen_size.y * 0.38 and touch_aim_pointer < 0:
+	if aim_hit_rect.has_point(event.position) and touch_aim_pointer < 0:
 		touch_aim_pointer = event.index
 		_update_touch_aim(event.position)
 		return
@@ -12771,29 +12903,32 @@ func _draw_touch_round_button(rect: Rect2, label: String, color: Color, pressed:
 
 func _draw_touch_joystick(center: Vector2, vector: Vector2, label: String, color: Color, active: bool) -> void:
 	var scale := touch_ui_coordinate_scale
-	var radius := TOUCH_STICK_RADIUS * scale
-	var alpha := 0.72 if active else 0.48
+	var radius := _touch_stick_radius()
+	var marker_distance := radius * 0.69
+	var marker_radius := maxf(8.0 * scale, radius * 0.155)
+	var knob_radius := maxf(19.0 * scale, radius * 0.33)
+	var alpha := 0.72 if active else 0.34
 	draw_circle(center + Vector2(0.0, 5.0 * scale), radius + 2.0 * scale, Color(0.01, 0.02, 0.025, 0.50))
 	draw_circle(center, radius, Color(0.025, 0.055, 0.07, alpha))
 	draw_arc(center, radius, 0.0, TAU, 42, Color(color, 0.74 if active else 0.45), 3.0 * scale, true)
 	for direction_value in [Vector2.UP, Vector2.RIGHT, Vector2.DOWN, Vector2.LEFT]:
 		var direction := Vector2(direction_value)
-		var marker_center: Vector2 = center + direction * 52.0 * scale
+		var marker_center: Vector2 = center + direction * marker_distance
 		var perpendicular := Vector2(-direction.y, direction.x)
 		var selected := active and vector.length_squared() > 0.04 and vector.normalized().dot(direction) > 0.55
-		draw_circle(marker_center, 12.0 * scale, Color(color.darkened(0.62), 0.84 if selected else 0.58))
-		draw_arc(marker_center, 12.0 * scale, 0.0, TAU, 20, Color(color, 0.95 if selected else 0.62), 1.8 * scale, true)
+		draw_circle(marker_center, marker_radius, Color(color.darkened(0.62), 0.84 if selected else 0.58))
+		draw_arc(marker_center, marker_radius, 0.0, TAU, 20, Color(color, 0.95 if selected else 0.62), 1.8 * scale, true)
 		var arrow := PackedVector2Array([
-			marker_center + direction * 8.0 * scale,
-			marker_center - direction * 5.0 * scale + perpendicular * 6.0 * scale,
-			marker_center - direction * 5.0 * scale - perpendicular * 6.0 * scale,
+			marker_center + direction * marker_radius * 0.68,
+			marker_center - direction * marker_radius * 0.42 + perpendicular * marker_radius * 0.50,
+			marker_center - direction * marker_radius * 0.42 - perpendicular * marker_radius * 0.50,
 		])
 		draw_colored_polygon(arrow, Color("F5FAFF") if selected else Color(color.lightened(0.30), 0.92))
 	var knob_position := center + vector.limit_length(1.0) * (radius * 0.62)
-	draw_circle(knob_position + Vector2(0.0, 3.0 * scale), 29.0 * scale, Color(0.01, 0.02, 0.03, 0.62))
-	draw_circle(knob_position, 27.0 * scale, Color(color.darkened(0.42), 0.96))
-	draw_arc(knob_position, 27.0 * scale, 0.0, TAU, 28, Color(color.lightened(0.25), 0.95), 2.5 * scale, true)
-	_draw_text(label, center + Vector2(0.0, -radius - 12.0 * scale), maxi(11, roundi(13.0 * scale)), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, 130.0 * scale)
+	draw_circle(knob_position + Vector2(0.0, 3.0 * scale), knob_radius + 2.0 * scale, Color(0.01, 0.02, 0.03, 0.62))
+	draw_circle(knob_position, knob_radius, Color(color.darkened(0.42), 0.96))
+	draw_arc(knob_position, knob_radius, 0.0, TAU, 28, Color(color.lightened(0.25), 0.95), 2.5 * scale, true)
+	_draw_text(label, center + Vector2(0.0, -radius - 9.0 * scale), maxi(10, roundi(11.0 * scale)), Color("EAF6FF"), HORIZONTAL_ALIGNMENT_CENTER, radius * 2.0)
 
 
 func _draw_touch_controls() -> void:
@@ -12808,17 +12943,28 @@ func _draw_touch_controls() -> void:
 			_draw_text("Close" if language == "en" else "關閉", close_rect.get_center() + Vector2(0.0, 6.0 * close_scale), maxi(12, roundi(14.0 * close_scale)), Color("F5FAFF"), HORIZONTAL_ALIGNMENT_CENTER, close_rect.size.x - 8.0 * close_scale)
 		return
 
-	_draw_touch_joystick(_touch_move_center(), touch_move_vector, "Move" if language == "en" else "移動", FRIEND_BLUE, touch_move_pointer >= 0)
-	_draw_touch_joystick(_touch_aim_center(), touch_aim_vector, "Aim & Attack" if language == "en" else "瞄準攻擊", FIRE_ORANGE, touch_aim_pointer >= 0)
+	if not touch_utility_drawer_open:
+		_draw_touch_joystick(_touch_move_center(), touch_move_vector, "Move" if language == "en" else "移動", FRIEND_BLUE, touch_move_pointer >= 0)
+		_draw_touch_joystick(_touch_aim_center(), touch_aim_vector, "Aim & Attack" if language == "en" else "瞄準攻擊", FIRE_ORANGE, touch_aim_pointer >= 0)
 
-	var unlocked := int(player.get("level", 1)) >= 10
-	var special_rect := _touch_special_rect()
-	var special_label := ("Skill" if language == "en" else "技能") if unlocked else "Lv.10"
-	_draw_touch_round_button(special_rect, special_label, GOLD, _touch_feedback_active("special"), unlocked)
-	if unlocked and float(player.get("special_cd", 0.0)) > 0.0:
-		var cooldown_scale := touch_ui_coordinate_scale
-		_draw_text("%.1f" % float(player["special_cd"]), special_rect.get_center() + Vector2(0.0, 28.0 * cooldown_scale), maxi(10, roundi(12.0 * cooldown_scale)), Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, special_rect.size.x)
+		var unlocked := int(player.get("level", 1)) >= 10
+		var special_rect := _touch_special_rect()
+		var special_label := ("Skill" if language == "en" else "技能") if unlocked else "Lv.10"
+		_draw_touch_round_button(special_rect, special_label, GOLD, _touch_feedback_active("special"), unlocked)
+		if unlocked and float(player.get("special_cd", 0.0)) > 0.0:
+			var cooldown_scale := touch_ui_coordinate_scale
+			_draw_text("%.1f" % float(player["special_cd"]), special_rect.get_center() + Vector2(0.0, 18.0 * cooldown_scale), maxi(9, roundi(10.0 * cooldown_scale)), Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, special_rect.size.x)
 
+		var handle_rects := _touch_utility_handle_rects()
+		var handle_inset := 2.0 * touch_ui_coordinate_scale
+		_draw_touch_round_button(Rect2(handle_rects["left"]).grow(-handle_inset), "Army" if language == "en" else "軍隊", FRIEND_BLUE, _touch_feedback_active("utility_left"))
+		_draw_touch_round_button(Rect2(handle_rects["right"]).grow(-handle_inset), "Menu" if language == "en" else "選單", MAGIC_PURPLE, _touch_feedback_active("utility_right"))
+		return
+
+	var close_handle_rects := _touch_utility_handle_rects()
+	var close_handle_inset := 2.0 * touch_ui_coordinate_scale
+	_draw_touch_round_button(Rect2(close_handle_rects["left"]).grow(-close_handle_inset), "×", Color("8B5965"), _touch_feedback_active("utility_left"))
+	_draw_touch_round_button(Rect2(close_handle_rects["right"]).grow(-close_handle_inset), "×", Color("8B5965"), _touch_feedback_active("utility_right"))
 	var utility_rects := _touch_utility_rects()
 	var labels := {"guide": "說明", "map": "地圖", "skills": "能力", "upgrades": "兵強", "recruit": "招募", "command": "軍令", "notices": "通知開" if notifications_hidden else "通知關", "cheat": "作弊", "fullscreen": "全螢", "pause": "暫停"}
 	if language == "en":
@@ -12827,7 +12973,8 @@ func _draw_touch_controls() -> void:
 	for action_value in utility_rects.keys():
 		var action := str(action_value)
 		var enabled := action != "recruit" or _is_near_recruitment()
-		_draw_touch_round_button(Rect2(utility_rects[action]), str(labels[action]), Color(colors[action]), _touch_feedback_active(action), enabled)
+		var visible_rect := Rect2(utility_rects[action]).grow(-3.0 * touch_ui_coordinate_scale)
+		_draw_touch_round_button(visible_rect, str(labels[action]), Color(colors[action]), _touch_feedback_active(action), enabled)
 
 
 func _draw_python_nest_map_icon(position: Vector2, large: bool, engaged: bool, defeated: bool) -> void:
@@ -15013,8 +15160,9 @@ func _run_self_test() -> void:
 	GameSaveManager.delete_save(nation_roundtrip_path)
 	_test_assert(_load_game(test_path), "nation_roundtrip_test_restores_canonical_save")
 
-	# Touch layout keeps ten always-visible utilities on two narrow side rails.
-	# Every action and in-panel control meets the 44 CSS-pixel touch minimum.
+	# Phone controls stay in two bottom-corner clusters. Ten secondary actions
+	# live behind two 48 CSS-pixel edge handles and appear only while choosing an
+	# action, leaving a guaranteed button-free corridor through the battlefield.
 	var stored_screen_size := screen_size
 	var stored_input_scheme := input_scheme
 	var stored_touch_ui_coordinate_scale := touch_ui_coordinate_scale
@@ -15028,12 +15176,27 @@ func _run_self_test() -> void:
 	var touch_utility := _touch_utility_rects()
 	var touch_upgrade_rect := Rect2(touch_utility["upgrades"])
 	var touch_scale := touch_ui_coordinate_scale
-	var left_stick_bounds := Rect2(_touch_move_center() - Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale, Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale * 2.0)
-	var right_stick_bounds := Rect2(_touch_aim_center() - Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale, Vector2.ONE * TOUCH_STICK_RADIUS * touch_scale * 2.0)
+	var touch_stick_radius := _touch_stick_radius()
+	var left_stick_bounds := Rect2(_touch_move_center() - Vector2.ONE * touch_stick_radius, Vector2.ONE * touch_stick_radius * 2.0)
+	var right_stick_bounds := Rect2(_touch_aim_center() - Vector2.ONE * touch_stick_radius, Vector2.ONE * touch_stick_radius * 2.0)
+	var collapsed_state_value: Variant = JSON.parse_string(render_game_to_text())
+	var collapsed_controls := Dictionary(Dictionary(Dictionary(collapsed_state_value).get("input", {})).get("virtual_controls", {})) if collapsed_state_value is Dictionary else {}
+	var collapsed_utilities := Dictionary(collapsed_controls.get("utility", {}))
+	var collapsed_handles := Dictionary(collapsed_controls.get("utility_handles", {}))
+	var rails_collapsed := collapsed_utilities.size() == 10 and str(collapsed_controls.get("utility_layout", "")) == "collapsible_dual_side_rails" and not bool(collapsed_controls.get("utility_drawer_open", true))
+	for rail_state_value in collapsed_utilities.values():
+		if bool(Dictionary(rail_state_value).get("visible", true)):
+			rails_collapsed = false
+			break
+	for handle_state_value in collapsed_handles.values():
+		if not bool(Dictionary(handle_state_value).get("visible", false)):
+			rails_collapsed = false
+			break
+	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["left"]).get_center())
 	var rails_state_value: Variant = JSON.parse_string(render_game_to_text())
 	var rails_controls := Dictionary(Dictionary(Dictionary(rails_state_value).get("input", {})).get("virtual_controls", {})) if rails_state_value is Dictionary else {}
 	var rails_utilities := Dictionary(rails_controls.get("utility", {}))
-	var rails_all_visible := rails_utilities.size() == 10 and str(rails_controls.get("utility_layout", "")) == "dual_side_rails"
+	var rails_all_visible := touch_utility_drawer_open and rails_utilities.size() == 10
 	for rail_state_value in rails_utilities.values():
 		if not bool(Dictionary(rail_state_value).get("visible", false)):
 			rails_all_visible = false
@@ -15062,58 +15225,101 @@ func _run_self_test() -> void:
 	var touch_special_tab_works := soldier_upgrade_category == "special"
 	_handle_touch_action_at(_touch_panel_close_rect().get_center())
 	var compact_touch_layouts_ok := true
-	for css_size_value in [Vector2(568.0, 320.0), Vector2(667.0, 375.0), Vector2(844.0, 390.0)]:
-		var css_size := Vector2(css_size_value)
-		var compact_scale := 720.0 / css_size.y
-		touch_ui_coordinate_scale = compact_scale
-		screen_size = Vector2(css_size.x * compact_scale, 720.0)
-		var compact_bounds := Rect2(Vector2.ZERO, screen_size)
-		var compact_stick_radius := TOUCH_STICK_RADIUS * compact_scale
-		var compact_rects: Array[Rect2] = [
-			Rect2(_touch_move_center() - Vector2.ONE * compact_stick_radius, Vector2.ONE * compact_stick_radius * 2.0),
-			Rect2(_touch_aim_center() - Vector2.ONE * compact_stick_radius, Vector2.ONE * compact_stick_radius * 2.0),
-			_touch_special_rect(),
-		]
-		for compact_utility_value in _touch_utility_rects().values():
-			compact_rects.append(Rect2(compact_utility_value))
-		for compact_index in compact_rects.size():
-			var compact_rect := compact_rects[compact_index]
-			var compact_css_size := compact_rect.size / compact_scale
-			if compact_css_size.x < 44.0 or compact_css_size.y < 44.0 or not compact_bounds.encloses(compact_rect):
+	var stored_layout_world_edition := world_edition
+	for compact_edition in [WORLD_EDITION_FREE, WORLD_EDITION_VIP]:
+		world_edition = str(compact_edition)
+		for css_size_value in [Vector2(568.0, 320.0), Vector2(667.0, 375.0), Vector2(844.0, 390.0)]:
+			var css_size := Vector2(css_size_value)
+			var compact_scale := 720.0 / css_size.y
+			touch_ui_coordinate_scale = compact_scale
+			screen_size = Vector2(css_size.x * compact_scale, 720.0)
+			touch_utility_drawer_open = false
+			var compact_bounds := Rect2(Vector2.ZERO, screen_size)
+			var compact_stick_radius := _touch_stick_radius()
+			var compact_handles := _touch_utility_handle_rects()
+			var compact_rects: Array[Rect2] = [
+				Rect2(_touch_move_center() - Vector2.ONE * compact_stick_radius, Vector2.ONE * compact_stick_radius * 2.0),
+				Rect2(_touch_aim_center() - Vector2.ONE * compact_stick_radius, Vector2.ONE * compact_stick_radius * 2.0),
+				_touch_special_rect(),
+				Rect2(compact_handles["left"]),
+				Rect2(compact_handles["right"]),
+			]
+			var compact_clear := _touch_gameplay_clear_rect()
+			var compact_move_hit := _touch_stick_hit_rect(_touch_move_center())
+			var compact_attack_hit := _touch_stick_hit_rect(_touch_aim_center())
+			var compact_occupied_area := 0.0
+			if compact_clear.size.x / compact_scale < 160.0 or compact_clear.size.x / screen_size.x < 0.34:
 				compact_touch_layouts_ok = false
-				break
-			for compact_previous_index in compact_index:
-				if compact_rect.intersects(compact_rects[compact_previous_index]):
+			if not compact_bounds.encloses(compact_move_hit) or not compact_bounds.encloses(compact_attack_hit) or compact_move_hit.intersects(compact_clear) or compact_attack_hit.intersects(compact_clear) or compact_move_hit.intersects(compact_attack_hit):
+				compact_touch_layouts_ok = false
+			for compact_index in compact_rects.size():
+				var compact_rect := compact_rects[compact_index]
+				var compact_css_size := compact_rect.size / compact_scale
+				compact_occupied_area += compact_rect.get_area()
+				if compact_css_size.x < 44.0 or compact_css_size.y < 44.0 or not compact_bounds.encloses(compact_rect) or compact_rect.intersects(compact_clear):
 					compact_touch_layouts_ok = false
 					break
+				for compact_previous_index in compact_index:
+					if compact_rect.intersects(compact_rects[compact_previous_index]):
+						compact_touch_layouts_ok = false
+						break
+			if compact_occupied_area / compact_bounds.get_area() > 0.24:
+				compact_touch_layouts_ok = false
+			if (screen_size.y - compact_rects[0].end.y) / compact_scale < TOUCH_EDGE_MARGIN_CSS - 0.1 or (screen_size.y - compact_rects[1].end.y) / compact_scale < TOUCH_EDGE_MARGIN_CSS - 0.1:
+				compact_touch_layouts_ok = false
+			_reset_touch_inputs()
+			var compact_clear_touch := InputEventScreenTouch.new()
+			compact_clear_touch.index = 90
+			compact_clear_touch.pressed = true
+			compact_clear_touch.position = compact_clear.get_center()
+			_handle_screen_touch(compact_clear_touch)
+			if touch_move_pointer >= 0 or touch_aim_pointer >= 0 or attack_held or touch_move_vector.length_squared() > 0.0:
+				compact_touch_layouts_ok = false
+			touch_utility_drawer_open = true
+			var compact_open_rects: Array[Rect2] = []
+			for compact_utility_value in _touch_utility_rects().values():
+				compact_open_rects.append(Rect2(compact_utility_value))
+			var compact_close_handles := _touch_utility_handle_rects()
+			compact_open_rects.append(Rect2(compact_close_handles["left"]))
+			compact_open_rects.append(Rect2(compact_close_handles["right"]))
+			for compact_open_index in compact_open_rects.size():
+				var compact_open_rect := compact_open_rects[compact_open_index]
+				var compact_open_css_size := compact_open_rect.size / compact_scale
+				if compact_open_css_size.x < 44.0 or compact_open_css_size.y < 44.0 or not compact_bounds.encloses(compact_open_rect) or compact_open_rect.intersects(compact_clear):
+					compact_touch_layouts_ok = false
+					break
+				for compact_open_previous_index in compact_open_index:
+					if compact_open_rect.intersects(compact_open_rects[compact_open_previous_index]):
+						compact_touch_layouts_ok = false
+						break
 			if not compact_touch_layouts_ok:
 				break
 		if not compact_touch_layouts_ok:
 			break
-		var compact_tutorial := _tutorial_panel_rect()
-		for compact_utility_value in _touch_utility_rects().values():
-			if compact_tutorial.intersects(Rect2(compact_utility_value)):
-				compact_touch_layouts_ok = false
-				break
-	_test_assert(compact_touch_layouts_ok, "touch_dual_side_rails_are_in_bounds_disjoint_and_tappable_on_three_short_landscape_sizes")
+	world_edition = stored_layout_world_edition
+	touch_utility_drawer_open = false
+	_test_assert(compact_touch_layouts_ok, "touch_collapsible_corner_controls_preserve_center_on_free_and_vip_phone_sizes")
 	var web_touch_scale := 720.0 / 390.0
 	touch_ui_coordinate_scale = web_touch_scale
 	screen_size = Vector2(844.0 * web_touch_scale, 720.0)
 	active_panel = ""
+	touch_utility_drawer_open = false
 	var web_screen_bounds := Rect2(Vector2.ZERO, screen_size)
-	var web_stick_radius := TOUCH_STICK_RADIUS * web_touch_scale
+	var web_stick_radius := _touch_stick_radius()
 	var web_move_bounds := Rect2(_touch_move_center() - Vector2.ONE * web_stick_radius, Vector2.ONE * web_stick_radius * 2.0)
 	var web_attack_bounds := Rect2(_touch_aim_center() - Vector2.ONE * web_stick_radius, Vector2.ONE * web_stick_radius * 2.0)
 	var web_special_bounds := _touch_special_rect()
+	var web_handles := _touch_utility_handle_rects()
 	var web_touch_utility := _touch_utility_rects()
-	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds]
-	var web_virtual_layout_ok := web_touch_utility.size() == 10
-	for web_utility_value in web_touch_utility.values():
-		web_virtual_rects.append(Rect2(web_utility_value))
+	var web_gameplay_clear := _touch_gameplay_clear_rect()
+	var web_move_hit := _touch_stick_hit_rect(_touch_move_center())
+	var web_attack_hit := _touch_stick_hit_rect(_touch_aim_center())
+	var web_virtual_rects: Array[Rect2] = [web_move_bounds, web_attack_bounds, web_special_bounds, Rect2(web_handles["left"]), Rect2(web_handles["right"])]
+	var web_virtual_layout_ok := web_touch_utility.size() == 10 and web_gameplay_clear.size.x / web_touch_scale >= 160.0 and web_screen_bounds.encloses(web_move_hit) and web_screen_bounds.encloses(web_attack_hit) and not web_move_hit.intersects(web_gameplay_clear) and not web_attack_hit.intersects(web_gameplay_clear)
 	for web_control_index in web_virtual_rects.size():
 		var web_control_rect := web_virtual_rects[web_control_index]
 		var web_control_css_size := web_control_rect.size / web_touch_scale
-		if web_control_css_size.x < 44.0 or web_control_css_size.y < 44.0 or not web_screen_bounds.encloses(web_control_rect):
+		if web_control_css_size.x < 44.0 or web_control_css_size.y < 44.0 or not web_screen_bounds.encloses(web_control_rect) or web_control_rect.intersects(web_gameplay_clear):
 			web_virtual_layout_ok = false
 			break
 		for web_previous_index in web_control_index:
@@ -15122,7 +15328,25 @@ func _run_self_test() -> void:
 				break
 		if not web_virtual_layout_ok:
 			break
-	_test_assert(web_virtual_layout_ok, "web_touch_ten_utilities_dual_sticks_and_special_are_large_visible_and_disjoint")
+	touch_utility_drawer_open = true
+	var web_open_rects: Array[Rect2] = []
+	for web_utility_value in web_touch_utility.values():
+		web_open_rects.append(Rect2(web_utility_value))
+	var web_close_handles := _touch_utility_handle_rects()
+	web_open_rects.append(Rect2(web_close_handles["left"]))
+	web_open_rects.append(Rect2(web_close_handles["right"]))
+	for web_open_index in web_open_rects.size():
+		var web_open_rect := web_open_rects[web_open_index]
+		var web_open_css_size := web_open_rect.size / web_touch_scale
+		if web_open_css_size.x < 44.0 or web_open_css_size.y < 44.0 or not web_screen_bounds.encloses(web_open_rect) or web_open_rect.intersects(web_gameplay_clear):
+			web_virtual_layout_ok = false
+			break
+		for web_open_previous_index in web_open_index:
+			if web_open_rect.intersects(web_open_rects[web_open_previous_index]):
+				web_virtual_layout_ok = false
+				break
+	touch_utility_drawer_open = false
+	_test_assert(web_virtual_layout_ok, "web_touch_collapsed_handles_and_open_rails_are_large_safe_and_disjoint")
 
 	var web_panel_targets_ok := true
 	var web_layout_unlock_before := all_soldiers_unlocked
@@ -15167,6 +15391,7 @@ func _run_self_test() -> void:
 	all_soldiers_unlocked = web_layout_unlock_before
 	var web_upgrade_rect := Rect2(_touch_utility_rects()["upgrades"])
 	var web_upgrade_css_size := web_upgrade_rect.size / web_touch_scale
+	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["left"]).get_center())
 	_handle_touch_action_at(web_upgrade_rect.get_center())
 	var web_panel := _soldier_upgrade_panel_rect()
 	var web_controls := _soldier_upgrade_control_rects(web_panel)
@@ -15178,7 +15403,7 @@ func _run_self_test() -> void:
 			break
 	web_stretch_targets_ok = web_stretch_targets_ok and not Rect2(web_controls["type_next"]).intersects(_touch_panel_close_rect())
 	_handle_touch_action_at(_touch_panel_close_rect().get_center())
-	_test_assert(rails_all_visible and touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_side_rail_panel_purchase_and_close")
+	_test_assert(rails_collapsed and rails_all_visible and touch_upgrade_geometry_ok and touch_upgrade_opened and touch_targets_large and close_does_not_overlap_next and touch_rank_after == touch_rank_before + 1 and touch_special_tab_works and active_panel.is_empty() and web_stretch_targets_ok, "touch_troop_upgrade_drawer_panel_purchase_and_close")
 	screen_size = stored_screen_size
 	touch_ui_coordinate_scale = stored_touch_ui_coordinate_scale
 	_set_input_scheme(stored_input_scheme)
@@ -15438,7 +15663,7 @@ func _run_self_test() -> void:
 	var touch_move_press := InputEventScreenTouch.new()
 	touch_move_press.index = 41
 	touch_move_press.pressed = true
-	touch_move_press.position = _touch_move_center() + Vector2(TOUCH_STICK_RADIUS, 0.0)
+	touch_move_press.position = _touch_move_center() + Vector2.RIGHT * _touch_stick_radius()
 	_input(touch_move_press)
 	_test_assert(_is_touch_scheme() and touch_move_pointer == 41 and touch_move_vector.x > 0.95, "touch_event_selects_virtual_joystick")
 	var touch_move_start: Vector2 = player["pos"]
@@ -15485,7 +15710,7 @@ func _run_self_test() -> void:
 	var touch_attack_press := InputEventScreenTouch.new()
 	touch_attack_press.index = 51
 	touch_attack_press.pressed = true
-	touch_attack_press.position = _touch_aim_center() + Vector2.UP * TOUCH_STICK_RADIUS * web_touch_scale
+	touch_attack_press.position = _touch_aim_center() + Vector2.UP * _touch_stick_radius()
 	_input(touch_attack_press)
 	var touch_attack_pressed_state_value: Variant = JSON.parse_string(render_game_to_text())
 	var touch_attack_pressed_input := Dictionary(Dictionary(touch_attack_pressed_state_value).get("input", {})) if touch_attack_pressed_state_value is Dictionary else {}
@@ -15508,6 +15733,7 @@ func _run_self_test() -> void:
 	var touch_attack_stopped := not attack_held and touch_aim_pointer < 0 and not bool(touch_attack_released_input.get("attack_held", true)) and not bool(touch_attack_released_control.get("held", true)) and is_zero_approx(float(player["attack_cd"]))
 	_test_assert(touch_attack_render_pressed_ok and touch_attack_aim_ok and touch_attack_executed and touch_attack_stopped, "touch_attack_stick_holds_aims_attacks_and_stops_on_release")
 
+	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["left"]).get_center())
 	var touch_command_entry := InputEventScreenTouch.new()
 	touch_command_entry.index = 52
 	touch_command_entry.pressed = true
@@ -15535,6 +15761,7 @@ func _run_self_test() -> void:
 	active_panel = ""
 	last_recruit_purchase_msec = -10000
 	last_recruit_purchase_type = ""
+	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["left"]).get_center())
 	var touch_recruit_entry := InputEventScreenTouch.new()
 	touch_recruit_entry.index = 54
 	touch_recruit_entry.pressed = true
@@ -15561,6 +15788,7 @@ func _run_self_test() -> void:
 	player["money"] = touch_recruit_money_before
 	active_panel = ""
 
+	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["right"]).get_center())
 	var touch_pause_entry := InputEventScreenTouch.new()
 	touch_pause_entry.index = 56
 	touch_pause_entry.pressed = true
@@ -15626,6 +15854,7 @@ func _run_self_test() -> void:
 	_test_assert(_needs_landscape_rotation(), "portrait_touch_requests_landscape_rotation")
 	screen_size = landscape_screen
 	tutorial_visible = false
+	_handle_touch_action_at(Rect2(_touch_utility_handle_rects()["right"]).get_center())
 	var touch_guide := InputEventScreenTouch.new()
 	touch_guide.index = 44
 	touch_guide.pressed = true
