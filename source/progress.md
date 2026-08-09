@@ -327,3 +327,15 @@ Original prompt: 新增可購買、會永久影響未來招募士兵的完整兵
 - [x] 觸控戰鬥介面新增清楚的四向箭頭、英文搖桿標籤與全螢幕鍵；844×390 下 10 個功能鍵、雙搖桿與技能鍵互不重疊。
 - [x] 招募、通用關閉、暫停／恢復、語言與音量按鍵在 Web stretch 後仍至少 44 CSS px；通知不再蓋住觸控功能列。
 - [x] Godot 4.6 deterministic self-test 最終為 249／249；新增右搖桿實際攻擊與釋放、軍令、近／遠據點招募、暫停／恢復與所有觸控目標尺寸驗證。
+
+## 鍛造金屬介面與荒原場景質感（2026-08-09）
+
+Original prompt: 選用第 1 套鍛造金屬方向，加入合適紋理提升介面高級感，同時優化遊戲場景並保持手機可玩。
+
+- [x] 加入生成式低對比深色拉絲鋼材質，玩家狀態、迷你地圖、軍隊命令列、通用按鍵、左右功能鍵與雙虛擬搖桿統一為黑鋼／舊銅／鉚釘語言。
+- [x] 雙搖桿縮至 100–108 CSS px 直徑，保留四向箭頭、藍／橙攻擊語意與至少 44 CSS px 觸控目標；中央戰鬥走廊仍保持可視、可操作。
+- [x] 免費版與競技場共用新的連續荒原地表材質；生物群系改用不規則低透明土色與植被表達，不再露出矩形 Chunk 接縫。
+- [x] 樹木改為多層樹冠、樹幹高光與加深投影；岩石加入切面與亮邊；灌木改為多團塊輪廓，提升俯視場景的體積與兵種辨識度。
+- [x] 選定設計參考保存在 `output/design-reference/forged-command-mobile-hud.png`；最終 568×320 實作截圖為 `output/playwright/ui-forged-2026-08-09-release/touch-568x320-design-qa.png`。
+- [x] Design QA 已通過並記錄於 `design-qa.md`；Godot deterministic self-test 為 278／278，Playwright 桌面／觸控／英文／VIP／競技場為 17／17，瀏覽器 console 0 errors。
+- [x] Web release 已重新匯出並更新專案根目錄 GitHub Pages 成品。

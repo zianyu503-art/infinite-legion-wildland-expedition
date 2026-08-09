@@ -9,11 +9,12 @@ extends RefCounted
 
 const GameConfig = preload("res://scripts/game_config.gd")
 const WorldGenerator = preload("res://scripts/world_generator.gd")
+const WILDLAND_GROUND_TEXTURE = preload("res://assets/environment/textures/wildland_meadow.png")
 
 const PROFILE_ID := "campaign"
 const SOLDIER_RENDERER_ID := "campaign_soldier_v2"
 const HERO_RENDERER_ID := "campaign_hero_v2"
-const MAP_RENDERER_ID := "campaign_wildland_v1"
+const MAP_RENDERER_ID := "campaign_wildland_v2"
 const STICK_ANIMATION_PROFILE_ID := "procedural_upright_stick_motion_v2"
 const HUMANOID_MODEL_ID := "readable_stick_army_v2"
 const HUMANOID_BASE_DISPLAY_SCALE := 1.24
@@ -1024,9 +1025,17 @@ static func draw_wildland_chunk(
 	if not chunk_screen_rect.intersects(viewport_rect, true):
 		return result
 	result["visible"] = true
-	var grass_color := _chunk_grass_color(chunk).lerp(Color("607D52"), 0.22)
+	var biome_id := str(biome_data.get("id", "meadow"))
+	# Every streamed chunk starts from the same continuous wildland material.
+	# Biome identity is layered back as irregular low-alpha soil patches and props
+	# below, avoiding any visible rectangular cache boundary.
+	var grass_color := Color("557A45")
 	if draw_ground:
 		canvas.draw_rect(chunk_screen_rect, grass_color)
+		# Generated top-down ground material adds fine natural grain; a restrained
+		# alpha keeps projectiles, stick figures and warning telegraphs dominant.
+		canvas.draw_texture_rect(WILDLAND_GROUND_TEXTURE, chunk_screen_rect, false, Color(1.0, 1.0, 1.0, 0.22))
+		_draw_ground_finish(canvas, chunk_coord, chunk_screen_rect, biome_id, zoom)
 
 	var decoration_cull := viewport_rect.grow(30.0 * zoom)
 	for decoration_value in Array(chunk.get("decorations", [])):
@@ -1061,21 +1070,64 @@ static func draw_wildland_chunk(
 		var radius := base_radius * zoom
 		match str(obstacle.get("type", "")):
 			"tree":
-				_draw_ellipse_shadow(canvas, position + Vector2(6, 10) * zoom, Vector2(base_radius * 1.35, base_radius * 0.55) * zoom)
-				canvas.draw_rect(Rect2(position + Vector2(-4, -4) * zoom, Vector2(8.0, base_radius + 13.0) * zoom), Color("795130"))
-				canvas.draw_circle(position + Vector2(0.0, -base_radius * 0.52) * zoom, base_radius * 1.18 * zoom, Color("315D3B"))
-				canvas.draw_circle(position + Vector2(-base_radius * 0.35, -base_radius * 0.72) * zoom, base_radius * 0.75 * zoom, Color("477B48"))
-				canvas.draw_arc(position + Vector2(0.0, -base_radius * 0.52) * zoom, base_radius * 1.18 * zoom, 0.0, TAU, 20, INK, 2.0 * zoom)
+				_draw_ellipse_shadow(canvas, position + Vector2(8, 12) * zoom, Vector2(base_radius * 1.55, base_radius * 0.62) * zoom)
+				canvas.draw_rect(Rect2(position + Vector2(-4.5, -3) * zoom, Vector2(9.0, base_radius + 15.0) * zoom), Color("5D3B27"))
+				canvas.draw_line(position + Vector2(-1.5, 0) * zoom, position + Vector2(-1.5, base_radius + 9.0) * zoom, Color("A27247"), 2.0 * zoom)
+				var crown := position + Vector2(0.0, -base_radius * 0.58) * zoom
+				canvas.draw_circle(crown + Vector2(base_radius * 0.28, base_radius * 0.10) * zoom, base_radius * 0.90 * zoom, Color("24472F"))
+				canvas.draw_circle(crown + Vector2(-base_radius * 0.42, base_radius * 0.02) * zoom, base_radius * 0.83 * zoom, Color("315F39"))
+				canvas.draw_circle(crown + Vector2(0.0, -base_radius * 0.35) * zoom, base_radius * 0.92 * zoom, Color("3E7443"))
+				canvas.draw_circle(crown + Vector2(-base_radius * 0.22, -base_radius * 0.58) * zoom, base_radius * 0.43 * zoom, Color("649359"))
+				canvas.draw_arc(crown, base_radius * 1.24 * zoom, 0.0, TAU, 24, Color("172D21"), 2.2 * zoom)
 			"rock":
-				_draw_ellipse_shadow(canvas, position + Vector2(5, 7) * zoom, Vector2(base_radius, base_radius * 0.45) * zoom)
-				_draw_polygon_shape(canvas, position, [Vector2(-base_radius, base_radius * 0.35), Vector2(-base_radius * 0.7, -base_radius * 0.5), Vector2(base_radius * 0.15, -base_radius * 0.78), Vector2(base_radius, -base_radius * 0.05), Vector2(base_radius * 0.55, base_radius * 0.62)], 0.0, Color("778493"), INK, 2.0 * zoom, zoom)
+				_draw_ellipse_shadow(canvas, position + Vector2(6, 8) * zoom, Vector2(base_radius * 1.16, base_radius * 0.48) * zoom)
+				var rock_points := [Vector2(-base_radius, base_radius * 0.35), Vector2(-base_radius * 0.7, -base_radius * 0.5), Vector2(base_radius * 0.15, -base_radius * 0.78), Vector2(base_radius, -base_radius * 0.05), Vector2(base_radius * 0.55, base_radius * 0.62)]
+				_draw_polygon_shape(canvas, position, rock_points, 0.0, Color("66727A"), INK, 2.0 * zoom, zoom)
+				_draw_polygon_shape(canvas, position + Vector2(-base_radius * 0.10, -base_radius * 0.18) * zoom, [Vector2(-base_radius * 0.55, base_radius * 0.15), Vector2(-base_radius * 0.32, -base_radius * 0.34), Vector2(base_radius * 0.12, -base_radius * 0.45), Vector2(base_radius * 0.48, -base_radius * 0.04), Vector2(base_radius * 0.18, base_radius * 0.22)], 0.0, Color("9AA3A5"), Color.TRANSPARENT, 0.0, zoom)
+				canvas.draw_line(position + Vector2(-base_radius * 0.05, -base_radius * 0.62) * zoom, position + Vector2(base_radius * 0.62, -base_radius * 0.08) * zoom, Color("C2C6BE"), 1.2 * zoom)
 			_:
-				_draw_ellipse_shadow(canvas, position + Vector2(4, 7) * zoom, Vector2(base_radius * 1.1, base_radius * 0.5) * zoom)
-				canvas.draw_circle(position, radius, Color("45754B"))
-				canvas.draw_circle(position + Vector2(-base_radius * 0.45, -base_radius * 0.2) * zoom, base_radius * 0.65 * zoom, Color("5B8D54"))
+				_draw_ellipse_shadow(canvas, position + Vector2(4, 7) * zoom, Vector2(base_radius * 1.18, base_radius * 0.5) * zoom)
+				canvas.draw_circle(position + Vector2(base_radius * 0.22, 0.0) * zoom, radius * 0.86, Color("315E38"))
+				canvas.draw_circle(position + Vector2(-base_radius * 0.42, -base_radius * 0.18) * zoom, base_radius * 0.72 * zoom, Color("5B8D54"))
+				canvas.draw_circle(position + Vector2(base_radius * 0.05, -base_radius * 0.46) * zoom, base_radius * 0.64 * zoom, Color("487B45"))
 				canvas.draw_arc(position, radius, 0.0, TAU, 18, INK, 1.7 * zoom)
 		result["obstacles_drawn"] = int(result["obstacles_drawn"]) + 1
 	return result
+
+
+static func _draw_ground_finish(canvas: CanvasItem, chunk_coord: Vector2i, rect: Rect2, biome_id: String, zoom: float) -> void:
+	var soil := Color("765C39")
+	var cool := Color("254B35")
+	match biome_id:
+		"desert":
+			soil = Color("B49155")
+			cool = Color("8B783D")
+		"swamp":
+			soil = Color("3F5138")
+			cool = Color("244A43")
+		"forest":
+			soil = Color("51452F")
+			cool = Color("173B29")
+		"hills":
+			soil = Color("7F744A")
+			cool = Color("43583B")
+	# Broad translucent patches break the flat chunk fill without exposing the
+	# cache grid or adding collision-relevant geometry.
+	for patch_index in 12:
+		var seed := float(chunk_coord.x * 173 + chunk_coord.y * 311 + patch_index * 97)
+		var local_x := fposmod(sin(seed * 0.017) * 43871.0, WorldGenerator.CHUNK_SIZE)
+		var local_y := fposmod(cos(seed * 0.023) * 25163.0, WorldGenerator.CHUNK_SIZE)
+		var radius := (42.0 + fposmod(absf(sin(seed)) * 113.0, 92.0)) * zoom
+		var center := rect.position + Vector2(local_x, local_y) * zoom
+		canvas.draw_circle(center, radius, Color(soil if patch_index % 3 == 0 else cool, 0.035 + float(patch_index % 4) * 0.008))
+	# Sparse grass strokes provide scale and direction while remaining below the
+	# silhouette density of units and combat VFX.
+	for fleck_index in 28:
+		var seed := float(chunk_coord.x * 419 + chunk_coord.y * 233 + fleck_index * 61)
+		var local := Vector2(fposmod(sin(seed * 0.031) * 17117.0, WorldGenerator.CHUNK_SIZE), fposmod(cos(seed * 0.037) * 19319.0, WorldGenerator.CHUNK_SIZE))
+		var start := rect.position + local * zoom
+		var length := (3.0 + float(fleck_index % 4)) * zoom
+		canvas.draw_line(start, start + Vector2(1.2, -length), Color(cool.lightened(0.18), 0.20), maxf(0.8, zoom))
 
 
 static func _team_primary(team: String) -> Color:
