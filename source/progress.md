@@ -341,3 +341,20 @@ Original prompt: 選用第 1 套鍛造金屬方向，加入合適紋理提升介
 - [x] 選定參考保存在 `output/design-reference/forged-command-mobile-hud.png`；最終關鍵證據在 `output/playwright/ui-mobile-scene-final-publish-2026-08-10/`，Design QA 記錄於根目錄 `design-qa.md`，P0／P1／P2 均為 0。
 - [x] Godot deterministic self-test 為 286／286；Playwright 桌面／手機觸控／英文／VIP／全部材質面板／競技場為 20／20，瀏覽器 console、page 與 request errors 均為 0。
 - [x] Web release 已重新匯出並更新專案根目錄 GitHub Pages 成品；`index.pck` SHA-256 為 `724c956f1c5a516b83f331b64b21635cfc6bbe7096ac135c92ad8b78f091c7ff`。
+
+## 圖標化行動介面與全對話框手機改版（2026-08-10）
+
+Original prompt: 依專業設計審查修改全部對話框與按鈕；按鈕優先使用圖標、以 hover／touch tooltip 說明，縮小視覺尺寸並保留手機安全點擊區，加入合適紋理且不遮擋遊戲。
+
+- [x] 建立共用 `UiIconCatalog` 與 48 個語意 ID；主戰場、手機左右工具抽屜、選角、暫停、作弊、招募、士兵強化與競技場共用一套清晰圖標，不再以大型文字鍵堆滿戰場。
+- [x] 圖標實際以 80 px 紋理匯入，手機高密度縮放仍清晰；地圖使用原創三折地圖 glyph，戰鬥／能力／語言改用更準確的盾牌、星形與字母切換圖示。
+- [x] Adwaita 衍生圖標的 GNOME attribution、逐檔來源、完整 LGPLv3／GPLv3 已同時封裝進 Web PCK 並公開於 Pages 根目錄第三方聲明。
+- [x] 568×320 選角改為單卡輪播，新增 44 CSS px 返回／前後／確認鍵；`change` 流程可安全取消回遊戲，首次選角可返回標題，選取狀態也可由瀏覽器自動驗證。
+- [x] 手機功能列改為單側展開的左右抽屜，每側五項、按鍵間距至少 6 px；中央戰鬥區維持空白，技能、招募、強化、軍令、地圖、通知、作弊、全螢幕與暫停皆有一致圖標與觸控提示。
+- [x] 技能、招募、士兵永久強化、軍令、地圖、暫停、作弊與重新開始確認全部使用共用模態遮罩、44 CSS px 關閉／操作目標和材質卡；招募改為 6 名／頁且兵種文字不再被購買鍵截斷。
+- [x] 作弊輸入在手機可正常喚起虛擬鍵盤；套用／取消不再被輸入層吞掉，面板外點擊不會穿透成攻擊。死亡、面板及確認狀態也不再暴露或觸發被遮住的控制。
+- [x] 新增 350 ms 桌面 hover tooltip 與 1.2 秒觸控提示；混合輸入切換、直向旋轉與模態狀態會清除過期提示，不會留下錯誤熱區或永久浮層。
+- [x] 競技場所有觸控操作改為放開才執行；拖曳離開會取消，350 ms 長按只預覽圖標說明，延遲相容滑鼠事件不會切走觸控模式；桌面 Tab／Shift+Tab、Enter 與焦點 tooltip 可用。
+- [x] 競技場結果頁與直向旋轉頁只暴露真正可操作的按鍵，不再保留隱形搖桿或重複離開鍵；選兵、數量、強化、戰鬥、結果皆完成 default／hover／pressed／focus／selected／disabled 視覺狀態。
+- [x] 新增與擴充 Playwright 行為驗證：選角返回／輪播、左右抽屜、面板幾何、招募分頁、作弊實際套用、確認取消、競技場鬆手／拖曳／長按／鍵盤焦點、結果與旋轉模態；最終 23／23 通過，修正後招募面板再驗證 1／1 通過，console／page／request errors 為 0。
+- [x] Godot deterministic self-test 最終為 286／286；Web release 已重新匯出至原 GitHub Pages 根目錄，`index.pck` SHA-256 為 `7222f030951ae428f938f2e2847e623e7b0b8f972339569c63632c3f79c605f7`，公開網址維持 `https://zianyu503-art.github.io/infinite-legion-wildland-expedition/`。
