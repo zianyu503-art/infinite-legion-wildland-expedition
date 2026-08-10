@@ -38,6 +38,91 @@ function intersects(a, b) {
   );
 }
 
+function mainTouchScale(state) {
+  const scale = state.input?.touch_ui_coordinate_scale;
+  assert.ok(Number.isFinite(scale) && scale > 0, "main UI must expose a positive touch coordinate scale");
+  return scale;
+}
+
+function minimumTouchCss(state) {
+  const minimum = state.input?.minimum_touch_css;
+  assert.equal(minimum, 44, "main UI must publish the 44 CSS px touch-target contract");
+  return minimum;
+}
+
+function assertMainTouchTarget(state, rect, label, { visible = true } = {}) {
+  assert.ok(rect, `${label} must expose a touch target`);
+  if (visible && Object.hasOwn(rect, "visible")) assert.equal(rect.visible, true, `${label} must be visible`);
+  assert.ok(Number.isFinite(rect.x) && Number.isFinite(rect.y), `${label} must expose a finite position`);
+  assert.ok(Number.isFinite(rect.width) && Number.isFinite(rect.height), `${label} must expose finite dimensions`);
+  const scale = mainTouchScale(state);
+  const required = minimumTouchCss(state) - 0.1;
+  assert.ok(rect.width / scale >= required, `${label} must be at least 44 CSS px wide`);
+  assert.ok(rect.height / scale >= required, `${label} must be at least 44 CSS px tall`);
+  const logicalWidth = state.input.logical_viewport_width;
+  const logicalHeight = state.input.logical_viewport_height;
+  assert.ok(
+    rect.x >= -0.1 && rect.y >= -0.1 &&
+    rect.x + rect.width <= logicalWidth + 0.5 &&
+    rect.y + rect.height <= logicalHeight + 0.5,
+    `${label} must remain inside the logical viewport`,
+  );
+}
+
+function assertNoTargetOverlaps(entries, label) {
+  for (let left = 0; left < entries.length; left += 1) {
+    for (let right = left + 1; right < entries.length; right += 1) {
+      const [leftName, leftRect] = entries[left];
+      const [rightName, rightRect] = entries[right];
+      assert.equal(intersects(leftRect, rightRect), false, `${label}: ${leftName} must not overlap ${rightName}`);
+    }
+  }
+}
+
+function assertTooltip(state, source, trigger) {
+  const tooltip = state.input?.tooltip;
+  assert.ok(tooltip, `${source} must expose tooltip state`);
+  assert.equal(tooltip.visible, true, `${source} tooltip must be visible`);
+  assert.equal(tooltip.source, source, `${source} tooltip must identify its source control`);
+  assert.equal(tooltip.trigger, trigger, `${source} tooltip must identify its ${trigger} trigger`);
+  assert.ok(typeof tooltip.text === "string" && tooltip.text.trim().length > 0, `${source} tooltip must contain a localized label`);
+  if (tooltip.rect) {
+    assert.ok(Number.isFinite(tooltip.rect.x) && Number.isFinite(tooltip.rect.y));
+    assert.ok(tooltip.rect.width > 0 && tooltip.rect.height > 0);
+  }
+}
+
+const LEFT_UTILITY_ACTIONS = ["upgrades", "recruit", "command", "skills", "map"];
+const RIGHT_UTILITY_ACTIONS = ["guide", "notices", "cheat", "fullscreen", "pause"];
+
+function assertUtilityDrawerSide(state, expectedSide) {
+  const controls = state.input?.virtual_controls;
+  assert.ok(controls, "touch utility controls must be exposed");
+  assert.ok(["", "left", "right"].includes(expectedSide));
+  assert.equal(controls.utility_drawer_side, expectedSide, `utility drawer side must be ${expectedSide || "closed"}`);
+  assert.equal(controls.utility_drawer_open, expectedSide !== "", "legacy drawer-open flag must agree with drawer side");
+  const expectedVisible = expectedSide === "left" ? LEFT_UTILITY_ACTIONS : expectedSide === "right" ? RIGHT_UTILITY_ACTIONS : [];
+  const expectedHidden = expectedSide === "left" ? RIGHT_UTILITY_ACTIONS : expectedSide === "right" ? LEFT_UTILITY_ACTIONS : [...LEFT_UTILITY_ACTIONS, ...RIGHT_UTILITY_ACTIONS];
+  for (const action of expectedVisible) {
+    const rect = controls.utility?.[action];
+    assert.equal(rect?.visible, true, `${action} must be visible in the ${expectedSide} drawer`);
+    assertMainTouchTarget(state, rect, `${expectedSide} utility ${action}`);
+  }
+  for (const action of expectedHidden) {
+    const rect = controls.utility?.[action];
+    assert.ok(rect, `${action} utility contract must remain exposed while hidden`);
+    assert.equal(rect.visible, false, `${action} must stay hidden in the ${expectedSide || "closed"} drawer`);
+  }
+  for (const [side, rect] of Object.entries(controls.utility_handles || {})) {
+    assertMainTouchTarget(state, rect, `${side} utility handle`);
+  }
+  const visibleEntries = expectedVisible.map((action) => [action, controls.utility[action]]);
+  for (const [side, rect] of Object.entries(controls.utility_handles || {})) {
+    visibleEntries.push([`${side} handle`, rect]);
+  }
+  assertNoTargetOverlaps(visibleEntries, `${expectedSide || "closed"} utility drawer`);
+}
+
 function assertCampaignArenaVisuals(state, { expectHero = false } = {}) {
   const arena = state.arena;
   assert.ok(arena?.visuals, "arena must expose its actual visual draw contract");
@@ -148,6 +233,11 @@ async function clickLogical(page, state, rect) {
   await page.mouse.click(point.x, point.y);
 }
 
+async function hoverLogical(page, state, rect) {
+  const point = await logicalPoint(page, state, rect);
+  await page.mouse.move(point.x, point.y);
+}
+
 const touchSessions = new WeakMap();
 
 async function touchClient(page) {
@@ -157,6 +247,34 @@ async function touchClient(page) {
     touchSessions.set(page, client);
   }
   return client;
+}
+
+async function beginLogicalTouch(page, state, rect, pointerId = 91) {
+  const client = await touchClient(page);
+  const point = await logicalPoint(page, state, rect);
+  const touchPoint = { x: point.x, y: point.y, id: pointerId, radiusX: 4, radiusY: 4, force: 1 };
+  await client.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [touchPoint] });
+  return { client, point, pointerId, touchPoint };
+}
+
+async function moveLogicalTouch(session, deltaCss) {
+  session.point = {
+    x: session.point.x + deltaCss.x,
+    y: session.point.y + deltaCss.y,
+  };
+  session.touchPoint = {
+    ...session.touchPoint,
+    x: session.point.x,
+    y: session.point.y,
+  };
+  await session.client.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [session.touchPoint],
+  });
+}
+
+async function endLogicalTouch(session) {
+  await session.client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
 }
 
 function dynamicControl(state, controlName) {
@@ -201,7 +319,7 @@ function assertDynamicJoystickContract(state, controlName) {
   const container = dynamicContainer(state, controlName);
   const control = dynamicControl(state, controlName);
   assert.ok(container && control, `${controlName} dynamic joystick state must be exposed`);
-  const expectedLayoutVersion = controlName.startsWith("arena_") ? 5 : 4;
+  const expectedLayoutVersion = controlName.startsWith("arena_") ? 6 : 4;
   assert.equal(container.layout_version, expectedLayoutVersion, `${controlName} must use touch layout version ${expectedLayoutVersion}`);
   assert.equal(container.joystick_mode, "dynamic_origin", `${controlName} must follow the finger-down origin`);
   assert.ok(control.activation_zone, `${controlName} must expose a separate activation_zone`);
@@ -259,6 +377,32 @@ function assertArenaUiMaterialContract(state) {
   }
 }
 
+function assertArenaInteractionContract(state) {
+  const interaction = state.arena?.interaction;
+  assert.ok(interaction, "arena must expose its icon interaction contract");
+  assert.deepEqual(
+    [...interaction.states].sort(),
+    ["default", "hover", "pressed", "focus", "selected", "disabled"].sort(),
+  );
+  assert.ok(interaction.hover_delay_seconds >= 0.3 && interaction.hover_delay_seconds <= 0.4);
+  assert.ok(interaction.touch_tooltip_seconds >= 1.0 && interaction.touch_tooltip_seconds <= 1.5);
+  assert.ok(interaction.long_press_preview_seconds >= 0.3 && interaction.long_press_preview_seconds <= 0.5);
+  assert.equal(interaction.touch_activation, "release");
+  assert.equal(typeof interaction.tooltip?.visible, "boolean", "arena tooltip state must be structured");
+  assert.ok(interaction.actions && Object.keys(interaction.actions).length > 0, "arena must expose interactive actions");
+  const semanticIcons = new Set(state.arena?.visuals?.ui_icon_system?.semantic_ids || []);
+  for (const [action, metadata] of Object.entries(interaction.actions)) {
+    assert.ok(metadata.rect, `arena ${action} must expose its logical hit rect`);
+    assert.ok(typeof metadata.label === "string" && metadata.label.trim().length > 0, `arena ${action} must expose a localized label`);
+    assert.equal(typeof metadata.icon_only, "boolean", `arena ${action} must declare whether it is icon-only`);
+    assert.equal(typeof metadata.enabled, "boolean", `arena ${action} must expose its enabled state`);
+    if (metadata.icon_only) {
+      assert.ok(typeof metadata.icon === "string" && metadata.icon.length > 0, `arena icon-only ${action} must use an icon asset`);
+      assert.ok(semanticIcons.has(metadata.icon), `arena icon-only ${action} must resolve through the shared icon catalog`);
+    }
+  }
+}
+
 function arenaTouchScale(state) {
   const logicalWidth = state.input?.logical_viewport_width;
   const viewportCssWidth = state.arena?.layout?.viewport_css?.width;
@@ -278,6 +422,7 @@ function assertArenaTouchTarget(rect, scale, label) {
 function assertArenaSetupTouchChrome(state, phase) {
   const layout = state.arena.layout;
   const scale = arenaTouchScale(state);
+  assert.equal(layout.layout_version, 6, `${phase} must use the icon-first arena layout contract`);
   assert.equal(layout.minimum_touch_css, 44, `${phase} must publish the 44 CSS px touch-target contract`);
   for (const key of ["exit", "back", "language"]) {
     assertArenaTouchTarget(layout[key], scale, `${phase} top-bar ${key}`);
@@ -523,6 +668,13 @@ await runCase(
     const layers = state.projectiles.map((projectile) => projectile.vfx_layers[0]).sort();
     assert.deepEqual(layers, ["burning_ammo", "frost_arrow", "paralysis_arrow", "toxic_payload"].sort());
     assert.equal(state.soldier_upgrades.all_maxed, false);
+    const notificationControl = state.input.icon_controls?.notifications;
+    assert.ok(notificationControl?.visible, "desktop notification icon control must be exposed and visible");
+    assert.ok(typeof notificationControl.icon === "string" && notificationControl.icon.length > 0, "desktop notification control must use an icon asset");
+    assert.ok(typeof notificationControl.tooltip === "string" && notificationControl.tooltip.trim().length > 0, "desktop notification control must publish its tooltip label");
+    await hoverLogical(page, state, notificationControl);
+    const hoveredState = await waitForState(page, (value) => value.input?.tooltip?.visible === true && value.input.tooltip.source === "notifications");
+    assertTooltip(hoveredState, "notifications", "hover");
     await page.keyboard.press("t");
     await waitForState(page, (value) => value.input.cheat_active === true);
     await page.keyboard.press("Control+A");
@@ -583,6 +735,49 @@ await runCase(
 );
 
 await runCase(
+  "touch-onboarding-controls-568x320",
+  {
+    viewport: { width: 568, height: 320 },
+    touch: true,
+    mobile: true,
+    deviceScaleFactor: 2,
+    locale: "zh-TW",
+    params: { touch: "1", lang: "zh_TW" },
+  },
+  async (page) => {
+    let state = await waitForState(page, (value) => value.mode === "title" && value.input?.scheme === "touch");
+    minimumTouchCss(state);
+    assertMainTouchTarget(state, state.input.title_actions.start, "title start");
+    await tapLogical(page, state, state.input.title_actions.start);
+    state = await waitForState(page, (value) => value.mode === "class_select" && value.input?.class_select_actions?.confirm);
+    // Let the compatibility-pointer guard expire before exercising the new
+    // carousel. A single physical touch must never auto-select the center card.
+    await page.waitForTimeout(450);
+    let classActions = state.input.class_select_actions;
+    assert.deepEqual(Object.keys(classActions).sort(), ["back", "confirm", "next", "prev"]);
+    for (const [action, rect] of Object.entries(classActions)) {
+      assertMainTouchTarget(state, rect, `class select ${action}`);
+    }
+    assertNoTargetOverlaps(Object.entries(classActions), "class select actions");
+    await tapLogical(page, state, classActions.back);
+    state = await waitForState(page, (value) => value.mode === "title" && value.input?.title_actions?.start);
+    await tapLogical(page, state, state.input.title_actions.start);
+    state = await waitForState(page, (value) => value.mode === "class_select" && value.input?.class_select_actions?.confirm);
+    await page.waitForTimeout(450);
+    classActions = state.input.class_select_actions;
+    const initialPreview = state.input.class_select_preview?.id;
+    await tapLogical(page, state, classActions.next);
+    state = await waitForState(page, (value) => value.mode === "class_select" && value.input?.class_select_preview?.id !== initialPreview);
+    const selectedPreview = state.input.class_select_preview.id;
+    await tapLogical(page, state, state.input.class_select_actions.confirm);
+    state = await waitForState(page, (value) => value.mode === "playing" && value.player?.class === selectedPreview && value.input?.tutorial_close?.visible === true);
+    assertMainTouchTarget(state, state.input.tutorial_close, "tutorial close");
+    await tapLogical(page, state, state.input.tutorial_close);
+    await waitForState(page, (value) => value.mode === "playing" && value.input?.tutorial_close?.visible === false);
+  },
+);
+
+await runCase(
   "vip-terrain-animation-touch-844x390",
   {
     viewport: { width: 844, height: 390 },
@@ -617,7 +812,7 @@ await runCase(
 
     const controls = state.input.virtual_controls;
     assert.equal(controls.utility_layout, "collapsible_dual_side_rails");
-    assert.equal(controls.utility_drawer_open, false);
+    assertUtilityDrawerSide(state, "");
     assertDynamicJoystickContract(state, "move");
     assertDynamicJoystickContract(state, "attack");
     assert.equal(intersects(controls.special, controls.gameplay_clear), false, "VIP special button must stay outside the center gameplay corridor");
@@ -677,7 +872,7 @@ for (const viewport of [
       const scale = state.input.touch_ui_coordinate_scale;
       const clear = controls.gameplay_clear;
       assert.equal(controls.utility_layout, "collapsible_dual_side_rails");
-      assert.equal(controls.utility_drawer_open, false);
+      assertUtilityDrawerSide(state, "");
       assertDynamicJoystickContract(state, "move");
       assertDynamicJoystickContract(state, "attack");
       assert.ok(clear.width / scale >= 160);
@@ -695,10 +890,12 @@ for (const viewport of [
       assert.equal(held.input.virtual_controls.attack.pointer, -1);
       assert.equal(held.input.attack_held, false);
       await tapLogical(page, state, controls.utility_handles.left);
-      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
-      assert.equal(Object.values(state.input.virtual_controls.utility).filter((item) => item.visible).length, 10);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_side === "left");
+      assertUtilityDrawerSide(state, "left");
+      assert.equal(Object.values(state.input.virtual_controls.utility).filter((item) => item.visible).length, LEFT_UTILITY_ACTIONS.length);
       await tapLogical(page, state, state.input.virtual_controls.utility_handles.left);
-      await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === false);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_side === "");
+      assertUtilityDrawerSide(state, "");
     },
   );
 }
@@ -724,7 +921,7 @@ for (const viewport of [
       assert.equal(Object.keys(utility).length, 10);
       assertDynamicJoystickContract(state, "move");
       assertDynamicJoystickContract(state, "attack");
-      assert.equal(controls.utility_drawer_open, false);
+      assertUtilityDrawerSide(state, "");
       assert.equal(controls.move.visible, true);
       assert.equal(controls.attack.visible, true);
       assert.equal(controls.move.visual_visible, false);
@@ -732,12 +929,10 @@ for (const viewport of [
       assert.equal(controls.special.visible, true);
       assert.ok(clear.width / scale >= 160, "phone layout must reserve at least 160 CSS px through the center");
       assert.ok(clear.width / logicalWidth >= 0.34, "phone layout must keep at least 34% of the width button-free");
-      const left = ["upgrades", "recruit", "command", "skills", "map"];
-      const right = ["guide", "notices", "cheat", "fullscreen", "pause"];
-      for (const action of [...left, ...right]) {
+      for (const action of [...LEFT_UTILITY_ACTIONS, ...RIGHT_UTILITY_ACTIONS]) {
         const rect = utility[action];
         assert.equal(rect.visible, false, `${action} should stay collapsed during combat`);
-        assert.ok(rect.width / scale >= 43.9 && rect.height / scale >= 43.9, `${action} is below 44 CSS px`);
+        assertMainTouchTarget(state, rect, `collapsed utility ${action}`, { visible: false });
       }
       const collapsedRects = [controls.special, handles.left, handles.right];
       let occupiedCssArea = 0;
@@ -786,8 +981,9 @@ for (const viewport of [
       assert.ok(Math.hypot(state.player.x - playerBefore.x, state.player.y - playerBefore.y) > 0.5, "dynamic move stick must move the player at every supported phone size");
 
       await tapLogical(page, state, handles.left);
-      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_side === "left");
       const openControls = state.input.virtual_controls;
+      assertUtilityDrawerSide(state, "left");
       if (viewport.width === 568) {
         await page.screenshot({ path: path.join(artifactDir, "touch-568x320-utility-drawer-open.png") });
       }
@@ -797,36 +993,25 @@ for (const viewport of [
       assert.equal(openControls.move.pointer, -1);
       assert.equal(openControls.attack.pointer, -1);
       assert.equal(openControls.utility_handles.left.mode, "close");
-      assert.equal(openControls.utility_handles.right.mode, "close");
-      const leftRailEnd = Math.max(...left.map((action) => openControls.utility[action].x + openControls.utility[action].width));
-      const rightRailStart = Math.min(...right.map((action) => openControls.utility[action].x));
-      assert.ok(openControls.utility_handles.left.x >= leftRailEnd + 5.9 * scale, "left close handle must sit beside the left rail");
-      assert.ok(openControls.utility_handles.left.x + openControls.utility_handles.left.width <= clear.x, "left close handle must remain left of the gameplay corridor");
-      assert.ok(openControls.utility_handles.right.x + openControls.utility_handles.right.width <= rightRailStart - 5.9 * scale, "right close handle must sit beside the right rail");
-      assert.ok(openControls.utility_handles.right.x >= clear.x + clear.width, "right close handle must remain right of the gameplay corridor");
-      const openRects = [
-        ...[...left, ...right].map((action) => openControls.utility[action]),
-        openControls.utility_handles.left,
-        openControls.utility_handles.right,
-      ];
-      for (let index = 0; index < openRects.length; index += 1) {
-        const rect = openRects[index];
-        assert.equal(rect.visible, true);
-        assert.ok(rect.x >= 0 && rect.y >= 0 && rect.x + rect.width <= logicalWidth + 0.5 && rect.y + rect.height <= logicalHeight + 0.5, "open utility must remain inside the phone viewport");
-        assert.equal(intersects(rect, clear), false, "open utilities must stay outside the center gameplay corridor");
-        for (let previous = 0; previous < index; previous += 1) {
-          assert.equal(intersects(rect, openRects[previous]), false, "open utilities must not overlap");
-        }
+      assert.equal(openControls.utility_handles.right.mode, "open");
+      for (const action of LEFT_UTILITY_ACTIONS) {
+        assert.equal(intersects(openControls.utility[action], clear), false, `${action} must stay outside the center gameplay corridor`);
       }
       await tapLogical(page, state, openControls.utility.upgrades);
       const panelState = await waitForState(page, (value) => value.panel === "soldier_upgrades");
-      assert.equal(panelState.input.virtual_controls.panel_close.visible, true);
+      assertMainTouchTarget(panelState, panelState.input.virtual_controls.panel_close, "soldier upgrades close");
+      assertTooltip(panelState, "upgrades", "touch");
       await tapLogical(page, panelState, panelState.input.virtual_controls.panel_close);
-      state = await waitForState(page, (value) => value.panel === "" && value.input.virtual_controls.utility_drawer_open === false);
+      state = await waitForState(page, (value) => value.panel === "" && value.input.virtual_controls.utility_drawer_side === "");
+      assertUtilityDrawerSide(state, "");
       await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
-      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === true);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_side === "right");
+      assertUtilityDrawerSide(state, "right");
+      assert.equal(state.input.virtual_controls.utility_handles.left.mode, "open");
+      assert.equal(state.input.virtual_controls.utility_handles.right.mode, "close");
       await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
-      await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_open === false);
+      state = await waitForState(page, (value) => value.input.virtual_controls.utility_drawer_side === "");
+      assertUtilityDrawerSide(state, "");
       if (viewport.width === 568) {
         await page.evaluate(() => window.advanceTime(6500));
         await page.screenshot({ path: path.join(artifactDir, "touch-568x320-design-qa.png") });
@@ -908,6 +1093,25 @@ await runCase(
       assert.equal(resumed.input.attack_held, false, "main attack must not relatch after rotation");
       return resumed;
     });
+
+    // A native LineEdit can otherwise remain above the portrait blocker. Open
+    // the touch cheat modal, rotate while it owns focus, and verify both the
+    // canvas modal and its real Control are dismissed before the blocker draws.
+    await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
+    state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_side === "right");
+    await tapLogical(page, state, state.input.virtual_controls.utility.cheat);
+    state = await waitForState(page, (value) => value.input?.cheat_active === true && value.input?.cheat_control?.visible === true);
+    await page.setViewportSize({ width: 320, height: 568 });
+    const portraitWithDismissedCheat = await waitForState(page, (value) => (
+      value.input?.needs_landscape_rotation === true &&
+      value.input?.cheat_active === false &&
+      value.input?.cheat_control?.visible === false
+    ));
+    assert.deepEqual(portraitWithDismissedCheat.input.cheat_actions, {});
+    await page.waitForTimeout(80);
+    await page.screenshot({ path: path.join(artifactDir, "touch-main-portrait-cheat-dismissed.png") });
+    await page.setViewportSize({ width: 568, height: 320 });
+    await waitForState(page, (value) => value.input?.needs_landscape_rotation === false && value.input?.cheat_active === false);
   },
 );
 
@@ -930,20 +1134,39 @@ await runCase(
 
     const openPanel = async (action, expectedPanel) => {
       state = await readState(page);
-      if (!state.input.virtual_controls.utility_drawer_open) {
+      if (state.input.virtual_controls.utility_drawer_side !== "left") {
         await tapLogical(page, state, state.input.virtual_controls.utility_handles.left);
-        state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_open === true);
+        state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_side === "left");
       }
+      assertUtilityDrawerSide(state, "left");
       await tapLogical(page, state, state.input.virtual_controls.utility[action]);
       state = await waitForState(page, (value) => value.panel === expectedPanel);
-      assert.equal(state.input.virtual_controls.panel_close.visible, true);
+      assertMainTouchTarget(state, state.input.virtual_controls.panel_close, `${expectedPanel} close`);
       assert.equal(state.ui.active_surface, `panel.${expectedPanel}`);
       if (expectedPanel === "soldier_upgrades") {
         assert.ok(state.soldier_upgrades.selected_type, "troop upgrade gallery must expose the selected troop controls");
         assert.ok(["base", "special"].includes(state.soldier_upgrades.category));
       }
+      if (expectedPanel === "skills") {
+        const upgrades = state.input.virtual_controls.skills_upgrade_buttons;
+        assert.ok(Array.isArray(upgrades) && upgrades.length === 5, "skills must expose all five upgrade targets");
+        for (const [index, rect] of upgrades.entries()) {
+          assertMainTouchTarget(state, rect, `skill upgrade ${index + 1}`);
+        }
+        assertNoTargetOverlaps(
+          [["close", state.input.virtual_controls.panel_close], ...upgrades.map((rect, index) => [`upgrade ${index + 1}`, rect])],
+          "skills panel targets",
+        );
+      }
       if (expectedPanel === "command") {
         assert.equal(state.input.virtual_controls.command_buttons.length, 6, "command gallery must expose all six touch commands");
+        for (const [index, rect] of state.input.virtual_controls.command_buttons.entries()) {
+          assertMainTouchTarget(state, rect, `command ${index + 1}`);
+        }
+        assertNoTargetOverlaps(
+          state.input.virtual_controls.command_buttons.map((rect, index) => [`command ${index + 1}`, rect]),
+          "command panel targets",
+        );
       }
       await page.waitForTimeout(80);
       await page.screenshot({ path: path.join(artifactDir, `touch-material-panel-${expectedPanel}.png`) });
@@ -960,40 +1183,137 @@ await runCase(
       await openPanel(action, panel);
     }
 
-    await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
-    state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_open === true);
+    if (state.input.virtual_controls.utility_drawer_side !== "right") {
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
+      state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_side === "right");
+    }
+    assertUtilityDrawerSide(state, "right");
     await tapLogical(page, state, state.input.virtual_controls.utility.pause);
     state = await waitForState(page, (value) => value.mode === "paused" && value.input?.virtual_controls?.pause_actions?.length > 0);
     const resume = state.input.virtual_controls.pause_actions.find((item) => item.action === "resume");
+    const restart = state.input.virtual_controls.pause_actions.find((item) => item.action === "restart");
     assert.ok(resume, "touch pause menu must expose a resume target");
+    assert.ok(restart, "touch pause menu must expose a restart target");
     assert.equal(state.ui.active_surface, "paused");
-    assert.ok(state.input.virtual_controls.pause_language.width > 0);
+    for (const item of state.input.virtual_controls.pause_actions) {
+      assertMainTouchTarget(state, item, `pause ${item.action}`);
+    }
+    assertNoTargetOverlaps(
+      state.input.virtual_controls.pause_actions.map((item) => [item.action, item]),
+      "pause actions",
+    );
+    assertMainTouchTarget(state, state.input.virtual_controls.pause_language, "pause language");
     assert.deepEqual(Object.keys(state.input.virtual_controls.pause_volume).sort(), ["down", "mute", "up"]);
+    for (const [action, rect] of Object.entries(state.input.virtual_controls.pause_volume)) {
+      assertMainTouchTarget(state, rect, `pause volume ${action}`);
+    }
     await page.waitForTimeout(80);
     await page.screenshot({ path: path.join(artifactDir, "touch-material-panel-pause.png") });
-    await tapLogical(page, state, resume);
+    await tapLogical(page, state, restart);
+    state = await waitForState(page, (value) => value.mode === "paused" && value.panel === "confirm_restart" && value.input?.confirm_restart_actions?.cancel);
+    const confirmActions = state.input.confirm_restart_actions;
+    assert.deepEqual(Object.keys(confirmActions).sort(), ["cancel", "confirm"]);
+    for (const [action, rect] of Object.entries(confirmActions)) {
+      assertMainTouchTarget(state, rect, `confirm restart ${action}`);
+    }
+    assertNoTargetOverlaps(Object.entries(confirmActions), "confirm restart actions");
+    await tapLogical(page, state, confirmActions.cancel);
+    state = await waitForState(page, (value) => value.mode === "paused" && value.panel === "");
+    const resumedTarget = state.input.virtual_controls.pause_actions.find((item) => item.action === "resume");
+    assert.ok(resumedTarget, "resume target must remain operable after cancelling restart");
+    await tapLogical(page, state, resumedTarget);
     state = await waitForState(page, (value) => value.mode === "playing" && value.panel === "");
 
-    await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
-    state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_open === true);
+    if (state.input.virtual_controls.utility_drawer_side !== "right") {
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
+      state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_side === "right");
+    }
+    assertUtilityDrawerSide(state, "right");
     await tapLogical(page, state, state.input.virtual_controls.utility.cheat);
-    state = await waitForState(page, (value) => value.input?.cheat_active === true);
+    state = await waitForState(page, (value) => value.input?.cheat_active === true && value.input?.cheat_actions?.cancel);
     assert.ok(state.ui.textured_regions.includes("panels.cheat"));
+    assertTooltip(state, "cheat", "touch");
+    const cheatActions = state.input.cheat_actions;
+    assert.deepEqual(Object.keys(cheatActions).sort(), ["cancel", "submit"]);
+    for (const [action, rect] of Object.entries(cheatActions)) {
+      assertMainTouchTarget(state, rect, `cheat ${action}`);
+    }
+    assertNoTargetOverlaps(Object.entries(cheatActions), "cheat actions");
     await page.waitForTimeout(80);
     await page.screenshot({ path: path.join(artifactDir, "touch-material-panel-cheat.png") });
-    await page.keyboard.press("Escape");
-    await waitForState(page, (value) => value.input?.cheat_active === false);
+    await page.keyboard.type("gold coins");
+    await tapLogical(page, state, cheatActions.cancel);
+    state = await waitForState(page, (value) => value.input?.cheat_active === false && value.mode === "playing");
+    const moneyBeforeCheat = state.player.money;
+    if (state.input.virtual_controls.utility_drawer_side !== "right") {
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.right);
+      state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_side === "right");
+    }
+    await tapLogical(page, state, state.input.virtual_controls.utility.cheat);
+    state = await waitForState(page, (value) => value.input?.cheat_active === true && value.input?.cheat_actions?.submit);
+    await page.keyboard.type("gold coins");
+    await tapLogical(page, state, state.input.cheat_actions.submit);
+    state = await waitForState(page, (value) => value.input?.cheat_active === false && value.player?.money >= moneyBeforeCheat + 100000);
 
     await page.evaluate(() => window.force_recruit_showcase_for_test(true, "zh_TW"));
     state = await waitForState(page, (value) => value.mode === "playing" && value.panel === "recruit" && value.input?.scheme === "touch");
     assertMainUiMaterialContract(state);
-    assert.equal(state.input.virtual_controls.panel_close.visible, true);
+    assertMainTouchTarget(state, state.input.virtual_controls.panel_close, "recruit close");
     assert.equal(state.ui.active_surface, "panel.recruit");
     assert.ok(state.input.virtual_controls.recruit_buy.length > 0, "recruit gallery must expose touch purchase controls");
+    const recruitTargets = state.input.virtual_controls.recruit_buy;
+    for (const item of recruitTargets) {
+      assertMainTouchTarget(state, item, `recruit ${item.type}`);
+    }
+    assertNoTargetOverlaps(recruitTargets.map((item) => [item.type, item]), "recruit purchase targets");
+    const recruitPage = state.input.virtual_controls.recruit_page;
+    assert.ok(recruitPage?.page_count >= 2, "phone recruit panel must paginate the complete roster");
+    assertMainTouchTarget(state, recruitPage.prev, "recruit previous page");
+    assertMainTouchTarget(state, recruitPage.next, "recruit next page");
+    assertNoTargetOverlaps(
+      [
+        ["close", state.input.virtual_controls.panel_close],
+        ["previous page", recruitPage.prev],
+        ["next page", recruitPage.next],
+        ...recruitTargets.map((item) => [`buy ${item.type}`, item]),
+      ],
+      "all recruit panel targets",
+    );
+    const firstPageTypes = recruitTargets.map((item) => item.type);
+    await tapLogical(page, state, recruitPage.next);
+    state = await waitForState(page, (value) => value.panel === "recruit" && value.input?.virtual_controls?.recruit_page?.page === recruitPage.page + 1);
+    const nextPageTargets = state.input.virtual_controls.recruit_buy;
+    assert.ok(nextPageTargets.length > 0);
+    assert.equal(nextPageTargets.some((item) => firstPageTypes.includes(item.type)), false, "adjacent recruit pages must not repeat soldiers");
+    for (const item of nextPageTargets) {
+      assertMainTouchTarget(state, item, `recruit page 2 ${item.type}`);
+    }
+    assertNoTargetOverlaps(nextPageTargets.map((item) => [item.type, item]), "recruit page 2 targets");
     await page.waitForTimeout(80);
     await page.screenshot({ path: path.join(artifactDir, "touch-material-panel-recruit.png") });
     await tapLogical(page, state, state.input.virtual_controls.panel_close);
     await waitForState(page, (value) => value.mode === "playing" && value.panel === "");
+
+    // Keep real English phone captures in the same visual audit. These three
+    // surfaces previously fell back to fragment replacement and could mix
+    // Chinese suffixes into otherwise English labels.
+    await page.evaluate(() => window.force_recruit_showcase_for_test(true, "en"));
+    state = await waitForState(page, (value) => value.mode === "playing" && value.panel === "recruit" && value.language === "en");
+    await page.waitForTimeout(80);
+    await page.screenshot({ path: path.join(artifactDir, "touch-material-panel-recruit-en.png") });
+    await tapLogical(page, state, state.input.virtual_controls.panel_close);
+    state = await waitForState(page, (value) => value.mode === "playing" && value.panel === "" && value.language === "en");
+
+    for (const [action, panel] of [["command", "command"], ["map", "map"]]) {
+      await tapLogical(page, state, state.input.virtual_controls.utility_handles.left);
+      state = await waitForState(page, (value) => value.input?.virtual_controls?.utility_drawer_side === "left");
+      await tapLogical(page, state, state.input.virtual_controls.utility[action]);
+      state = await waitForState(page, (value) => value.panel === panel && value.language === "en");
+      await page.waitForTimeout(80);
+      await page.screenshot({ path: path.join(artifactDir, `touch-material-panel-${panel}-en.png`) });
+      await tapLogical(page, state, state.input.virtual_controls.panel_close);
+      state = await waitForState(page, (value) => value.mode === "playing" && value.panel === "" && value.language === "en");
+    }
   },
 );
 
@@ -1029,6 +1349,7 @@ for (const phase of ["types", "counts", "upgrades"]) {
       }
       assertMainUiMaterialContract(state);
       assertArenaUiMaterialContract(state);
+      assertArenaInteractionContract(state);
       assert.equal(state.arena.no_player, true);
       assert.deepEqual(state.arena.selection_flow, ["types", "counts", "upgrades", "battle"]);
       const scale = assertArenaSetupTouchChrome(state, phase);
@@ -1080,6 +1401,97 @@ for (const phase of ["types", "counts", "upgrades"]) {
     },
   );
 }
+
+await runCase(
+  "arena-touch-release-preview-and-cancel-568x320",
+  {
+    viewport: { width: 568, height: 320 },
+    touch: true,
+    params: { arena_scene: "types", arena_mode: "spectator", touch: "1", lang: "zh_TW" },
+  },
+  async (page) => {
+    let state = await waitForState(page, (value) => value.mode === "arena" && value.arena?.phase === "types");
+    assertArenaInteractionContract(state);
+    assert.equal(state.arena.active_team, "blue");
+    assert.equal(state.arena.interaction.actions.type_prev.enabled, false, "first-page previous must be truly disabled");
+    assert.equal(state.arena.interaction.actions.type_next.enabled, true);
+    assert.deepEqual(state.arena.interaction.actions.team_red.rect, state.arena.layout.team_tabs.red, "interaction and layout hit rectangles must align");
+
+    await tapLogical(page, state, state.arena.layout.page_prev);
+    await page.waitForTimeout(80);
+    state = await readState(page);
+    assert.equal(state.arena.layout.type_layout.page, 0, "disabled previous-page action must not execute");
+    assert.equal(state.arena.interaction.pending_touch_action, "", "disabled action must not own a touch pointer");
+
+    // Labeled actions also wait for release, and a deliberate drag cancels them.
+    let session = await beginLogicalTouch(page, state, state.arena.layout.team_tabs.red, 92);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "team_red");
+    assert.equal(state.arena.active_team, "blue", "team tab must not activate on finger-down");
+    await moveLogicalTouch(session, { x: 12, y: 0 });
+    state = await waitForState(page, (value) => value.arena?.interaction?.touch_preview_only === true);
+    await endLogicalTouch(session);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "");
+    assert.equal(state.arena.active_team, "blue", "dragging a labeled action must cancel its release");
+
+    session = await beginLogicalTouch(page, state, state.arena.layout.team_tabs.red, 93);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "team_red");
+    assert.equal(state.arena.active_team, "blue");
+    await endLogicalTouch(session);
+    state = await waitForState(page, (value) => value.arena?.active_team === "red");
+
+    // Icon-only long press is a preview: it keeps touch presentation despite a
+    // delayed pointer-backed mouse move, then releases without changing page.
+    session = await beginLogicalTouch(page, state, state.arena.layout.page_next, 94);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "type_next");
+    assert.equal(state.arena.layout.type_layout.page, 0, "page action must wait for release");
+    state = await waitForState(page, (value) => (
+      value.arena?.interaction?.touch_preview_only === true &&
+      value.arena?.interaction?.tooltip?.visible === true
+    ));
+    assert.equal(state.arena.interaction.tooltip.source, "type_next");
+    assert.equal(state.arena.interaction.tooltip.trigger, "touch");
+    await page.waitForTimeout(350);
+    await page.mouse.move(210, 150);
+    state = await readState(page);
+    assert.equal(state.input.scheme, "touch", "pending arena UI touch must reject compatibility mouse presentation changes");
+    assert.equal(state.arena.interaction.pending_touch_action, "type_next");
+    await endLogicalTouch(session);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "");
+    assert.equal(state.arena.layout.type_layout.page, 0, "long-press preview must not execute on release");
+
+    session = await beginLogicalTouch(page, state, state.arena.layout.page_next, 95);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "type_next");
+    assert.equal(state.arena.layout.type_layout.page, 0);
+    await endLogicalTouch(session);
+    await waitForState(page, (value) => value.arena?.layout?.type_layout?.page === 1);
+  },
+);
+
+await runCase(
+  "arena-desktop-hover-and-focus-tooltip",
+  {
+    viewport: { width: 1280, height: 720 },
+    params: { arena_scene: "types", arena_mode: "spectator", lang: "en" },
+  },
+  async (page) => {
+    let state = await waitForState(page, (value) => value.mode === "arena" && value.arena?.phase === "types");
+    assertArenaInteractionContract(state);
+    await hoverLogical(page, state, state.arena.layout.exit);
+    state = await waitForState(page, (value) => (
+      value.arena?.interaction?.tooltip?.visible === true &&
+      value.arena.interaction.tooltip.trigger === "hover"
+    ));
+    assert.equal(state.arena.interaction.tooltip.source, "common_exit");
+    assert.ok(state.arena.interaction.tooltip.text.length > 0);
+    assert.ok(state.arena.interaction.tooltip.rect.width > 0 && state.arena.interaction.tooltip.rect.height > 0);
+
+    await page.locator("canvas").first().focus();
+    await page.keyboard.press("Tab");
+    state = await waitForState(page, (value) => value.arena?.interaction?.tooltip?.trigger === "focus");
+    assert.equal(state.arena.interaction.tooltip.source, state.arena.interaction.focused);
+    assert.equal(state.arena.interaction.actions[state.arena.interaction.focused].icon_only, true);
+  },
+);
 
 await runCase(
   "arena-interactive-flow-touch-568x320",
@@ -1139,6 +1551,7 @@ await runCase(
 
     state = await waitForAdvancedState(page, (value) => value.arena?.phase === "result", 1000, 30000);
     assert.ok(state.arena.winner, "completed arena battle must expose its winner");
+    assertArenaInteractionContract(state);
     scale = arenaTouchScale(state);
     const resultActions = state.arena.layout.result_actions;
     assert.deepEqual(Object.keys(resultActions).sort(), ["leave", "rematch"]);
@@ -1153,11 +1566,20 @@ await runCase(
       );
     }
     assert.equal(intersects(resultActions.rematch, resultActions.leave), false, "arena result actions must not overlap");
-    for (const [action, rect] of Object.entries(state.arena.layout.battle_controls)) {
-      assertArenaTouchTarget(rect, scale, `arena result top-bar ${action}`);
+    assert.equal(state.arena.layout.battle_controls_visible, false, "arena result must hide duplicate top-bar battle actions");
+    assert.equal(Object.hasOwn(state.arena.layout, "battle_controls"), false, "arena result must expose only the central result actions");
+    for (const staleKey of ["exit", "back", "language", "primary", "move_stick", "aim_stick"]) {
+      assert.equal(Object.hasOwn(state.arena.layout, staleKey), false, `arena result must not expose phantom ${staleKey} controls`);
     }
+    assert.deepEqual(Object.keys(state.arena.interaction.actions).sort(), ["result_leave", "result_rematch"]);
     await page.waitForTimeout(80);
     await page.screenshot({ path: path.join(artifactDir, "arena-result-actions-touch-568x320-active.png") });
+
+    const rematchTouch = await beginLogicalTouch(page, state, resultActions.rematch, 96);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "result_rematch");
+    assert.equal(state.arena.phase, "result", "result action must not execute on finger-down");
+    await endLogicalTouch(rematchTouch);
+    await waitForState(page, (value) => value.arena?.phase === "battle");
   },
 );
 
@@ -1257,6 +1679,22 @@ await runCase(
     assertArenaUiMaterialContract(state);
     assert.equal(state.arena.layout.rotation_required, true);
     assert.equal(state.arena.layout.controls_visible, false);
+    assert.deepEqual(Object.keys(state.arena.layout.rotation_actions || {}).sort(), ["exit", "language"]);
+    const rotationScale = arenaTouchScale(state);
+    for (const [action, rect] of Object.entries(state.arena.layout.rotation_actions)) {
+      assertArenaTouchTarget(rect, rotationScale, `arena rotation ${action}`);
+    }
+    assertNoTargetOverlaps(Object.entries(state.arena.layout.rotation_actions), "arena rotation actions");
+    assert.deepEqual(Object.keys(state.arena.interaction.actions).sort(), ["rotation_exit", "rotation_language"]);
+    for (const staleKey of ["exit", "back", "language", "primary", "battle_controls", "move_stick", "aim_stick"]) {
+      assert.equal(Object.hasOwn(state.arena.layout, staleKey), false, `portrait overlay must hide ${staleKey}`);
+    }
+
+    const languageTouch = await beginLogicalTouch(page, state, state.arena.layout.rotation_actions.language, 97);
+    state = await waitForState(page, (value) => value.arena?.interaction?.pending_touch_action === "rotation_language");
+    assert.equal(state.language, "en", "portrait language action must wait for release");
+    await endLogicalTouch(languageTouch);
+    state = await waitForState(page, (value) => value.language === "zh_TW" && value.arena?.layout?.rotation_required === true);
     const timeBefore = state.arena.battle_time;
     await page.evaluate(() => window.advanceTime(1200));
     state = await readState(page);

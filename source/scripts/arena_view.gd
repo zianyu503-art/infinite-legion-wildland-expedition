@@ -16,6 +16,7 @@ const WorldGenerator = preload("res://scripts/world_generator.gd")
 const CampaignVisualRenderer = preload("res://scripts/campaign_visual_renderer.gd")
 const SoldierUpgradeCatalog = preload("res://scripts/soldier_upgrade_catalog.gd")
 const SoldierUpgradeVfxCatalog = preload("res://scripts/soldier_upgrade_vfx_catalog.gd")
+const UiIconCatalog = preload("res://scripts/ui_icon_catalog.gd")
 const UI_STEEL_TEXTURE = preload("res://assets/ui/textures/dark_blued_steel.png")
 const UI_BRONZE_TEXTURE = preload("res://assets/ui/textures/aged_hammered_bronze.png")
 const UI_CANVAS_TEXTURE = preload("res://assets/ui/textures/tactical_waxed_canvas.png")
@@ -48,6 +49,10 @@ const COMPACT_TOUCH_MAX_HEIGHT_CSS := 420.0
 const MIN_BATTLE_CAMERA_ZOOM := 0.20
 const CAMPAIGN_MAP_DRAW_MARGIN := 180.0
 const CAMPAIGN_COVERAGE_EPSILON := 0.5
+const TOOLTIP_HOVER_DELAY := 0.35
+const TOOLTIP_TOUCH_DURATION := 1.20
+const TOUCH_PREVIEW_HOLD_SECONDS := 0.35
+const TOUCH_ACTION_DRAG_CANCEL_CSS := 10.0
 
 var controller: ArenaController
 var language := "zh_TW"
@@ -77,6 +82,19 @@ var touch_attack_held := false
 var _font: Font
 var _sound_cooldown := 0.0
 var _last_winner := ""
+var _pointer_position := Vector2(-10000.0, -10000.0)
+var _pointer_kind := ""
+var _pointer_down := false
+var _focused_action := ""
+var _hovered_action := ""
+var _hover_elapsed := 0.0
+var _touch_tooltip_action := ""
+var _touch_tooltip_remaining := 0.0
+var _pending_touch_action := ""
+var _pending_touch_pointer := -1
+var _pending_touch_origin := Vector2.ZERO
+var _pending_touch_hold := 0.0
+var _pending_touch_preview_only := false
 
 
 func _ready() -> void:
@@ -114,6 +132,7 @@ func open(requested_language: String, requested_touch_mode: bool, requested_scal
 	_reset_transient_input()
 	_sound_cooldown = 0.0
 	_last_winner = ""
+	_reset_ui_interaction()
 	campaign_chunks.clear()
 	campaign_map_summary.clear()
 	_last_draw_trace.clear()
@@ -124,6 +143,7 @@ func open(requested_language: String, requested_touch_mode: bool, requested_scal
 func close() -> void:
 	visible = false
 	_reset_transient_input()
+	_reset_ui_interaction()
 
 
 func set_presentation(requested_language: String, requested_touch_mode: bool, requested_scale: float) -> void:
@@ -134,12 +154,16 @@ func set_presentation(requested_language: String, requested_touch_mode: bool, re
 
 
 func has_active_touch_controls() -> bool:
-	return move_pointer >= 0 or aim_pointer >= 0
+	# Pending UI presses are touch owners too. Keeping them visible here prevents
+	# Chromium's delayed compatibility MouseMotion from switching the Arena to
+	# desktop presentation during an intentional long-press preview.
+	return move_pointer >= 0 or aim_pointer >= 0 or _pending_touch_pointer >= 0
 
 
 func advance(delta: float) -> void:
 	if not visible or controller == null:
 		return
+	_update_ui_interaction(maxf(0.0, delta))
 	if _portrait_rotation_required():
 		# The rotation notice is a real modal state: do not let a hidden battle
 		# advance or retain virtual-stick input behind it.
@@ -191,10 +215,15 @@ func handle_input(event: InputEvent) -> bool:
 		return false
 	if _portrait_rotation_required():
 		_reset_transient_input()
-		return true
+		return _handle_rotation_input(event)
 	if event is InputEventKey:
 		var key_event := event as InputEventKey
 		if key_event.pressed and not key_event.echo:
+			if key_event.keycode == KEY_TAB:
+				_cycle_keyboard_focus(-1 if key_event.shift_pressed else 1)
+				return true
+			if key_event.keycode in [KEY_ENTER, KEY_KP_ENTER] and not _focused_action.is_empty():
+				return _activate_focused_action()
 			if key_event.keycode == KEY_ESCAPE:
 				close_requested.emit()
 				return true
@@ -211,14 +240,25 @@ func handle_input(event: InputEvent) -> bool:
 	if event is InputEventScreenTouch:
 		touch_mode = true
 		var touch := event as InputEventScreenTouch
+		_pointer_kind = "touch"
+		_pointer_position = touch.position
+		_pointer_down = touch.pressed
 		if not touch.pressed:
+			var pending_handled := touch.index == _pending_touch_pointer
+			var pending_activated := _release_pending_touch_action(touch.index, touch.position)
+			if pending_activated:
+				sound_requested.emit("ui", 0.38, 1.0)
 			if touch.index == move_pointer:
 				_end_touch_move()
 			if touch.index == aim_pointer:
 				_end_touch_aim()
+			queue_redraw()
+			if pending_handled:
+				return true
 			return true
-		if _activate_at(touch.position):
-			sound_requested.emit("ui", 0.38, 1.0)
+		_focus_action_at(touch.position, true)
+		if not _focused_action.is_empty():
+			_begin_pending_touch_action(touch.index, touch.position)
 			return true
 		if controller.phase == "battle" and controller.mode == "challenge":
 			if _move_activation_zone().has_point(touch.position) and move_pointer < 0:
@@ -230,22 +270,41 @@ func handle_input(event: InputEvent) -> bool:
 	if event is InputEventScreenDrag:
 		touch_mode = true
 		var drag := event as InputEventScreenDrag
+		_pointer_kind = "touch"
+		_pointer_position = drag.position
+		if drag.index == _pending_touch_pointer:
+			if drag.position.distance_to(_pending_touch_origin) > TOUCH_ACTION_DRAG_CANCEL_CSS * ui_scale:
+				_pending_touch_preview_only = true
+			queue_redraw()
+			return true
 		if drag.index == move_pointer:
 			_update_touch_move(drag.position)
 		elif drag.index == aim_pointer:
 			_update_touch_aim(drag.position)
 		return true
 	if event is InputEventMouseMotion:
+		var motion := event as InputEventMouseMotion
+		_pointer_kind = "mouse"
+		_pointer_position = motion.position
+		_update_hover_target()
 		if controller.phase == "battle" and controller.mode == "challenge" and not controller.hero.is_empty():
-			var mouse_world := _view_to_world((event as InputEventMouseMotion).position)
+			var mouse_world := _view_to_world(motion.position)
 			var delta_to_mouse := mouse_world - Vector2(controller.hero.get("pos", Vector2.ZERO))
 			if delta_to_mouse.length_squared() > 0.01:
 				aim_vector = delta_to_mouse.normalized()
-		return controller.phase == "battle"
+		queue_redraw()
+		return controller.phase == "battle" or not _hovered_action.is_empty()
 	if event is InputEventMouseButton:
 		var mouse := event as InputEventMouseButton
 		if mouse.button_index == MOUSE_BUTTON_LEFT:
-			if mouse.pressed and _activate_at(mouse.position):
+			_pointer_kind = "mouse"
+			_pointer_position = mouse.position
+			_pointer_down = mouse.pressed
+			if mouse.pressed:
+				_focus_action_at(mouse.position, false)
+			else:
+				queue_redraw()
+			if mouse.pressed and not _focused_action.is_empty() and _activate_at(mouse.position):
 				sound_requested.emit("ui", 0.38, 1.0)
 				mouse_attack_held = false
 				return true
@@ -270,12 +329,13 @@ func render_state() -> Dictionary:
 	state["hero_class"] = hero_class
 	state["touch"] = touch_mode
 	state["ui_scale"] = snappedf(ui_scale, 0.001)
-	state["layout_version"] = 5
+	state["layout_version"] = 6
 	state["joystick_mode"] = "dynamic_origin"
 	state["camera"] = {"x": snappedf(camera_position.x, 0.1), "y": snappedf(camera_position.y, 0.1), "zoom": snappedf(camera_zoom, 0.001)}
 	state["selection_flow"] = ["types", "counts", "upgrades", "battle"]
 	state["layout"] = _layout_state()
 	state["visuals"] = visual_contract()
+	state["interaction"] = _interaction_state()
 	return state
 
 
@@ -295,6 +355,20 @@ func visual_contract() -> Dictionary:
 			"canvas": _texture_status(UI_CANVAS_TEXTURE),
 		},
 		"ui_material_roles": {"shell": "steel", "cards": "canvas", "primary": "bronze"},
+		"ui_icon_system": {
+			"catalog": "UiIconCatalog",
+			"source_family": "Adwaita symbolic",
+			"semantic_ids": Array(UiIconCatalog.semantic_ids()),
+			"mobile_visible_plate_css": 36.0,
+			"mobile_hit_target_css": MIN_TOUCH_TARGET_CSS,
+		},
+		"interaction_states": ["default", "hover", "pressed", "focus", "selected", "disabled"],
+		"tooltip_policy": {
+			"hover_delay_seconds": TOOLTIP_HOVER_DELAY,
+			"touch_seconds": TOOLTIP_TOUCH_DURATION,
+			"touch_activation": "release",
+			"long_press_preview_seconds": TOUCH_PREVIEW_HOLD_SECONDS,
+		},
 		"textured_regions": ["setup_background", "header", "footer", "cards", "buttons", "battle_hud", "battle_dynamic_sticks", "result_panel"],
 		"world_seed": campaign_world_seed,
 		"map_anchor": {"x": snappedf(campaign_map_anchor.x, 0.1), "y": snappedf(campaign_map_anchor.y, 0.1)},
@@ -383,6 +457,22 @@ func _reset_transient_input() -> void:
 	aim_origin = Vector2.ZERO
 	mouse_attack_held = false
 	touch_attack_held = false
+
+
+func _reset_ui_interaction() -> void:
+	_pointer_position = Vector2(-10000.0, -10000.0)
+	_pointer_kind = ""
+	_pointer_down = false
+	_focused_action = ""
+	_hovered_action = ""
+	_hover_elapsed = 0.0
+	_touch_tooltip_action = ""
+	_touch_tooltip_remaining = 0.0
+	_pending_touch_action = ""
+	_pending_touch_pointer = -1
+	_pending_touch_origin = Vector2.ZERO
+	_pending_touch_hold = 0.0
+	_pending_touch_preview_only = false
 
 
 func _portrait_rotation_required() -> bool:
@@ -602,6 +692,10 @@ func _activate_battle_at(position: Vector2) -> bool:
 		if Rect2(result_actions["leave"]).has_point(position):
 			close_requested.emit()
 			return true
+		# The result panel is the only action surface in this state.  Keeping the
+		# setup/restart/exit header hot underneath it created duplicate choices
+		# and accidental exits on short touch screens.
+		return false
 	var controls := _battle_control_rects()
 	if Rect2(controls["exit"]).has_point(position):
 		close_requested.emit()
@@ -1040,22 +1134,24 @@ func _upgrade_option_rects() -> Array[Dictionary]:
 func _page_rect(direction: String) -> Rect2:
 	var s := ui_scale
 	var footer_y := size.y - _footer_height() + 8.0 * s
-	return Rect2(10.0 * s if direction == "prev" else 104.0 * s, footer_y, 88.0 * s, 44.0 * s)
+	return Rect2(10.0 * s if direction == "prev" else 60.0 * s, footer_y, MIN_TOUCH_TARGET_CSS * s, MIN_TOUCH_TARGET_CSS * s)
 
 
 func _battle_control_rects() -> Dictionary:
 	var s := ui_scale
 	var button_height := MIN_TOUCH_TARGET_CSS * s
+	var button_width := (MIN_TOUCH_TARGET_CSS if touch_mode else 96.0) * s
+	var gap := 6.0 * s
 	return {
-		"setup": Rect2(8.0 * s, 8.0 * s, 104.0 * s, button_height),
-		"restart": Rect2(118.0 * s, 8.0 * s, 104.0 * s, button_height),
-		"exit": Rect2(size.x - 112.0 * s, 8.0 * s, 104.0 * s, button_height),
+		"setup": Rect2(8.0 * s, 8.0 * s, button_width, button_height),
+		"restart": Rect2(8.0 * s + button_width + gap, 8.0 * s, button_width, button_height),
+		"exit": Rect2(size.x - 8.0 * s - button_width, 8.0 * s, button_width, button_height),
 	}
 
 
 func _result_panel_rect() -> Rect2:
 	var s := ui_scale
-	var panel_size := Vector2(minf(440.0 * s, size.x - 24.0 * s), minf(180.0 * s, size.y - 76.0 * s))
+	var panel_size := Vector2(minf(468.0 * s, size.x - 24.0 * s), minf(208.0 * s, size.y - 70.0 * s))
 	return Rect2(size * 0.5 - panel_size * 0.5 + Vector2(0.0, 12.0 * s), panel_size)
 
 
@@ -1073,19 +1169,379 @@ func _result_action_rects() -> Dictionary:
 	}
 
 
+func _rotation_action_rects() -> Dictionary:
+	var s := ui_scale
+	var target := MIN_TOUCH_TARGET_CSS * s
+	var margin := 10.0 * s
+	return {
+		"exit": Rect2(margin, margin, target, target),
+		"language": Rect2(size.x - margin - target, margin, target, target),
+	}
+
+
+func _types_confirm_enabled() -> bool:
+	return (
+		not controller.selected_types_for("red").is_empty()
+		and (controller.mode == "challenge" or not controller.selected_types_for("blue").is_empty())
+	)
+
+
+func _counts_confirm_enabled() -> bool:
+	for team in ["blue", "red"]:
+		var choices := controller.selected_types_for(team)
+		if team == "blue" and controller.mode == "challenge" and choices.is_empty():
+			continue
+		var total := controller.team_total(team)
+		if total <= 0 or total > ArenaControllerScript.MAX_COUNT_PER_TEAM:
+			return false
+		for type_id_value in choices:
+			var amount := controller.count_for(team, str(type_id_value))
+			if amount < ArenaControllerScript.MIN_COUNT_PER_TYPE or amount > ArenaControllerScript.MAX_COUNT_PER_TYPE:
+				return false
+	return true
+
+
+func _count_adjust_enabled(type_id: String, delta: int) -> bool:
+	var amount := controller.count_for(controller.active_team, type_id)
+	if delta < 0:
+		return amount > ArenaControllerScript.MIN_COUNT_PER_TYPE
+	return amount < ArenaControllerScript.MAX_COUNT_PER_TYPE and controller.team_total(controller.active_team) < ArenaControllerScript.MAX_COUNT_PER_TEAM
+
+
+func _upgrade_adjust_enabled(option: Dictionary, delta: int) -> bool:
+	var definition: Dictionary = option.get("definition", {})
+	var rank := int(definition.get("rank", 0))
+	if delta < 0:
+		return rank > 0
+	return rank < int(definition.get("max_rank", 0))
+
+
+func _action_entry(rect: Rect2, zh_label: String, en_label: String, icon_id: String = "", icon_only: bool = false, enabled: bool = true) -> Dictionary:
+	return {
+		"rect": rect,
+		"label": _t(zh_label, en_label),
+		"icon": icon_id,
+		"icon_only": icon_only,
+		"enabled": enabled,
+	}
+
+
+func _interactive_action_entries() -> Dictionary:
+	var result := {}
+	if controller == null:
+		return result
+	if _portrait_rotation_required():
+		var rotation := _rotation_action_rects()
+		result["rotation_exit"] = _action_entry(Rect2(rotation["exit"]), "離開競技場", "LEAVE ARENA", "close", true)
+		result["rotation_language"] = _action_entry(Rect2(rotation["language"]), "切換語言", "CHANGE LANGUAGE", "language", true)
+		return result
+	if controller.phase in ["battle", "result"]:
+		if controller.phase == "result":
+			var result_actions := _result_action_rects()
+			result["result_rematch"] = _action_entry(Rect2(result_actions["rematch"]), "保留陣容再戰", "REMATCH WITH SAME LOADOUT", "rematch", false)
+			result["result_leave"] = _action_entry(Rect2(result_actions["leave"]), "離開競技場", "LEAVE ARENA", "exit", false)
+			return result
+		var battle := _battle_control_rects()
+		result["battle_setup"] = _action_entry(Rect2(battle["setup"]), "調整陣容", "EDIT LOADOUT", "settings", touch_mode)
+		result["battle_restart"] = _action_entry(Rect2(battle["restart"]), "重新開始", "RESTART BATTLE", "restart", touch_mode)
+		result["battle_exit"] = _action_entry(Rect2(battle["exit"]), "離開競技場", "LEAVE ARENA", "exit", touch_mode)
+		return result
+
+	var common := _common_rects()
+	result["common_exit"] = _action_entry(Rect2(common["exit"]), "離開競技場", "LEAVE ARENA", "close", true)
+	if controller.phase != "mode":
+		result["common_back"] = _action_entry(Rect2(common["back"]), "上一步", "BACK", "back", true)
+	result["common_language"] = _action_entry(Rect2(common["language"]), "切換語言", "CHANGE LANGUAGE", "language", true)
+	if controller.mode == "spectator" and controller.phase != "mode":
+		var tabs := _team_tab_rects()
+		result["team_blue"] = _action_entry(Rect2(tabs["blue"]), "編輯藍隊", "EDIT BLUE TEAM")
+		result["team_red"] = _action_entry(Rect2(tabs["red"]), "編輯紅隊", "EDIT RED TEAM")
+	match controller.phase:
+		"mode":
+			var modes := _mode_rects()
+			result["mode_challenge"] = _action_entry(Rect2(modes["challenge"]), "玩家挑戰", "PLAYER CHALLENGE")
+			result["mode_spectator"] = _action_entry(Rect2(modes["spectator"]), "士兵觀戰", "SOLDIER SPECTATOR")
+		"types":
+			var type_rects := _type_rects()
+			for type_id_value in type_rects.keys():
+				var type_id := str(type_id_value)
+				result["type_%s" % type_id] = _action_entry(Rect2(type_rects[type_id]), _soldier_name(type_id), _soldier_name(type_id))
+			if controller.mode == "challenge":
+				for class_id in ["archer", "mage", "warrior"]:
+					result["hero_%s" % class_id] = _action_entry(_hero_class_rect(class_id), _hero_name(class_id), _hero_name(class_id))
+			if _compact_type_pagination_enabled():
+				result["type_prev"] = _action_entry(_page_rect("prev"), "上一頁", "PREVIOUS PAGE", "prev", true, _current_type_page() > 0)
+				result["type_next"] = _action_entry(_page_rect("next"), "下一頁", "NEXT PAGE", "next", true, _current_type_page() < _type_page_count() - 1)
+			result["types_confirm"] = _action_entry(_footer_primary_rect(), "確認士兵並調整數量", "CONFIRM TYPES AND SET COUNTS", "next", false, _types_confirm_enabled())
+		"counts":
+			var count_rects := _count_rects()
+			for type_id_value in count_rects.keys():
+				var type_id := str(type_id_value)
+				var data: Dictionary = count_rects[type_id]
+				result["count_minus_%s" % type_id] = _action_entry(Rect2(data["minus"]), "減少%s" % _soldier_name(type_id), "REMOVE %s" % _soldier_name(type_id), "minus", true, _count_adjust_enabled(type_id, -1))
+				result["count_plus_%s" % type_id] = _action_entry(Rect2(data["plus"]), "增加%s" % _soldier_name(type_id), "ADD %s" % _soldier_name(type_id), "plus", true, _count_adjust_enabled(type_id, 1))
+			var count_page := int(count_pages.get(controller.active_team, 0))
+			result["count_prev"] = _action_entry(_page_rect("prev"), "上一頁", "PREVIOUS PAGE", "prev", true, count_page > 0)
+			result["count_next"] = _action_entry(_page_rect("next"), "下一頁", "NEXT PAGE", "next", true, count_page < _count_page_count() - 1)
+			result["counts_confirm"] = _action_entry(_footer_primary_rect(), "確認數量並選擇強化", "CONFIRM COUNTS AND CHOOSE UPGRADES", "next", false, _counts_confirm_enabled())
+		"upgrades":
+			var toolbar := _upgrade_toolbar_rects()
+			var can_cycle_type := controller.selected_types_for(controller.active_team).size() > 1
+			result["upgrade_type_prev"] = _action_entry(Rect2(toolbar["type_prev"]), "上一個兵種", "PREVIOUS UNIT", "prev", true, can_cycle_type)
+			result["upgrade_type_next"] = _action_entry(Rect2(toolbar["type_next"]), "下一個兵種", "NEXT UNIT", "next", true, can_cycle_type)
+			result["upgrade_base"] = _action_entry(Rect2(toolbar["base"]), "基礎強化", "BASE UPGRADES")
+			result["upgrade_special"] = _action_entry(Rect2(toolbar["special"]), "特殊能力", "SPECIAL ABILITIES")
+			var upgrade_options := _upgrade_option_rects()
+			for option in upgrade_options:
+				var upgrade_id := str(option["id"])
+				var upgrade_name := SoldierUpgradeCatalog.localized_name(upgrade_id, language)
+				result["upgrade_minus_%s" % upgrade_id] = _action_entry(Rect2(option["minus"]), "降低%s" % upgrade_name, "LOWER %s" % upgrade_name, "minus", true, _upgrade_adjust_enabled(option, -1))
+				result["upgrade_plus_%s" % upgrade_id] = _action_entry(Rect2(option["plus"]), "提升%s" % upgrade_name, "RAISE %s" % upgrade_name, "plus", true, _upgrade_adjust_enabled(option, 1))
+			var upgrade_page_count := controller.upgrade_page_count(_upgrade_page_size())
+			result["upgrade_prev"] = _action_entry(_page_rect("prev"), "上一頁", "PREVIOUS PAGE", "prev", true, controller.upgrade_page > 0)
+			result["upgrade_next"] = _action_entry(_page_rect("next"), "下一頁", "NEXT PAGE", "next", true, controller.upgrade_page < upgrade_page_count - 1)
+			result["upgrade_confirm"] = _action_entry(_footer_primary_rect(), "開始戰鬥", "START BATTLE", "play", false, _counts_confirm_enabled())
+	return result
+
+
+func _action_at_position(position: Vector2) -> String:
+	var entries := _interactive_action_entries()
+	for action_id_value in entries.keys():
+		var action_id := str(action_id_value)
+		var entry: Dictionary = entries[action_id]
+		if bool(entry.get("enabled", true)) and Rect2(entry["rect"]).has_point(position):
+			return action_id
+	return ""
+
+
+func _focus_action_at(position: Vector2, show_touch_tooltip: bool) -> void:
+	var action_id := _action_at_position(position)
+	_focused_action = action_id
+	if show_touch_tooltip:
+		_touch_tooltip_action = ""
+		_touch_tooltip_remaining = 0.0
+		if not action_id.is_empty():
+			var entry: Dictionary = _interactive_action_entries().get(action_id, {})
+			if bool(entry.get("icon_only", false)):
+				_touch_tooltip_action = action_id
+				_touch_tooltip_remaining = TOOLTIP_TOUCH_DURATION
+	queue_redraw()
+
+
+func _focused_action_is_icon_only() -> bool:
+	if _focused_action.is_empty():
+		return false
+	var entry: Dictionary = _interactive_action_entries().get(_focused_action, {})
+	return not entry.is_empty() and bool(entry.get("icon_only", false))
+
+
+func _begin_pending_touch_action(pointer_index: int, position: Vector2) -> void:
+	_pending_touch_action = _focused_action
+	_pending_touch_pointer = pointer_index
+	_pending_touch_origin = position
+	_pending_touch_hold = 0.0
+	_pending_touch_preview_only = false
+	var entry: Dictionary = _interactive_action_entries().get(_pending_touch_action, {})
+	if bool(entry.get("icon_only", false)):
+		_touch_tooltip_action = _pending_touch_action
+		_touch_tooltip_remaining = TOOLTIP_TOUCH_DURATION
+	else:
+		_touch_tooltip_action = ""
+		_touch_tooltip_remaining = 0.0
+	queue_redraw()
+
+
+func _clear_pending_touch_action() -> void:
+	_pending_touch_action = ""
+	_pending_touch_pointer = -1
+	_pending_touch_origin = Vector2.ZERO
+	_pending_touch_hold = 0.0
+	_pending_touch_preview_only = false
+
+
+func _release_pending_touch_action(pointer_index: int, position: Vector2) -> bool:
+	if pointer_index != _pending_touch_pointer or _pending_touch_action.is_empty():
+		return false
+	var action_id := _pending_touch_action
+	var entries := _interactive_action_entries()
+	var should_activate := (
+		not _pending_touch_preview_only
+		and entries.has(action_id)
+		and bool(Dictionary(entries[action_id]).get("enabled", true))
+		and _action_at_position(position) == action_id
+	)
+	_clear_pending_touch_action()
+	if not should_activate:
+		return false
+	var activated := _activate_rotation_at(position) if _portrait_rotation_required() else _activate_at(position)
+	if activated:
+		_touch_tooltip_action = action_id
+		_touch_tooltip_remaining = TOOLTIP_TOUCH_DURATION
+	return activated
+
+
+func _update_hover_target() -> void:
+	if _pointer_kind != "mouse":
+		_hovered_action = ""
+		_hover_elapsed = 0.0
+		return
+	var action_id := _action_at_position(_pointer_position)
+	if action_id != _hovered_action:
+		_hovered_action = action_id
+		_hover_elapsed = 0.0
+
+
+func _update_ui_interaction(delta: float) -> void:
+	_touch_tooltip_remaining = maxf(0.0, _touch_tooltip_remaining - delta)
+	var entries := _interactive_action_entries()
+	if _pending_touch_pointer >= 0:
+		if not entries.has(_pending_touch_action) or not bool(Dictionary(entries[_pending_touch_action]).get("enabled", true)):
+			_clear_pending_touch_action()
+		else:
+			_pending_touch_hold += delta
+			var pending_entry: Dictionary = entries[_pending_touch_action]
+			if bool(pending_entry.get("icon_only", false)):
+				if _pending_touch_hold >= TOUCH_PREVIEW_HOLD_SECONDS:
+					_pending_touch_preview_only = true
+				# Keep an icon preview readable for the whole press. Labeled actions
+				# still wait for release, but do not need a redundant tooltip.
+				_touch_tooltip_action = _pending_touch_action
+				_touch_tooltip_remaining = maxf(_touch_tooltip_remaining, 0.12)
+	if _touch_tooltip_remaining <= 0.0:
+		_touch_tooltip_action = ""
+	_update_hover_target()
+	if not _hovered_action.is_empty():
+		_hover_elapsed += delta
+	if not _focused_action.is_empty() and (not entries.has(_focused_action) or not bool(Dictionary(entries[_focused_action]).get("enabled", true))):
+		_focused_action = ""
+	if not _touch_tooltip_action.is_empty() and (not entries.has(_touch_tooltip_action) or not bool(Dictionary(entries[_touch_tooltip_action]).get("enabled", true))):
+		_touch_tooltip_action = ""
+		_touch_tooltip_remaining = 0.0
+
+
+func _visible_tooltip_action() -> String:
+	var entries := _interactive_action_entries()
+	if _touch_tooltip_remaining > 0.0 and entries.has(_touch_tooltip_action) and bool(Dictionary(entries[_touch_tooltip_action]).get("enabled", true)):
+		return _touch_tooltip_action
+	if _pointer_kind == "mouse" and _hover_elapsed >= TOOLTIP_HOVER_DELAY and entries.has(_hovered_action):
+		var entry: Dictionary = entries[_hovered_action]
+		if bool(entry.get("icon_only", false)):
+			return _hovered_action
+	if _pointer_kind == "keyboard" and entries.has(_focused_action):
+		var focused_entry: Dictionary = entries[_focused_action]
+		if bool(focused_entry.get("enabled", true)) and bool(focused_entry.get("icon_only", false)):
+			return _focused_action
+	return ""
+
+
+func _cycle_keyboard_focus(direction: int) -> void:
+	var entries := _interactive_action_entries()
+	var action_ids: Array = []
+	for action_id_value in entries.keys():
+		var action_id := str(action_id_value)
+		if bool(Dictionary(entries[action_id]).get("enabled", true)):
+			action_ids.append(action_id)
+	if action_ids.is_empty():
+		_focused_action = ""
+		return
+	var index := action_ids.find(_focused_action)
+	index = posmod(index + direction if index >= 0 else (0 if direction > 0 else action_ids.size() - 1), action_ids.size())
+	_focused_action = str(action_ids[index])
+	_pointer_kind = "keyboard"
+	queue_redraw()
+
+
+func _activate_focused_action() -> bool:
+	var entry: Dictionary = _interactive_action_entries().get(_focused_action, {})
+	if entry.is_empty() or not bool(entry.get("enabled", true)):
+		return false
+	var position := Rect2(entry["rect"]).get_center()
+	var activated := _activate_rotation_at(position) if _portrait_rotation_required() else _activate_at(position)
+	if activated:
+		sound_requested.emit("ui", 0.38, 1.0)
+	queue_redraw()
+	return activated
+
+
+func _activate_rotation_at(position: Vector2) -> bool:
+	var actions := _rotation_action_rects()
+	if Rect2(actions["exit"]).has_point(position):
+		close_requested.emit()
+		return true
+	if Rect2(actions["language"]).has_point(position):
+		language_toggle_requested.emit()
+		return true
+	return false
+
+
+func _handle_rotation_input(event: InputEvent) -> bool:
+	if event is InputEventKey:
+		var key_event := event as InputEventKey
+		if key_event.pressed and not key_event.echo:
+			if key_event.keycode == KEY_ESCAPE:
+				close_requested.emit()
+				return true
+			if key_event.keycode == KEY_L:
+				language_toggle_requested.emit()
+				return true
+			if key_event.keycode == KEY_TAB:
+				_cycle_keyboard_focus(-1 if key_event.shift_pressed else 1)
+				return true
+			if key_event.keycode in [KEY_ENTER, KEY_KP_ENTER] and not _focused_action.is_empty():
+				return _activate_focused_action()
+		return true
+	if event is InputEventScreenTouch:
+		var touch := event as InputEventScreenTouch
+		_pointer_kind = "touch"
+		_pointer_position = touch.position
+		_pointer_down = touch.pressed
+		if touch.pressed:
+			_focus_action_at(touch.position, true)
+			if _focused_action_is_icon_only():
+				_begin_pending_touch_action(touch.index, touch.position)
+		else:
+			if _release_pending_touch_action(touch.index, touch.position):
+				sound_requested.emit("ui", 0.38, 1.0)
+		queue_redraw()
+		return true
+	if event is InputEventScreenDrag:
+		var drag := event as InputEventScreenDrag
+		_pointer_kind = "touch"
+		_pointer_position = drag.position
+		if drag.index == _pending_touch_pointer and drag.position.distance_to(_pending_touch_origin) > TOUCH_ACTION_DRAG_CANCEL_CSS * ui_scale:
+			_pending_touch_preview_only = true
+		queue_redraw()
+		return true
+	if event is InputEventMouseMotion:
+		_pointer_kind = "mouse"
+		_pointer_position = (event as InputEventMouseMotion).position
+		_update_hover_target()
+		queue_redraw()
+		return true
+	if event is InputEventMouseButton:
+		var mouse := event as InputEventMouseButton
+		if mouse.button_index == MOUSE_BUTTON_LEFT:
+			_pointer_kind = "mouse"
+			_pointer_position = mouse.position
+			_pointer_down = mouse.pressed
+			if mouse.pressed:
+				_focus_action_at(mouse.position, false)
+				if _activate_rotation_at(mouse.position):
+					sound_requested.emit("ui", 0.38, 1.0)
+			queue_redraw()
+		return true
+	return true
+
+
 func _layout_state() -> Dictionary:
 	var common := _common_rects()
 	var css_viewport := _viewport_css_size()
 	var result := {
-		"layout_version": 5,
+		"layout_version": 6,
 		"joystick_mode": "dynamic_origin",
 		"coordinate_space": "logical_viewport_pixels",
 		"viewport_css": {"width": snappedf(css_viewport.x, 0.1), "height": snappedf(css_viewport.y, 0.1)},
 		"compact_touch_landscape": _compact_touch_landscape(),
-		"exit": _rect_state(Rect2(common["exit"])),
-		"back": _rect_state(Rect2(common["back"])),
-		"language": _rect_state(Rect2(common["language"])),
-		"primary": _rect_state(_footer_primary_rect()),
 		"minimum_touch_css": MIN_TOUCH_TARGET_CSS,
 		"typography": {
 			"minimum_body_css": MIN_BODY_FONT_CSS,
@@ -1098,6 +1554,20 @@ func _layout_state() -> Dictionary:
 	}
 	if controller == null:
 		return result
+	if _portrait_rotation_required():
+		var rotation_states := {}
+		for action_key in _rotation_action_rects().keys():
+			rotation_states[str(action_key)] = _rect_state(Rect2(_rotation_action_rects()[action_key]))
+		result["rotation_actions"] = rotation_states
+		result["self_test"] = layout_self_test()
+		return result
+	if controller.phase not in ["battle", "result"]:
+		result["exit"] = _rect_state(Rect2(common["exit"]))
+		result["language"] = _rect_state(Rect2(common["language"]))
+		if controller.phase != "mode":
+			result["back"] = _rect_state(Rect2(common["back"]))
+		if controller.phase in ["types", "counts", "upgrades"]:
+			result["primary"] = _rect_state(_footer_primary_rect())
 	if controller.mode == "spectator" and controller.phase not in ["mode", "battle", "result"]:
 		var team_states := {}
 		for team in ["blue", "red"]:
@@ -1164,21 +1634,96 @@ func _layout_state() -> Dictionary:
 				}
 			result["upgrade_controls"] = option_states
 		"battle", "result":
-			var battle_states := {}
-			for control_key in _battle_control_rects().keys():
-				battle_states[str(control_key)] = _rect_state(Rect2(_battle_control_rects()[control_key]))
-			result["battle_controls"] = battle_states
+			result["battle_controls_visible"] = controller.phase == "battle"
+			if controller.phase == "battle":
+				var battle_states := {}
+				for control_key in _battle_control_rects().keys():
+					battle_states[str(control_key)] = _rect_state(Rect2(_battle_control_rects()[control_key]))
+				result["battle_controls"] = battle_states
 			if controller.phase == "result":
 				result["result_panel"] = _rect_state(_result_panel_rect())
 				var result_action_states := {}
 				for action_key in _result_action_rects().keys():
 					result_action_states[str(action_key)] = _rect_state(Rect2(_result_action_rects()[action_key]))
 				result["result_actions"] = result_action_states
-			if touch_mode and controller.mode == "challenge":
+			if controller.phase == "battle" and touch_mode and controller.mode == "challenge":
 				result["move_stick"] = _touch_stick_layout_state(true)
 				result["aim_stick"] = _touch_stick_layout_state(false)
 	result["self_test"] = layout_self_test()
 	return result
+
+
+func _tooltip_trigger_for(action_id: String) -> String:
+	if action_id.is_empty():
+		return ""
+	if _touch_tooltip_remaining > 0.0 and action_id == _touch_tooltip_action:
+		return "touch"
+	if _pointer_kind == "mouse" and action_id == _hovered_action and _hover_elapsed >= TOOLTIP_HOVER_DELAY:
+		return "hover"
+	if _pointer_kind == "keyboard" and action_id == _focused_action:
+		return "focus"
+	return ""
+
+
+func _tooltip_rect_for_action(action_id: String) -> Rect2:
+	var entry: Dictionary = _interactive_action_entries().get(action_id, {})
+	if entry.is_empty():
+		return Rect2()
+	var anchor := Rect2(entry["rect"])
+	var label := str(entry["label"])
+	var width_css := clampf(26.0 + float(label.length()) * (6.8 if language == "en" else 12.0), 104.0, 260.0)
+	var tooltip_size := Vector2(width_css, 34.0) * ui_scale
+	var tooltip_x := anchor.end.x + 6.0 * ui_scale if anchor.get_center().x < size.x * 0.5 else anchor.position.x - tooltip_size.x - 6.0 * ui_scale
+	var tooltip_y := anchor.end.y + 5.0 * ui_scale if anchor.get_center().y < size.y * 0.55 else anchor.position.y - tooltip_size.y - 5.0 * ui_scale
+	tooltip_x = clampf(tooltip_x, 4.0 * ui_scale, size.x - tooltip_size.x - 4.0 * ui_scale)
+	tooltip_y = clampf(tooltip_y, 4.0 * ui_scale, size.y - tooltip_size.y - 4.0 * ui_scale)
+	return Rect2(Vector2(tooltip_x, tooltip_y), tooltip_size)
+
+
+func _interaction_state() -> Dictionary:
+	var entries := _interactive_action_entries()
+	var action_states := {}
+	for action_id_value in entries.keys():
+		var action_id := str(action_id_value)
+		var entry: Dictionary = entries[action_id]
+		action_states[action_id] = {
+			"rect": _rect_state(Rect2(entry["rect"])),
+			"label": str(entry["label"]),
+			"icon": str(entry.get("icon", "")),
+			"icon_only": bool(entry.get("icon_only", false)),
+			"enabled": bool(entry.get("enabled", true)),
+		}
+	var tooltip_action := _visible_tooltip_action()
+	var tooltip_state := {
+		"visible": false,
+		"source": "",
+		"trigger": "",
+		"text": "",
+	}
+	if not tooltip_action.is_empty() and entries.has(tooltip_action):
+		var tooltip_entry: Dictionary = entries[tooltip_action]
+		tooltip_state = {
+			"visible": true,
+			"source": tooltip_action,
+			"trigger": _tooltip_trigger_for(tooltip_action),
+			"text": str(tooltip_entry["label"]),
+			"rect": _rect_state(_tooltip_rect_for_action(tooltip_action)),
+		}
+	return {
+		"focused": _focused_action,
+		"hovered": _hovered_action,
+		"tooltip": tooltip_state,
+		"tooltip_action": tooltip_action,
+		"pending_touch_action": _pending_touch_action,
+		"touch_preview_only": _pending_touch_preview_only,
+		"pointer_down": _pointer_down,
+		"hover_delay_seconds": TOOLTIP_HOVER_DELAY,
+		"touch_tooltip_seconds": TOOLTIP_TOUCH_DURATION,
+		"touch_activation": "release",
+		"long_press_preview_seconds": TOUCH_PREVIEW_HOLD_SECONDS,
+		"states": ["default", "hover", "pressed", "focus", "selected", "disabled"],
+		"actions": action_states,
+	}
 
 
 func layout_self_test() -> Dictionary:
@@ -1215,12 +1760,15 @@ func layout_self_test() -> Dictionary:
 
 	if touch_mode and controller != null:
 		var common := _common_rects()
-		if controller.phase in ["battle", "result"]:
+		if _portrait_rotation_required():
+			for action_key in _rotation_action_rects().keys():
+				targets["rotation_%s" % str(action_key)] = Rect2(_rotation_action_rects()[action_key])
+		elif controller.phase == "battle":
 			for control_key in _battle_control_rects().keys():
 				targets["battle_%s" % str(control_key)] = Rect2(_battle_control_rects()[control_key])
-			if controller.phase == "result":
-				for action_key in _result_action_rects().keys():
-					targets["result_%s" % str(action_key)] = Rect2(_result_action_rects()[action_key])
+		elif controller.phase == "result":
+			for action_key in _result_action_rects().keys():
+				targets["result_%s" % str(action_key)] = Rect2(_result_action_rects()[action_key])
 		else:
 			targets["exit"] = Rect2(common["exit"])
 			targets["language"] = Rect2(common["language"])
@@ -1268,6 +1816,13 @@ func layout_self_test() -> Dictionary:
 		if rect.size.x / scale + 0.01 < MIN_TOUCH_TARGET_CSS or rect.size.y / scale + 0.01 < MIN_TOUCH_TARGET_CSS:
 			all_targets_ok = false
 			failures.append("touch_target_%s_below_44_css" % str(target_name))
+	var result_hides_duplicate_header_actions := true
+	if controller != null and controller.phase == "result":
+		for action_id_value in _interactive_action_entries().keys():
+			if str(action_id_value).begins_with("battle_"):
+				result_hides_duplicate_header_actions = false
+				failures.append("result_duplicate_header_action")
+				break
 
 	return {
 		"passed": failures.is_empty(),
@@ -1277,6 +1832,7 @@ func layout_self_test() -> Dictionary:
 			"compact_type_columns_at_most_two": compact_columns_ok,
 			"visible_touch_targets_at_least_44_css": all_targets_ok,
 			"result_has_two_44_css_actions": result_geometry_ok,
+			"result_hides_duplicate_header_actions": result_hides_duplicate_header_actions,
 			"joystick_deadzone_zero_based": deadzone_continuous,
 			"four_way_direction_cues": true,
 			"minimum_body_font_css": MIN_BODY_FONT_CSS,
@@ -1332,11 +1888,23 @@ func _draw() -> void:
 		return
 	if _portrait_rotation_required():
 		_draw_forged_background(Rect2(Vector2.ZERO, size))
-		var center := size * 0.5
-		var phone := Rect2(center - Vector2(110.0, 62.0) * ui_scale, Vector2(220.0, 124.0) * ui_scale)
+		var center := size * Vector2(0.5, 0.43)
+		var phone_width_css := minf(220.0, _viewport_css_size().x - 48.0)
+		var phone_size := Vector2(phone_width_css, phone_width_css * 0.56) * ui_scale
+		var phone := Rect2(center - phone_size * 0.5, phone_size)
 		_draw_forged_panel(phone, Color("7FA7B8"), 4.0 * ui_scale, true, Color("142B35"))
-		draw_arc(center, 145.0 * ui_scale, -2.7, -0.4, 36, GOLD, 5.0 * ui_scale)
-		_draw_text(_t("請旋轉裝置", "ROTATE DEVICE"), center + Vector2(0.0, 150.0 * ui_scale), roundi(28.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, minf(size.x - 20.0 * ui_scale, 360.0 * ui_scale))
+		var orbit_radius := minf(145.0 * ui_scale, size.x * 0.44)
+		draw_arc(center, orbit_radius, -2.7, -0.4, 36, GOLD, 4.0 * ui_scale)
+		var arrow_tip := center + Vector2.from_angle(-0.4) * orbit_radius
+		var arrow_direction := Vector2.from_angle(1.05)
+		draw_colored_polygon(PackedVector2Array([arrow_tip, arrow_tip - arrow_direction * 14.0 * ui_scale + arrow_direction.rotated(PI * 0.5) * 7.0 * ui_scale, arrow_tip - arrow_direction * 14.0 * ui_scale - arrow_direction.rotated(PI * 0.5) * 7.0 * ui_scale]), GOLD)
+		_draw_text(_t("請旋轉裝置", "ROTATE DEVICE"), center + Vector2(0.0, 118.0 * ui_scale), roundi(24.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, minf(size.x - 24.0 * ui_scale, 320.0 * ui_scale))
+		_draw_text(_t("競技場採用俯視橫屏操作", "TOP-DOWN ARENA USES LANDSCAPE"), center + Vector2(0.0, 146.0 * ui_scale), roundi(MIN_BODY_FONT_CSS * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, minf(size.x - 28.0 * ui_scale, 300.0 * ui_scale))
+		_draw_text(_t("旋轉後繼續，陣容不會重置", "ROTATE TO CONTINUE · LOADOUT IS KEPT"), center + Vector2(0.0, 168.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), Color(MUTED, 0.82), HORIZONTAL_ALIGNMENT_CENTER, minf(size.x - 28.0 * ui_scale, 300.0 * ui_scale))
+		var rotation_actions := _rotation_action_rects()
+		_draw_icon_button(Rect2(rotation_actions["exit"]), "close", Color("8B4751"))
+		_draw_icon_button(Rect2(rotation_actions["language"]), "language", Color("456D7E"))
+		_draw_ui_tooltip()
 		return
 	if controller.phase in ["battle", "result"]:
 		_draw_battle()
@@ -1354,14 +1922,15 @@ func _draw_setup() -> void:
 		"types": _draw_type_selection()
 		"counts": _draw_count_selection()
 		"upgrades": _draw_upgrade_selection()
+	_draw_ui_tooltip()
 
 
 func _draw_setup_header() -> void:
 	var common := _common_rects()
-	_draw_button(Rect2(common["exit"]), "×", Color("8B4751"), 20)
+	_draw_icon_button(Rect2(common["exit"]), "close", Color("8B4751"))
 	if controller.phase != "mode":
-		_draw_button(Rect2(common["back"]), "←", Color("456D7E"), 18)
-	_draw_button(Rect2(common["language"]), "EN" if language != "en" else "中", Color("456D7E"), 13)
+		_draw_icon_button(Rect2(common["back"]), "back", Color("456D7E"))
+	_draw_icon_button(Rect2(common["language"]), "language", Color("456D7E"))
 	var phase_names := {
 		"mode": _t("模式", "MODE"), "types": _t("① 選士兵", "① TYPES"),
 		"counts": _t("② 調數量", "② COUNTS"), "upgrades": _t("③ 選強化", "③ UPGRADES"),
@@ -1370,8 +1939,8 @@ func _draw_setup_header() -> void:
 		_draw_text(_t("競技場", "ARENA") + " · " + str(phase_names.get(controller.phase, "")), Vector2(size.x * 0.5, 35.0 * ui_scale), maxi(16, roundi(20.0 * ui_scale)), TEXT, HORIZONTAL_ALIGNMENT_CENTER, size.x * 0.48)
 	if controller.mode == "spectator" and controller.phase != "mode":
 		var tabs := _team_tab_rects()
-		_draw_button(Rect2(tabs["blue"]), _t("藍隊", "BLUE") + " %d" % controller.team_total("blue"), BLUE if controller.active_team == "blue" else Color("35516B"), 13)
-		_draw_button(Rect2(tabs["red"]), _t("紅隊", "RED") + " %d" % controller.team_total("red"), RED if controller.active_team == "red" else Color("65404A"), 13)
+		_draw_button(Rect2(tabs["blue"]), _t("藍隊", "BLUE") + " %d" % controller.team_total("blue"), BLUE if controller.active_team == "blue" else Color("35516B"), 13, controller.active_team == "blue")
+		_draw_button(Rect2(tabs["red"]), _t("紅隊", "RED") + " %d" % controller.team_total("red"), RED if controller.active_team == "red" else Color("65404A"), 13, controller.active_team == "red")
 
 
 func _draw_mode_selection() -> void:
@@ -1384,6 +1953,8 @@ func _draw_mode_selection() -> void:
 	_draw_text(_t("選擇敵軍，親自進場迎戰", "Choose soldiers and fight them yourself"), challenge.get_center() + Vector2(0.0, 18.0 * ui_scale), roundi(14.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, challenge.size.x - 32.0 * ui_scale)
 	_draw_text(_t("士兵觀戰", "SPECTATOR"), spectator.get_center() + Vector2(0.0, -34.0 * ui_scale), roundi(28.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, spectator.size.x - 24.0 * ui_scale)
 	_draw_text(_t("藍紅雙方自動戰鬥；不生成玩家", "Blue vs red AI battle; no player entity"), spectator.get_center() + Vector2(0.0, 18.0 * ui_scale), roundi(14.0 * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, spectator.size.x - 32.0 * ui_scale)
+	_draw_action_outline(challenge)
+	_draw_action_outline(spectator)
 
 
 func _draw_type_selection() -> void:
@@ -1397,17 +1968,18 @@ func _draw_type_selection() -> void:
 		_draw_unit_badge(type_id, rect.position + Vector2(28.0 * ui_scale, rect.size.y * 0.5), 20.0 * ui_scale, controller.active_team)
 		var label_css := 14.0 if _compact_type_pagination_enabled() else MIN_BODY_FONT_CSS
 		_draw_text(("✓ " if chosen else "") + _soldier_name(type_id), rect.get_center() + Vector2(17.0 * ui_scale, 5.0 * ui_scale), roundi(label_css * ui_scale), TEXT if chosen else MUTED, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 62.0 * ui_scale)
+		_draw_action_outline(rect, chosen)
 	if controller.mode == "challenge":
 		for class_id in ["archer", "mage", "warrior"]:
-			_draw_button(_hero_class_rect(class_id), ("✓ " if hero_class == class_id else "") + _hero_name(class_id), BLUE if hero_class == class_id else Color("405866"), 13)
+			_draw_button(_hero_class_rect(class_id), _hero_name(class_id), BLUE if hero_class == class_id else Color("405866"), 13, hero_class == class_id)
 	if _compact_type_pagination_enabled():
-		_draw_button(_page_rect("prev"), "◀", Color("405866"), 18)
-		_draw_button(_page_rect("next"), "▶", Color("405866"), 18)
+		_draw_icon_button(_page_rect("prev"), "prev", Color("405866"), false, _current_type_page() > 0)
+		_draw_icon_button(_page_rect("next"), "next", Color("405866"), false, _current_type_page() < _type_page_count() - 1)
 		var footer_text_left := _page_rect("next").end.x + 4.0 * ui_scale
 		var footer_text_right := _footer_primary_rect().position.x - 4.0 * ui_scale
 		_draw_text("%d/%d" % [_current_type_page() + 1, _type_page_count()], Vector2((footer_text_left + footer_text_right) * 0.5, size.y - 24.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, maxf(10.0, footer_text_right - footer_text_left))
-	var types_ready := not controller.selected_types_for("red").is_empty() and (controller.mode == "challenge" or not controller.selected_types_for("blue").is_empty())
-	_draw_button(_footer_primary_rect(), _t("選好了 → 數量", "DONE → COUNTS"), GOLD if types_ready else Color("4B555A"), 14)
+	var types_ready := _types_confirm_enabled()
+	_draw_icon_text_button(_footer_primary_rect(), "next", _t("選好了 · 數量", "DONE · COUNTS"), GOLD if types_ready else Color("4B555A"), false, types_ready)
 
 
 func _draw_count_selection() -> void:
@@ -1418,27 +1990,29 @@ func _draw_count_selection() -> void:
 		_draw_card(row, Color("142833"), Color("456D7E"))
 		_draw_unit_badge(type_id, row.position + Vector2(34.0 * ui_scale, row.size.y * 0.5), 20.0 * ui_scale, controller.active_team)
 		_draw_text(_soldier_name(type_id), row.position + Vector2(62.0 * ui_scale, row.size.y * 0.5 + 5.0 * ui_scale), roundi(14.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_LEFT, row.size.x * 0.42)
-		_draw_button(Rect2(data["minus"]), "−", Color("6D4650"), 22)
+		_draw_icon_button(Rect2(data["minus"]), "minus", Color("6D4650"), false, _count_adjust_enabled(type_id, -1))
 		_draw_text("×%d" % controller.count_for(controller.active_team, type_id), Rect2(data["minus"]).position + Vector2(-78.0 * ui_scale, 29.0 * ui_scale), roundi(17.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, 70.0 * ui_scale)
-		_draw_button(Rect2(data["plus"]), "+", Color("3F8068"), 22)
-	_draw_button(_page_rect("prev"), "◀", Color("405866"), 18)
-	_draw_button(_page_rect("next"), "▶", Color("405866"), 18)
+		_draw_icon_button(Rect2(data["plus"]), "plus", Color("3F8068"), false, _count_adjust_enabled(type_id, 1))
+	_draw_icon_button(_page_rect("prev"), "prev", Color("405866"), false, int(count_pages.get(controller.active_team, 0)) > 0)
+	_draw_icon_button(_page_rect("next"), "next", Color("405866"), false, int(count_pages.get(controller.active_team, 0)) < _count_page_count() - 1)
 	var footer_text_left := _page_rect("next").end.x + 4.0 * ui_scale
 	var footer_text_right := _footer_primary_rect().position.x - 4.0 * ui_scale
 	var footer_text_width := maxf(10.0, footer_text_right - footer_text_left)
 	_draw_text(_t("共 %d 人", "TOTAL %d") % controller.team_total(controller.active_team), Vector2((footer_text_left + footer_text_right) * 0.5, size.y - 25.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, footer_text_width)
-	_draw_button(_footer_primary_rect(), _t("選好了 → 強化", "DONE → UPGRADES"), GOLD, 14)
+	var counts_ready := _counts_confirm_enabled()
+	_draw_icon_text_button(_footer_primary_rect(), "next", _t("選好了 · 強化", "DONE · UPGRADES"), GOLD if counts_ready else Color("4B555A"), false, counts_ready)
 
 
 func _draw_upgrade_selection() -> void:
 	var toolbar := _upgrade_toolbar_rects()
-	_draw_button(Rect2(toolbar["type_prev"]), "◀", Color("405866"), 17)
-	_draw_button(Rect2(toolbar["type_next"]), "▶", Color("405866"), 17)
+	var can_cycle_type := controller.selected_types_for(controller.active_team).size() > 1
+	_draw_icon_button(Rect2(toolbar["type_prev"]), "prev", Color("405866"), false, can_cycle_type)
+	_draw_icon_button(Rect2(toolbar["type_next"]), "next", Color("405866"), false, can_cycle_type)
 	var type_id := controller.current_upgrade_type()
 	_draw_card(Rect2(toolbar["type_name"]), Color("142833"), Color(GameConfig.SOLDIERS[type_id]["color"]) if not type_id.is_empty() else PANEL_EDGE)
 	_draw_text(_soldier_name(type_id), Rect2(toolbar["type_name"]).get_center() + Vector2(0.0, 5.0 * ui_scale), roundi(14.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, Rect2(toolbar["type_name"]).size.x - 8.0 * ui_scale)
-	_draw_button(Rect2(toolbar["base"]), _t("基礎", "BASE"), BLUE if controller.upgrade_category == "base" else Color("405866"), 13)
-	_draw_button(Rect2(toolbar["special"]), _t("特殊", "SPECIAL"), Color("9A62CF") if controller.upgrade_category == "special" else Color("51465E"), 13)
+	_draw_button(Rect2(toolbar["base"]), _t("基礎", "BASE"), BLUE if controller.upgrade_category == "base" else Color("405866"), 13, controller.upgrade_category == "base")
+	_draw_button(Rect2(toolbar["special"]), _t("特殊", "SPECIAL"), Color("9A62CF") if controller.upgrade_category == "special" else Color("51465E"), 13, controller.upgrade_category == "special")
 	for option in _upgrade_option_rects():
 		var definition: Dictionary = option["definition"]
 		var upgrade_id := str(option["id"])
@@ -1450,14 +2024,17 @@ func _draw_upgrade_selection() -> void:
 			_draw_ability_glyph(upgrade_id, row.position + Vector2(23.0 * ui_scale, row.size.y * 0.5), 9.0 * ui_scale, 1.0)
 		_draw_text(SoldierUpgradeCatalog.localized_name(upgrade_id, language), row.position + Vector2(43.0 * ui_scale, 19.0 * ui_scale), roundi(14.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 250.0 * ui_scale)
 		_draw_text(SoldierUpgradeCatalog.localized_effect_text(upgrade_id, maxi(1, rank), language), row.position + Vector2(43.0 * ui_scale, row.size.y - 10.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_LEFT, row.size.x - 250.0 * ui_scale)
-		_draw_button(Rect2(option["minus"]), "−", Color("6D4650"), 20)
+		_draw_icon_button(Rect2(option["minus"]), "minus", Color("6D4650"), false, _upgrade_adjust_enabled(option, -1))
 		_draw_text("%d/%d" % [rank, int(definition.get("max_rank", 1))], Rect2(option["minus"]).position + Vector2(-67.0 * ui_scale, 28.0 * ui_scale), roundi(13.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, 60.0 * ui_scale)
-		_draw_button(Rect2(option["plus"]), "+", Color("3F8068"), 20)
-	_draw_button(_page_rect("prev"), "◀", Color("405866"), 18)
-	_draw_button(_page_rect("next"), "▶", Color("405866"), 18)
+		_draw_icon_button(Rect2(option["plus"]), "plus", Color("3F8068"), false, _upgrade_adjust_enabled(option, 1))
 	var page_count := controller.upgrade_page_count(_upgrade_page_size())
-	_draw_text("%d/%d" % [controller.upgrade_page + 1, page_count], Vector2(245.0 * ui_scale, size.y - 25.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, 80.0 * ui_scale)
-	_draw_button(_footer_primary_rect(), _t("開始戰鬥", "START BATTLE"), GOLD, 14)
+	_draw_icon_button(_page_rect("prev"), "prev", Color("405866"), false, controller.upgrade_page > 0)
+	_draw_icon_button(_page_rect("next"), "next", Color("405866"), false, controller.upgrade_page < page_count - 1)
+	var page_label_left := _page_rect("next").end.x + 4.0 * ui_scale
+	var page_label_right := _footer_primary_rect().position.x - 4.0 * ui_scale
+	_draw_text("%d/%d" % [controller.upgrade_page + 1, page_count], Vector2((page_label_left + page_label_right) * 0.5, size.y - 25.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, maxf(20.0 * ui_scale, page_label_right - page_label_left))
+	var battle_ready := _counts_confirm_enabled()
+	_draw_icon_text_button(_footer_primary_rect(), "play", _t("開始戰鬥", "START BATTLE"), GOLD if battle_ready else Color("4B555A"), false, battle_ready)
 
 
 func _update_battle_camera() -> void:
@@ -1541,6 +2118,7 @@ func _draw_battle() -> void:
 			_draw_touch_joystick(move_origin, move_vector, _t("移動", "MOVE"), BLUE)
 		if aim_pointer >= 0:
 			_draw_touch_joystick(aim_origin, aim_vector, _t("瞄準攻擊", "AIM + FIRE"), Color("FF8A42"))
+	_draw_ui_tooltip()
 
 
 func _draw_arena_unit(unit: Dictionary) -> void:
@@ -1956,31 +2534,40 @@ func _draw_arena_hero(hero: Dictionary) -> void:
 func _draw_battle_hud() -> void:
 	var controls := _battle_control_rects()
 	_draw_forged_panel(Rect2(4.0 * ui_scale, 4.0 * ui_scale, size.x - 8.0 * ui_scale, 54.0 * ui_scale), FORGED_BRASS, 1.5 * ui_scale, false, Color("101B23"))
-	_draw_button(Rect2(controls["setup"]), _t("重選", "SETUP"), Color("456D7E"), 12)
-	_draw_button(Rect2(controls["restart"]), _t("重開", "RESTART"), Color("6A557A"), 12)
-	_draw_button(Rect2(controls["exit"]), _t("離開", "EXIT"), Color("8B4751"), 12)
+	if controller.phase == "battle":
+		if touch_mode:
+			_draw_icon_button(Rect2(controls["setup"]), "settings", Color("456D7E"))
+			_draw_icon_button(Rect2(controls["restart"]), "restart", Color("6A557A"))
+			_draw_icon_button(Rect2(controls["exit"]), "exit", Color("8B4751"))
+		else:
+			_draw_icon_text_button(Rect2(controls["setup"]), "settings", _t("陣容", "SETUP"), Color("456D7E"))
+			_draw_icon_text_button(Rect2(controls["restart"]), "restart", _t("重開", "RESTART"), Color("6A557A"))
+			_draw_icon_text_button(Rect2(controls["exit"]), "exit", _t("離開", "EXIT"), Color("8B4751"))
 	var battle_state := controller.render_state()
 	var battle_teams: Dictionary = battle_state["teams"]
 	var blue_alive := 1 if controller.mode == "challenge" and not controller.hero.is_empty() and float(controller.hero.get("hp", 0.0)) > 0.0 else 0
 	blue_alive += int(Dictionary(battle_teams["blue"])["alive"])
 	var red_alive := int(Dictionary(battle_teams["red"])["alive"])
 	var title := (_t("觀戰模式", "SPECTATOR") if controller.mode == "spectator" else _t("玩家挑戰", "CHALLENGE")) + "  %d  —  %d" % [blue_alive, red_alive]
-	# Fit the score between RESTART and EXIT, including compact English HUDs.
-	var hud_left := Rect2(controls["restart"]).end.x + 8.0 * ui_scale
-	var hud_right := Rect2(controls["exit"]).position.x - 8.0 * ui_scale
+	# During battle the score fits between compact utility actions.  The result
+	# state deliberately removes those duplicate actions and re-centres the HUD.
+	var hud_left := Rect2(controls["restart"]).end.x + 8.0 * ui_scale if controller.phase == "battle" else 12.0 * ui_scale
+	var hud_right := Rect2(controls["exit"]).position.x - 8.0 * ui_scale if controller.phase == "battle" else size.x - 12.0 * ui_scale
 	var hud_width := maxf(80.0 * ui_scale, hud_right - hud_left)
 	var hud_center_x := hud_left + hud_width * 0.5
 	_draw_text(title, Vector2(hud_center_x, 35.0 * ui_scale), roundi(17.0 * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, hud_width)
 	_draw_text(_t("場地自動尺寸", "AUTO-SIZED") + " %d×%d" % [roundi(controller.arena_rect.size.x), roundi(controller.arena_rect.size.y)], Vector2(hud_center_x, 54.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, hud_width)
 	if controller.phase == "result":
+		draw_rect(Rect2(Vector2.ZERO, size), Color(0.0, 0.0, 0.0, 0.32))
 		var overlay := _result_panel_rect()
 		_draw_forged_panel(overlay, GOLD, 3.0 * ui_scale, true, Color("171C22"), "bronze")
 		var winner_name := _t("藍隊", "BLUE") if controller.winner == "blue" else (_t("紅隊", "RED") if controller.winner == "red" else _t("平手", "DRAW"))
-		_draw_text(winner_name + " " + _t("獲勝", "WINS"), overlay.get_center() + Vector2(0.0, -38.0 * ui_scale), roundi(26.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
-		_draw_text(_t("選擇下一步", "CHOOSE NEXT ACTION"), overlay.get_center() + Vector2(0.0, -7.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
+		_draw_text(winner_name + " " + _t("獲勝", "WINS"), overlay.get_center() + Vector2(0.0, -55.0 * ui_scale), roundi(25.0 * ui_scale), GOLD, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
+		_draw_text(_t("陣容與強化已保留", "TEAMS AND UPGRADES ARE KEPT"), overlay.get_center() + Vector2(0.0, -24.0 * ui_scale), roundi(MIN_BODY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
+		_draw_text(_t("直接再戰，或安全離開競技場", "REMATCH NOW OR LEAVE THE ARENA"), overlay.get_center() + Vector2(0.0, -3.0 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), MUTED, HORIZONTAL_ALIGNMENT_CENTER, overlay.size.x - 24.0 * ui_scale)
 		var actions := _result_action_rects()
-		_draw_button(Rect2(actions["rematch"]), _t("再戰", "REMATCH"), GOLD, 15)
-		_draw_button(Rect2(actions["leave"]), _t("離開競技場", "LEAVE"), Color("8B4751"), 15)
+		_draw_icon_text_button(Rect2(actions["rematch"]), "rematch", _t("再戰", "REMATCH"), GOLD)
+		_draw_icon_text_button(Rect2(actions["leave"]), "exit", _t("離開競技場", "LEAVE ARENA"), Color("8B4751"))
 
 
 func _move_center() -> Vector2:
@@ -2141,10 +2728,99 @@ func _draw_card(rect: Rect2, fill: Color, edge: Color) -> void:
 	_draw_forged_panel(rect, edge, maxf(1.5, 2.0 * ui_scale), true, Color(fill, tint_alpha), "canvas")
 
 
-func _draw_button(rect: Rect2, label: String, color: Color, base_size: int) -> void:
+func _draw_action_outline(rect: Rect2, selected: bool = false) -> void:
+	var state := _button_state(rect)
+	if bool(state["hovered"]):
+		draw_rect(rect.grow(-2.0 * ui_scale), Color(TEXT, 0.72), false, 2.0 * ui_scale)
+	if bool(state["focused"]):
+		draw_rect(rect.grow(-4.0 * ui_scale), Color(GOLD, 0.96), false, 2.0 * ui_scale)
+	if selected:
+		draw_line(rect.position + Vector2(10.0, 5.0) * ui_scale, Vector2(rect.end.x - 10.0 * ui_scale, rect.position.y + 5.0 * ui_scale), Color(GOLD, 0.92), 2.0 * ui_scale)
+
+
+func _rect_matches(first: Rect2, second: Rect2) -> bool:
+	return first.position.distance_to(second.position) < 0.5 and first.size.distance_to(second.size) < 0.5
+
+
+func _button_state(hit_rect: Rect2) -> Dictionary:
+	var hovered := _pointer_kind == "mouse" and hit_rect.has_point(_pointer_position)
+	var pressed := _pointer_down and hit_rect.has_point(_pointer_position)
+	var focused := false
+	var entries := _interactive_action_entries()
+	if entries.has(_focused_action):
+		focused = _rect_matches(hit_rect, Rect2(Dictionary(entries[_focused_action])["rect"]))
+	return {"hovered": hovered, "pressed": pressed, "focused": focused}
+
+
+func _draw_button_surface(visual_rect: Rect2, hit_rect: Rect2, color: Color, selected: bool, enabled: bool) -> Rect2:
+	var state := _button_state(hit_rect)
+	var rendered_rect := visual_rect
+	if bool(state["pressed"]) and enabled:
+		rendered_rect.position += Vector2(0.0, 1.5 * ui_scale)
+	var semantic_color := color if enabled else Color(color, 0.52)
+	var edge_color := semantic_color.lightened(0.22)
+	if bool(state["hovered"]) and enabled:
+		edge_color = semantic_color.lightened(0.42)
+		draw_rect(rendered_rect.grow(2.5 * ui_scale), Color(semantic_color, 0.13))
+	if bool(state["pressed"]) and enabled:
+		edge_color = semantic_color.darkened(0.10)
 	var material := "bronze" if color == GOLD else "steel"
-	_draw_forged_panel(rect, color.lightened(0.22), maxf(1.5, 2.0 * ui_scale), false, Color(color.darkened(0.42), 0.28), material)
-	_draw_text(label, rect.get_center() + Vector2(0.0, float(base_size) * 0.36 * ui_scale), maxi(roundi(MIN_SECONDARY_FONT_CSS * ui_scale), roundi(float(base_size) * ui_scale)), TEXT, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x - 8.0 * ui_scale)
+	var fill_alpha := 0.34 if selected else 0.28
+	_draw_forged_panel(rendered_rect, edge_color, maxf(1.5, 2.0 * ui_scale), false, Color(semantic_color.darkened(0.42), fill_alpha), material)
+	if selected:
+		draw_line(rendered_rect.position + Vector2(7.0, 4.0) * ui_scale, Vector2(rendered_rect.end.x - 7.0 * ui_scale, rendered_rect.position.y + 4.0 * ui_scale), Color(GOLD, 0.88), 2.0 * ui_scale)
+	if bool(state["focused"]):
+		draw_rect(hit_rect.grow(-1.5 * ui_scale), Color(GOLD, 0.96), false, 2.0 * ui_scale)
+	return rendered_rect
+
+
+func _draw_button(rect: Rect2, label: String, color: Color, base_size: int, selected: bool = false, enabled: bool = true) -> void:
+	var rendered_rect := _draw_button_surface(rect, rect, color, selected, enabled)
+	var label_color := TEXT if enabled else Color(MUTED, 0.58)
+	_draw_text(label, rendered_rect.get_center() + Vector2(0.0, float(base_size) * 0.36 * ui_scale), maxi(roundi(MIN_SECONDARY_FONT_CSS * ui_scale), roundi(float(base_size) * ui_scale)), label_color, HORIZONTAL_ALIGNMENT_CENTER, rendered_rect.size.x - 8.0 * ui_scale)
+
+
+func _draw_icon_button(hit_rect: Rect2, icon_id: String, color: Color, selected: bool = false, enabled: bool = true) -> void:
+	# The touch target remains 44 CSS px, while the visible metal plate is a
+	# quieter 36 CSS px so the battlefield and nearby controls keep breathing.
+	var visual_rect := hit_rect
+	if touch_mode:
+		var visible_size := Vector2.ONE * minf(36.0 * ui_scale, minf(hit_rect.size.x, hit_rect.size.y))
+		visual_rect = Rect2(hit_rect.get_center() - visible_size * 0.5, visible_size)
+	var rendered_rect := _draw_button_surface(visual_rect, hit_rect, color, selected, enabled)
+	var icon_size := minf(21.0 * ui_scale, minf(rendered_rect.size.x, rendered_rect.size.y) - 10.0 * ui_scale)
+	var icon_rect := Rect2(rendered_rect.get_center() - Vector2.ONE * icon_size * 0.5, Vector2.ONE * icon_size)
+	var icon_color := TEXT if enabled else Color(MUTED, 0.50)
+	draw_texture_rect(UiIconCatalog.texture(icon_id), icon_rect, false, icon_color)
+
+
+func _draw_icon_text_button(rect: Rect2, icon_id: String, label: String, color: Color, selected: bool = false, enabled: bool = true) -> void:
+	var rendered_rect := _draw_button_surface(rect, rect, color, selected, enabled)
+	var icon_size := minf(19.0 * ui_scale, rendered_rect.size.y - 14.0 * ui_scale)
+	var icon_center := Vector2(rendered_rect.position.x + 15.0 * ui_scale, rendered_rect.get_center().y)
+	if rendered_rect.size.x < 76.0 * ui_scale:
+		icon_center = rendered_rect.get_center()
+	var icon_rect := Rect2(icon_center - Vector2.ONE * icon_size * 0.5, Vector2.ONE * icon_size)
+	var content_color := TEXT if enabled else Color(MUTED, 0.50)
+	draw_texture_rect(UiIconCatalog.texture(icon_id), icon_rect, false, content_color)
+	if rendered_rect.size.x >= 76.0 * ui_scale:
+		var text_left := rendered_rect.position.x + 31.0 * ui_scale
+		var text_width := rendered_rect.end.x - text_left - 6.0 * ui_scale
+		_draw_text(label, Vector2(text_left + text_width * 0.5, rendered_rect.get_center().y + 4.5 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), content_color, HORIZONTAL_ALIGNMENT_CENTER, text_width)
+
+
+func _draw_ui_tooltip() -> void:
+	var action_id := _visible_tooltip_action()
+	if action_id.is_empty():
+		return
+	var entries := _interactive_action_entries()
+	if not entries.has(action_id):
+		return
+	var entry: Dictionary = entries[action_id]
+	var label := str(entry["label"])
+	var tooltip_rect := _tooltip_rect_for_action(action_id)
+	_draw_forged_panel(tooltip_rect, FORGED_BRASS, 1.5 * ui_scale, false, Color("101820"), "canvas")
+	_draw_text(label, tooltip_rect.get_center() + Vector2(0.0, 4.5 * ui_scale), roundi(MIN_SECONDARY_FONT_CSS * ui_scale), TEXT, HORIZONTAL_ALIGNMENT_CENTER, tooltip_rect.size.x - 12.0 * ui_scale)
 
 
 func _draw_bar(rect: Rect2, ratio: float, color: Color) -> void:
